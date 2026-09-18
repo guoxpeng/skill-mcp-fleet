@@ -58,6 +58,9 @@ DEFAULT_CONFIG = {
     "max_output_bytes": 200000, # 单次输出上限，防止刷爆上下文
     "allowed_roots": ["/"],     # 文件读写允许的路径前缀（安全边界）
     "enable_docker": True,      # 无 Docker 的设备可关掉
+    "login_shell": True,        # True=bash -lc（会 source /etc/profile）；
+                                # 容器里 profile 打了欢迎横幅（PAI-DSW 等）时设 False，
+                                # 改成 bash -c，输出干净且 PATH 通常够用
 }
 
 
@@ -116,16 +119,15 @@ def _which(cmd):
 # ---------------------------------------------------------------------------
 def _wrap(cmd, sudo=False):
     """把命令包成最终交给 bash 执行的字符串。全部用字符串拼接，避免 % 吃掉花括号。"""
-    if not sudo:
-        return "bash -lc " + shlex.quote(cmd)
-    if _is_root():
-        return "bash -lc " + shlex.quote(cmd)
+    flag = "-lc" if CFG.get("login_shell", True) else "-c"
+    if not sudo or _is_root():
+        return "bash " + flag + " " + shlex.quote(cmd)
     pw = CFG.get("sudo_password") or ""
     if pw:
         return ("printf '%s\\n' " + shlex.quote(pw)
-                + " | sudo -S bash -lc " + shlex.quote(cmd))
+                + " | sudo -S bash " + flag + " " + shlex.quote(cmd))
     # 没配密码：尝试免密 sudo（-n），失败会明确报错，不会卡住
-    return "sudo -n bash -lc " + shlex.quote(cmd)
+    return "sudo -n bash " + flag + " " + shlex.quote(cmd)
 
 
 def run_local(command, sudo=False, timeout=None, work_dir=None, stdin=None):
@@ -313,7 +315,7 @@ def t_http_get(a):
 # 工具清单（base 名，暴露时按 tool_prefix 加前缀）
 # ---------------------------------------------------------------------------
 BASE_TOOLS = [
-    ("exec", "在设备本机执行 shell 命令（bash -lc，支持多行脚本/管道/重定向）。sudo=true 可提权。",
+    ("exec", "在设备本机执行 shell 命令（支持多行脚本/管道/重定向）。sudo=true 可提权。",
      {"type": "object", "properties": {
          "command": {"type": "string", "description": "要执行的命令"},
          "sudo": {"type": "boolean", "description": "是否用 sudo 执行"},
