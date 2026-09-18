@@ -1,0 +1,14 @@
+[Unit]
+Description=Fleet Agent static file server (install.sh)
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/fleet_agent
+ExecStart=/usr/bin/python3 -m http.server 8099 --directory /opt/fleet_agent --bind 0.0.0.0
+Restart=always
+RestartSec=3
+User=root
+
+[Install]
+WantedBy=multi-user.target
