@@ -932,6 +932,18 @@ if [ ! -x "$BIN" ]; then
   chmod +x "$BIN"
 fi
 
+# ---- 复用已有隧道：避免撞 trycloudflare 创建频率限制，也让公网地址保持稳定 ----
+URL=""
+if [ "${CF_FORCE:-0}" != "1" ] && [ -f "$PIDF" ] && kill -0 "$(cat "$PIDF" 2>/dev/null)" 2>/dev/null; then
+  URL="$(grep -oE 'https://[a-z0-9][a-z0-9-]*\.trycloudflare\.com' "$LOG" 2>/dev/null | head -1)"
+  if [ -n "$URL" ]; then
+    echo "[i] 已有隧道在运行（pid $(cat "$PIDF")），复用既有地址，不新建。"
+    echo "[i] 要强制重建：CF_FORCE=1 bash $DIR/mcp-tunnel.sh"
+    echo "[i] 要改协议：  kill \$(cat $PIDF); CF_PROTO=http2 bash $DIR/mcp-tunnel.sh"
+  fi
+fi
+
+if [ -z "$URL" ]; then
 if [ -f "$PIDF" ]; then kill "$(cat "$PIDF")" 2>/dev/null || true; rm -f "$PIDF"; sleep 1; fi
 : > "$LOG"
 # 偶发 502 时可试：CF_PROTO=http2 bash mcp-tunnel.sh  （QUIC 被限速的网络下更稳）
@@ -944,7 +956,6 @@ sleep 1
 REAL="$(pgrep -f "$BIN tunnel --url http://127.0.0.1:$PORT" 2>/dev/null | head -1 || true)"
 if [ -n "$REAL" ]; then echo "$REAL" > "$PIDF"; else echo $! > "$PIDF"; fi
 
-URL=""
 for _ in $(seq 1 40); do
   URL="$(grep -oE 'https://[a-z0-9][a-z0-9-]*\.trycloudflare\.com' "$LOG" 2>/dev/null | head -1)"
   [ -n "$URL" ] && break
@@ -955,6 +966,7 @@ if [ -z "$URL" ]; then
   echo "[x] 未取到隧道地址，日志尾部："
   tail -n 20 "$LOG"
   exit 1
+fi
 fi
 
 # ---- 自检 1：域名是否解析 ----
@@ -1001,7 +1013,8 @@ if [ "$DNS_OK" != "1" ] || { [ -n "$HTTP_CODE" ] && [ "$HTTP_CODE" != "200" ]; }
   echo "       → 判定方法：在主端电脑执行  curl -s -o /dev/null -w '%{http_code}' $URL/"
   echo "         返回 200 就是好的，可直接填进主端 mcp.json。"
   echo "    2) trycloudflare 免费快隧被限流：短时间内反复创建隧道会导致域名不再解析。"
-  echo "       → 等 10~30 分钟再跑本脚本；同一台设备只保留一条隧道，别反复重开。"
+  echo "       → 本脚本默认复用已有隧道，正常不会撞上；万一是被限流，等 10~30 分钟再"
+  echo "         用 CF_FORCE=1 bash $DIR/mcp-tunnel.sh 重建。"
   echo "    3) QUIC(UDP) 被网络设备干扰：日志出现 'no recent network activity' 时改用"
   echo "       CF_PROTO=http2 bash $DIR/mcp-tunnel.sh"
   echo "    4) 要长期稳定：换固定隧道（自有域名 + cloudflared tunnel create）或端口映射/frp。"
@@ -1043,7 +1056,9 @@ UNIT_EOF
   # 端口若被旧进程占用，先清掉（按端口杀，避免 pkill 关键字误伤）
   "$PY3" "$DIR/_portkill.py" "$PORT" >/dev/null 2>&1 || true
   sleep 1
-  systemctl enable --now "$UNIT" >/dev/null 2>&1 || warn "enable --now 失败，请手动 systemctl start $UNIT"
+  systemctl enable "$UNIT" >/dev/null 2>&1 || warn "enable 失败"
+  # 重装场景：单元可能本来就在跑，enable --now 不会重启，这里必须 restart 才能加载新代码
+  systemctl restart "$UNIT" >/dev/null 2>&1 || warn "restart 失败，请手动 systemctl start $UNIT"
   sleep 2
   STATUS="$(systemctl is-active "$UNIT" 2>/dev/null || echo unknown)"
   log "服务状态: $STATUS"
@@ -1058,7 +1073,13 @@ else
   else
     log "本机 PID1 是 $(cat /proc/1/comm 2>/dev/null || echo unknown)，非 systemd（容器环境），使用守护进程模式"
   fi
-  bash "$DIR/mcp-ctl.sh" start || true
+  # 重装场景：老实例还在跑，直接 start 会跳过去，新代码不生效 → 改用 restart
+  if bash "$DIR/mcp-ctl.sh" status >/dev/null 2>&1; then
+    warn "检测到旧实例在运行，重启以加载本次安装的代码"
+    bash "$DIR/mcp-ctl.sh" restart || true
+  else
+    bash "$DIR/mcp-ctl.sh" start || true
+  fi
   VERIFY_CMD="bash $DIR/mcp-ctl.sh status"
 fi
 
