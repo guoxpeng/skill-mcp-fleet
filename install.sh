@@ -33,7 +33,7 @@ while [ $# -gt 0 ]; do
     --prefix)     PREFIX="${2:-}"; shift 2 ;;
     --sudo-pass)  SUDO_PASS="${2:-}"; shift 2 ;;
     --uninstall)  UNINSTALL="1"; shift ;;
-    -h|--help)    sed -n '2,20p' "$0"; exit 0 ;;
+    -h|--help)    sed -n '2,20p' "$0" 2>/dev/null || echo "(管道方式不支持 --help，请见 README)"; exit 0 ;;
     *) echo "[!] 未知参数: $1"; exit 1 ;;
   esac
 done
@@ -52,11 +52,15 @@ die()  { printf '\033[31m[x]\033[0m %s\n' "$*" >&2; exit 1; }
 
 # ---------- 权限 ----------
 if [ "$(id -u)" -ne 0 ]; then
-  if command -v sudo >/dev/null 2>&1; then
+  if [ -r "$0" ] && command -v sudo >/dev/null 2>&1; then
     echo "[i] 需要 root，自动用 sudo 重新执行"
     exec sudo -E bash "$0" "$@"
+  elif [ ! -r "$0" ]; then
+    die "检测到管道方式执行（curl | bash）且当前非 root。
+    请改用：curl -fsSL <URL> | sudo bash -s -- --name <名字> --port 3100
+    或先下载再装：curl -fsSL <URL> -o install.sh && sudo bash install.sh --name <名字> --port 3100"
   else
-    die "请用 root 运行：sudo bash $0 ..."
+    die "请用 root 运行：sudo bash $0 --name <名字> --port 3100"
   fi
 fi
 
