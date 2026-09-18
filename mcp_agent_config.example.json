@@ -7,5 +7,6 @@
   "command_timeout": 120,
   "max_output_bytes": 200000,
   "allowed_roots": ["/"],
-  "enable_docker": true
+  "enable_docker": true,
+  "login_shell": true
 }
