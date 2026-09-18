@@ -440,7 +440,7 @@ echo " MCP 端点    ：$URL/mcp"
 echo "------------------------------------------------------------"
 echo " 本地 agent  ：$(curl -s -m 5 "http://127.0.0.1:$PORT/" >/dev/null 2>&1 && echo 正常 || echo 无响应)"
 echo " 域名解析    ：$([ "$DNS_OK" = "1" ] && echo 已解析 || echo "未解析(异常)")"
-echo " 公网访问    ：${HTTP_CODE:-未检测}"
+echo " 公网访问    ：${HTTP_CODE:-未检测}$([ "$HTTP_CODE" = "200" ] && echo " (通)" || echo " (仅本机视角，见下方说明)")"
 echo "------------------------------------------------------------"
 echo " 主端 ~/.workbuddy/mcp.json 增加："
 echo
@@ -452,12 +452,19 @@ echo "============================================================"
 
 if [ "$DNS_OK" != "1" ] || { [ -n "$HTTP_CODE" ] && [ "$HTTP_CODE" != "200" ]; }; then
   echo
-  echo "[!] 隧道已连上，但公网访问不通，常见原因："
-  echo "    1) trycloudflare 免费快隧被限流：短时间内反复创建隧道会导致域名不再解析。"
+  echo "[i] 本脚本的『公网访问』数值是**从本机发起**的 curl，仅供参考，不等于隧道不可用。"
+  echo "    本机 agent 正常 + 域名已解析时，多数情况下隧道其实是通的（从主端一测便知）。"
+  echo
+  echo "    『公网访问』异常的原因，按可能性排序："
+  echo "    1) 容器/云主机出网被限制（只放行白名单域名）：本机连不上 Cloudflare 边缘，"
+  echo "       但 cloudflared 自己走的是 UDP 7844 / 已建立的连接，所以隧道照样可用。"
+  echo "       → 判定方法：在主端电脑执行  curl -s -o /dev/null -w '%{http_code}' $URL/"
+  echo "         返回 200 就是好的，可直接填进主端 mcp.json。"
+  echo "    2) trycloudflare 免费快隧被限流：短时间内反复创建隧道会导致域名不再解析。"
   echo "       → 等 10~30 分钟再跑本脚本；同一台设备只保留一条隧道，别反复重开。"
-  echo "    2) QUIC(UDP) 被网络设备干扰：日志出现 'no recent network activity' 时改用"
+  echo "    3) QUIC(UDP) 被网络设备干扰：日志出现 'no recent network activity' 时改用"
   echo "       CF_PROTO=http2 bash $DIR/mcp-tunnel.sh"
-  echo "    3) 要长期稳定：换固定隧道（自有域名 + cloudflared tunnel create）或端口映射/frp。"
+  echo "    4) 要长期稳定：换固定隧道（自有域名 + cloudflared tunnel create）或端口映射/frp。"
 fi
 echo " 停止隧道：kill \$(cat "$PIDF")      日志：$LOG"
 TUN_SH_EOF
