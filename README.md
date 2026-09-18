@@ -66,20 +66,22 @@ curl -fsSL https://api.github.com/repos/guoxpeng/mcp-fleet/contents/install.sh \
 sudo bash install.sh --name fnos --port 3100
 ```
 
-各通道内容一致，MD5 `822a4bf0cc131f7176886a3c6485ad9e`（29,001 字节，v1.0）。
+各通道内容一致，MD5 `c8235c189cf9f695174853ef51a2b624`（39.8 KB，v2.0）。
 
-看到 `服务状态: active` 和 `本机自检通过` 就成了。
+看到 `服务状态: active`（systemd 机型）或 `已启动`（容器机型）加 `本机自检通过` 就成了。
 
 ### 参数
 
 | 参数 | 说明 | 默认 |
 |---|---|---|
-| `--name` | 副端标识（决定 systemd 单元名、主端里的服务名） | 主机名 |
+| `--name` | 副端标识（决定服务名、主端里的服务名） | 主机名 |
 | `--port` | 监听端口 | `3100` |
 | `--dir` | 安装目录 | `/opt/<name>_mcp` |
 | `--prefix` | 工具名前缀（一般不用填） | 空 |
 | `--sudo-pass` | 需要 sudo 提权时写入配置的密码 | 空（自动用免密 sudo） |
-| `--uninstall` | 卸载（停服务+删单元+删目录） | — |
+| `--mode` | 托管方式：`auto` / `systemd` / `nohup` | `auto` |
+| `--tunnel` | 装完顺带起一条公网隧道（云容器/无内网入口时用） | 关 |
+| `--uninstall` | 卸载（停服务+删单元+删目录+清隧道进程） | — |
 
 ### 常见场景
 
@@ -99,9 +101,38 @@ sudo bash install.sh --name fnos --port 3100 --uninstall
 
 **重复执行同一命令是安全的**（幂等）：会更新代码并重启服务，但**不会覆盖你已改过的配置文件**。
 
-### 没有 systemd 的环境（容器 / 云主机）
+### 没有 systemd 的环境（Docker / PAI-DSW / Colab / 云容器）
 
-脚本会自动降级为 `setsid nohup` 后台运行，功能不变，但**重启后不会自动拉起**——需要把安装命令写进容器的启动脚本或平台的启动钩子。
+脚本会自动降级为**守护进程模式**：功能完全一样（12 个工具照用），只是不走服务托管。安装目录里会多出一套自包含的控制脚本：
+
+```bash
+bash /opt/<name>_mcp/mcp-ctl.sh status     # 状态 + 健康检查
+bash /opt/<name>_mcp/mcp-ctl.sh start      # 启动
+bash /opt/<name>_mcp/mcp-ctl.sh stop       # 停止
+bash /opt/<name>_mcp/mcp-ctl.sh restart    # 重启
+bash /opt/<name>_mcp/mcp-ctl.sh log 50     # 最近 50 行日志
+bash /opt/<name>_mcp/mcp-ctl.sh tunnel     # 起公网隧道
+```
+
+内部带一个 `_supervisor.sh` 守护壳，进程崩了 3 秒自动拉起（等价于 systemd 的 `Restart=always`）。**区别只有一个：容器重启后需要手动 `mcp-ctl.sh start`**（或把这条命令写进平台的启动钩子）。
+
+> 手动指定也行：`--mode nohup` 强制守护进程模式；`--mode systemd` 在真 systemd 机型上强制走服务。
+
+## 二之二、云容器怎么连上？（公网隧道）
+
+容器/云主机通常**没有**能被你家内网直接访问的 IP，此时用内置的 cloudflared 快速隧道：
+
+```bash
+bash /opt/<name>_mcp/mcp-tunnel.sh
+```
+
+它会自动下载 `cloudflared` 并打印一个 `https://xxx.trycloudflare.com` 地址，主端 `mcp.json` 就填 `<该地址>/mcp`。装的时候一步到位：`--tunnel`。
+
+注意事项：
+
+- 地址是**临时的**，隧道重启就变，换了要同步改主端 `mcp.json` 再重启 WorkBuddy。
+- 快速隧道偶发 502，重试即可；QUIC 被限速的网络可换协议：`CF_PROTO=http2 bash mcp-tunnel.sh`。
+- 公网隧道等于把 root 权限的 exec 挂到互联网，**用完就关**：`kill $(cat /opt/<name>_mcp/tunnel.pid)`。
 
 ## 三、接入主端（在**主端电脑**上）
 
@@ -148,11 +179,21 @@ curl -fsSL http://192.168.1.10:8099/install.sh -o install.sh && sudo bash instal
 
 ## 五、日常运维（副端上）
 
+**systemd 机型：**
+
 ```bash
 systemctl status <name>-mcp      # 状态
 journalctl -u <name>-mcp -f      # 实时日志
 systemctl restart <name>-mcp     # 改完配置重启
 ```
+
+**容器机型（无 systemd）：**
+
+```bash
+bash /opt/<name>_mcp/mcp-ctl.sh {start|stop|restart|status|log|tunnel}
+```
+
+查不到机型就统一用 `bash /opt/<name>_mcp/mcp-ctl.sh status`，它会自己判断。
 
 配置文件：`/opt/<name>_mcp/mcp_agent_config.json`
 
@@ -192,8 +233,14 @@ systemctl restart <name>-mcp     # 改完配置重启
 **Q：端口被占用**
 换 `--port 3101` 等空闲端口，主端配置同步改。
 
+**Q：装的时候报 `System has not been booted with systemd as init system (PID 1). Can't operate.`**
+容器里装了 `systemctl` 二进制但 PID 1 不是 systemd（Docker / PAI-DSW / Colab 都这样）。v2.0 已修：脚本改为探测 `/run/systemd/system` + `/proc/1/comm`，这种情况自动走守护进程模式，不再报错。老版本请重新下载 `install.sh`。
+
 **Q：改了 `mcp_agent.py` 后装出去的还是老代码**
 内嵌代码需要重新生成：`python build_installer.py`，再重新执行 `install.sh`。
+
+**Q：装完 `systemctl` 里看不到服务**
+确认是不是容器环境——容器里本就没有服务单元，用 `mcp-ctl.sh` 管理。
 
 ## 八、文件清单
 
@@ -206,11 +253,23 @@ systemctl restart <name>-mcp     # 改完配置重启
 | `fleet-http.service` | 内网静态分发服务的 systemd 单元 |
 | `mcp_agent_config.example.json` | 配置样例 |
 
+安装完成后，副端目录里还会生成：
+
+| 文件 | 用途 |
+|---|---|
+| `mcp-ctl.sh` | 控制脚本（无 systemd 环境使用） |
+| `_supervisor.sh` | 守护壳，崩溃 3 秒自动重启 |
+| `_portkill.py` | 零依赖按端口清理僵尸进程（替代 `fuser`） |
+| `mcp-tunnel.sh` | cloudflared 公网隧道 |
+| `port.txt` / `agent.pid` / `tunnel.pid` / `agent.log` / `tunnel.log` | 运行时文件 |
+
 ## 九、已踩过的坑（别重犯）
 
-1. **别用 `pkill -f xxx` 杀自己的服务**——命令行里含关键字会把执行该命令的 shell 一起杀掉。安装脚本已改用 `fuser -k <端口>/tcp`。
+1. **别用 `pkill -f xxx` 杀自己的服务**——命令行里含关键字会把执行该命令的 shell 一起杀掉。脚本改用「按端口 scan `/proc/net/tcp` 找 pid」的 `_portkill.py`（不依赖 `fuser`，容器里常没装 psmisc）。
 2. **Python 拼命令不要用 `%` 格式化**——`docker ps --format '{{.Names}}'` 里的 `{{...}}` 会被 `%` 吃掉。代码里已全部改成字符串拼接。
 3. **`sudo -S` 要预喂密码**——`printf '%s\n' <密码> | sudo -S bash -lc <命令>`，否则卡住等输入。
-4. **配置改动不重启不生效**——`systemctl restart <name>-mcp`。
+4. **配置改动不重启不生效**——`systemctl restart <name>-mcp` 或 `mcp-ctl.sh restart`。
 5. **主端 mcp.json 改完必须重启 WorkBuddy**。
 6. **`curl | bash` 时 `$0` 不是文件**——脚本内的 `exec sudo bash "$0"` 会失效，已在 v1.0 修正为检测并提示正确用法。
+7. **别用 `command -v systemctl` 判断有没有 systemd**（v2.0 修复）——容器里这个二进制通常存在，但 PID 1 不是 systemd，`systemctl daemon-reload` 必炸；且 `set -e` 会让整个安装脚本在那里静默中止，前面写的文件全白装。
+8. **不要用 `$!` 记 `setsid nohup ... &` 的 pid**——`setsid` 在「调用者已是进程组长」时会 fork，`$!` 拿到的是马上退出的中间进程，pidfile 直接失效（表现为卸载后隧道/agent 进程残留）。正确做法是让被守护的进程自己写 pidfile，或用 `pgrep -f` 事后回查真实 pid。
