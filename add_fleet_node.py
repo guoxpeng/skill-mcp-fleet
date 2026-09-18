@@ -9,6 +9,7 @@ MCP 主端 · 副设备注册工具
 用法：
   python add_fleet_node.py --name fnos --ip 192.168.5.4 --port 3100
   python add_fleet_node.py --name nas  --ip 192.168.1.10 --port 3100 --remove
+  python add_fleet_node.py --name cloud --url https://xxx.trycloudflare.com/mcp
   python add_fleet_node.py --list
 
 改完记得重启 WorkBuddy 或重载 MCP 配置才会生效。
@@ -22,16 +23,36 @@ import urllib.request
 
 DEFAULT_MCP = os.path.join(os.path.expanduser("~"), ".workbuddy", "mcp.json")
 
+_HDR = {"Content-Type": "application/json",
+        "Accept": "application/json, text/event-stream"}
 
-def http_json(url, payload=None, timeout=10):
+
+def http_json(url, payload=None, timeout=10, session=None):
     data = json.dumps(payload).encode("utf-8") if payload is not None else None
-    req = urllib.request.Request(
-        url, data=data,
-        headers={"Content-Type": "application/json", "Accept": "application/json"},
-        method="POST" if data else "GET",
-    )
+    hdr = dict(_HDR)
+    if session and session.get("id"):
+        hdr["Mcp-Session-Id"] = session["id"]
+    req = urllib.request.Request(url, data=data, headers=hdr,
+                                 method="POST" if data else "GET")
     with urllib.request.urlopen(req, timeout=timeout) as r:
-        return json.loads(r.read().decode("utf-8", "ignore"))
+        if session is not None and r.headers.get("Mcp-Session-Id"):
+            session["id"] = r.headers["Mcp-Session-Id"]
+        body = r.read().decode("utf-8", "ignore")
+    for line in body.splitlines():          # 兼容 SSE 帧
+        if line.startswith("data:"):
+            body = line[5:].strip()
+    return json.loads(body) if body.strip() else {}
+
+
+def normalize_url(host_or_url, port):
+    """--url 可传完整地址；--ip/--port 则拼出来。两者最终都归一成 .../mcp 端点。"""
+    s = host_or_url.strip()
+    if not s.startswith(("http://", "https://")):
+        s = "http://%s:%d" % (s, port)
+    s = s.rstrip("/")
+    if not s.endswith("/mcp"):
+        s += "/mcp"
+    return s
 
 
 def load_mcp(path):
@@ -53,9 +74,9 @@ def save_mcp(path, cfg):
         f.write("\n")
 
 
-def probe(ip, port):
+def probe(mcp_url):
     """返回 (ok, 描述, 工具数量)。"""
-    base = "http://%s:%d" % (ip, port)
+    base = mcp_url[:-4] if mcp_url.endswith("/mcp") else mcp_url
     try:
         info = http_json(base + "/")
     except urllib.error.URLError as e:
@@ -66,12 +87,19 @@ def probe(ip, port):
     return True, "副端在线：%s v%s，%d 个工具" % (info.get("server"), info.get("version"), n), n
 
 
-def test_call(ip, port):
-    """真实调用一次 exec，验证工具可用。"""
-    body = {"jsonrpc": "2.0", "id": 1, "method": "tools/call",
-            "params": {"name": "exec", "arguments": {"command": "hostname; uname -srm"}}}
+def test_call(mcp_url):
+    """按 MCP 规范握手（initialize → notifications/initialized）后真实调用一次 exec。"""
+    session = {"id": None}
     try:
-        d = http_json("http://%s:%d/mcp" % (ip, port), body, timeout=25)
+        http_json(mcp_url, {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {
+            "protocolVersion": "2024-11-05", "capabilities": {},
+            "clientInfo": {"name": "add_fleet_node", "version": "2.0"}}}, timeout=25, session=session)
+        http_json(mcp_url, {"jsonrpc": "2.0", "method": "notifications/initialized",
+                            "params": {}}, timeout=15, session=session)
+        d = http_json(mcp_url, {"jsonrpc": "2.0", "id": 2, "method": "tools/call",
+                                "params": {"name": "exec",
+                                           "arguments": {"command": "hostname; uname -srm"}}},
+                      timeout=25, session=session)
         c = d.get("result", {}).get("content", [{}])[0].get("text", "")
         return True, c.strip().replace("\n", " / ")[:120]
     except Exception as e:
@@ -83,6 +111,7 @@ def main():
     ap.add_argument("--name", required=False, help="副端标识（mcp.json 里的 key）")
     ap.add_argument("--ip", required=False, help="副端 IP")
     ap.add_argument("--port", type=int, default=3100, help="副端端口（默认 3100）")
+    ap.add_argument("--url", help="完整端点（如 https://xxx.trycloudflare.com/mcp），用于公网隧道")
     ap.add_argument("--mcp", default=DEFAULT_MCP, help="mcp.json 路径")
     ap.add_argument("--remove", action="store_true", help="从 mcp.json 移除该副端")
     ap.add_argument("--list", action="store_true", help="列出已注册的副端")
@@ -112,19 +141,21 @@ def main():
             print("[i] mcp.json 里没有 %s，无需移除" % args.name)
         return 0
 
-    if not args.ip:
-        ap.error("需要 --ip")
+    if not args.ip and not args.url:
+        ap.error("需要 --ip（内网）或 --url（完整地址/公网隧道）")
 
-    url = "http://%s:%d/mcp" % (args.ip, args.port)
+    url = normalize_url(args.url or args.ip, args.port)
 
     if not args.no_test:
-        ok, msg, n = probe(args.ip, args.port)
+        ok, msg, n = probe(url)
         print(("[+] " if ok else "[x] ") + msg)
         if not ok:
-            print("\n请先在副端执行安装脚本：")
-            print("  sudo bash install.sh --name %s --port %d" % (args.name, args.port))
+            print("\n排查提示：")
+            print("  内网机型 → 确认副端已装好，且主端能 ping 通该 IP")
+            print("  容器/云主机 → 内网 IP 主端够不到，到副端执行：bash /opt/%s_mcp/mcp-tunnel.sh" % args.name)
+            print("装副端：sudo bash install.sh --name %s --port %d" % (args.name, args.port))
             return 2
-        ok2, out = test_call(args.ip, args.port)
+        ok2, out = test_call(url)
         print(("[+] " if ok2 else "[!] ") + "工具测试: " + out)
 
     cfg["mcpServers"][args.name] = {
