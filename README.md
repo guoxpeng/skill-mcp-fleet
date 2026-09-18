@@ -66,7 +66,7 @@ curl -fsSL https://api.github.com/repos/guoxpeng/mcp-fleet/contents/install.sh \
 sudo bash install.sh --name fnos --port 3100
 ```
 
-各通道内容一致，MD5 `6b9b3baa1e3ee36661a2a6dbaad148f2`（42.7 KB，v2.1）。
+各通道内容一致，MD5 `44f8ec8951f345c2209321e1f2b49473`（43.8 KB，v2.3）。
 
 看到 `服务状态: active`（systemd 机型）或 `已启动`（容器机型）加 `本机自检通过` 就成了。
 
@@ -130,14 +130,14 @@ bash /opt/<name>_mcp/mcp-tunnel.sh
 
 注意事项：
 
-- 地址是**临时的**，隧道重启就变，换了要同步改主端 `mcp.json` 再重启 WorkBuddy。
+- 地址是**临时的**，隧道重启就变，换了要同步改主端 `mcp.json` 再重启 WorkBuddy。脚本默认**复用已在运行的隧道**（地址不变，也避免撞限流）；要强制重建用 `CF_FORCE=1 bash mcp-tunnel.sh`。
 - 隧道脚本末尾的「公网访问：xxx」是**从副端本机发起**的 curl，只作参考。**容器里常出现 `000`，但隧道其实是通的**——云容器出网多有限制，本机连不上 Cloudflare 边缘，而 cloudflared 走的 UDP 7844 不受影响。判定以主端为准：
 
   ```bash
   # 在主端电脑上跑，返回 200 就是好的
   curl -s -o /dev/null -w '%{http_code}\n' https://xxx.trycloudflare.com/
   ```
-- **别反复重开隧道**：trycloudflare 对新建快隧有频率限制，短时间建太多会出现「隧道连上了但域名一直不解析」，等 10~30 分钟再试。
+- **别反复重开隧道**：trycloudflare 对新建快隧有频率限制，短时间建太多会出现「隧道连上了但域名一直不解析」，等 10~30 分钟再试。v2.2 起脚本会复用已有隧道，正常不会触发。
 - QUIC 被网络设备干扰时（日志刷 `no recent network activity`、访问间歇 502）换协议：`CF_PROTO=http2 bash mcp-tunnel.sh`。
 - 公网隧道等于把 root 权限的 exec 挂到互联网，**用完就关**：`kill $(cat /opt/<name>_mcp/tunnel.pid)`。要长期用就上固定隧道（自有域名 + `cloudflared tunnel create`）或端口映射/frp。
 
@@ -223,6 +223,8 @@ bash /opt/<name>_mcp/mcp-ctl.sh {start|stop|restart|status|log|tunnel}
 
 改完 `systemctl restart <name>-mcp`（容器用 `mcp-ctl.sh restart`）生效。
 
+> 用 `install.sh` 再装一次也会自动重启（配置文件保留）；隧道默认**复用已有地址**，`--tunnel` 重装不会换地址（要换得先 `CF_FORCE=1` 或先卸载）。
+
 - 设备**没有 Docker** → 把 `enable_docker` 设为 `false`，docker 工具会直接返回友好提示。
 - 想限制文件读写范围 → 改 `allowed_roots`，例如 `["/opt", "/home"]`。
 - **命令输出前面总有一堆欢迎横幅**（PAI-DSW 等容器会在 `/etc/profile.d/` 里打印 ASCII 图）→ 设 `"login_shell": false`。它把执行方式从 `bash -lc`（登录 shell，会 source `/etc/profile`）换成 `bash -c`，输出干净；不影响 PATH（docker / python3 照样能找到）。默认 `true` 是为了兼容老设备。
@@ -306,3 +308,4 @@ bash /opt/fnos_mcp/mcp-ctl.sh restart
 9. **副端自检里的「公网访问」数值不能当判决**——容器出网受限时本机 curl 返回 `000`，但隧道对外其实完全可用。别据此反复重开隧道（会撞上 trycloudflare 的频率限制，越试越坏）。判定只看主端那一次 curl。
 10. **登录 shell 会把容器的欢迎横幅塞进每一次工具返回**——`bash -lc` 会 source `/etc/profile`，PAI-DSW 这类镜像在那里打印 ASCII 图。用配置项 `login_shell: false` 切成 `bash -c` 解决。
 11. **Windows 上做语法检查别直接敲 `bash`**——可能解析到 `C:\Windows\System32\bash.exe`（WSL 桩），在有安全策略的机器上会被拦且报错莫名其妙。用系统里真实 Git Bash 的绝对路径。
+12. **重装不等于更新（v2.2 修复）**——老版本再装一次会打印「已在运行 (pid xxx)」直接跳过，**跑的还是老代码**，你会以为改动没生效。现在：nohup 分支检测到旧实例自动 `restart`，systemd 分支把 `enable --now` 拆成 `enable` + `restart`（`enable --now` 对已 active 的单元不会重启）。配置文件仍然保留、不覆盖。
