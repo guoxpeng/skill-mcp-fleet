@@ -187,6 +187,9 @@ DEFAULT_CONFIG = {
     "max_output_bytes": 200000, # 单次输出上限，防止刷爆上下文
     "allowed_roots": ["/"],     # 文件读写允许的路径前缀（安全边界）
     "enable_docker": True,      # 无 Docker 的设备可关掉
+    "login_shell": True,        # True=bash -lc（会 source /etc/profile）；
+                                # 容器里 profile 打了欢迎横幅（PAI-DSW 等）时设 False，
+                                # 改成 bash -c，输出干净且 PATH 通常够用
 }
 
 
@@ -245,16 +248,15 @@ def _which(cmd):
 # ---------------------------------------------------------------------------
 def _wrap(cmd, sudo=False):
     """把命令包成最终交给 bash 执行的字符串。全部用字符串拼接，避免 % 吃掉花括号。"""
-    if not sudo:
-        return "bash -lc " + shlex.quote(cmd)
-    if _is_root():
-        return "bash -lc " + shlex.quote(cmd)
+    flag = "-lc" if CFG.get("login_shell", True) else "-c"
+    if not sudo or _is_root():
+        return "bash " + flag + " " + shlex.quote(cmd)
     pw = CFG.get("sudo_password") or ""
     if pw:
         return ("printf '%s\\n' " + shlex.quote(pw)
-                + " | sudo -S bash -lc " + shlex.quote(cmd))
+                + " | sudo -S bash " + flag + " " + shlex.quote(cmd))
     # 没配密码：尝试免密 sudo（-n），失败会明确报错，不会卡住
-    return "sudo -n bash -lc " + shlex.quote(cmd)
+    return "sudo -n bash " + flag + " " + shlex.quote(cmd)
 
 
 def run_local(command, sudo=False, timeout=None, work_dir=None, stdin=None):
@@ -442,7 +444,7 @@ def t_http_get(a):
 # 工具清单（base 名，暴露时按 tool_prefix 加前缀）
 # ---------------------------------------------------------------------------
 BASE_TOOLS = [
-    ("exec", "在设备本机执行 shell 命令（bash -lc，支持多行脚本/管道/重定向）。sudo=true 可提权。",
+    ("exec", "在设备本机执行 shell 命令（支持多行脚本/管道/重定向）。sudo=true 可提权。",
      {"type": "object", "properties": {
          "command": {"type": "string", "description": "要执行的命令"},
          "sudo": {"type": "boolean", "description": "是否用 sudo 执行"},
@@ -978,7 +980,7 @@ echo " MCP 端点    ：$URL/mcp"
 echo "------------------------------------------------------------"
 echo " 本地 agent  ：$(curl -s -m 5 "http://127.0.0.1:$PORT/" >/dev/null 2>&1 && echo 正常 || echo 无响应)"
 echo " 域名解析    ：$([ "$DNS_OK" = "1" ] && echo 已解析 || echo "未解析(异常)")"
-echo " 公网访问    ：${HTTP_CODE:-未检测}"
+echo " 公网访问    ：${HTTP_CODE:-未检测}$([ "$HTTP_CODE" = "200" ] && echo " (通)" || echo " (仅本机视角，见下方说明)")"
 echo "------------------------------------------------------------"
 echo " 主端 ~/.workbuddy/mcp.json 增加："
 echo
@@ -990,12 +992,19 @@ echo "============================================================"
 
 if [ "$DNS_OK" != "1" ] || { [ -n "$HTTP_CODE" ] && [ "$HTTP_CODE" != "200" ]; }; then
   echo
-  echo "[!] 隧道已连上，但公网访问不通，常见原因："
-  echo "    1) trycloudflare 免费快隧被限流：短时间内反复创建隧道会导致域名不再解析。"
+  echo "[i] 本脚本的『公网访问』数值是**从本机发起**的 curl，仅供参考，不等于隧道不可用。"
+  echo "    本机 agent 正常 + 域名已解析时，多数情况下隧道其实是通的（从主端一测便知）。"
+  echo
+  echo "    『公网访问』异常的原因，按可能性排序："
+  echo "    1) 容器/云主机出网被限制（只放行白名单域名）：本机连不上 Cloudflare 边缘，"
+  echo "       但 cloudflared 自己走的是 UDP 7844 / 已建立的连接，所以隧道照样可用。"
+  echo "       → 判定方法：在主端电脑执行  curl -s -o /dev/null -w '%{http_code}' $URL/"
+  echo "         返回 200 就是好的，可直接填进主端 mcp.json。"
+  echo "    2) trycloudflare 免费快隧被限流：短时间内反复创建隧道会导致域名不再解析。"
   echo "       → 等 10~30 分钟再跑本脚本；同一台设备只保留一条隧道，别反复重开。"
-  echo "    2) QUIC(UDP) 被网络设备干扰：日志出现 'no recent network activity' 时改用"
+  echo "    3) QUIC(UDP) 被网络设备干扰：日志出现 'no recent network activity' 时改用"
   echo "       CF_PROTO=http2 bash $DIR/mcp-tunnel.sh"
-  echo "    3) 要长期稳定：换固定隧道（自有域名 + cloudflared tunnel create）或端口映射/frp。"
+  echo "    4) 要长期稳定：换固定隧道（自有域名 + cloudflared tunnel create）或端口映射/frp。"
 fi
 echo " 停止隧道：kill \$(cat "$PIDF")      日志：$LOG"
 TUN_SH_EOF
