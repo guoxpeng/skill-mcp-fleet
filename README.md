@@ -66,7 +66,7 @@ curl -fsSL https://api.github.com/repos/guoxpeng/mcp-fleet/contents/install.sh \
 sudo bash install.sh --name fnos --port 3100
 ```
 
-各通道内容一致，MD5 `c8235c189cf9f695174853ef51a2b624`（39.8 KB，v2.0）。
+各通道内容一致，MD5 `3a79ae02a88123e06eb32de1f9be3e4c`（41.7 KB，v2.0，4 条通道已实测同值）。
 
 看到 `服务状态: active`（systemd 机型）或 `已启动`（容器机型）加 `本机自检通过` 就成了。
 
@@ -131,22 +131,26 @@ bash /opt/<name>_mcp/mcp-tunnel.sh
 注意事项：
 
 - 地址是**临时的**，隧道重启就变，换了要同步改主端 `mcp.json` 再重启 WorkBuddy。
-- 快速隧道偶发 502，重试即可；QUIC 被限速的网络可换协议：`CF_PROTO=http2 bash mcp-tunnel.sh`。
-- 公网隧道等于把 root 权限的 exec 挂到互联网，**用完就关**：`kill $(cat /opt/<name>_mcp/tunnel.pid)`。
+- 隧道脚本会自检「域名解析 + 公网访问」。报不通时按它打印的 3 条原因排查。
+- **别反复重开隧道**：trycloudflare 对新建快隧有频率限制，短时间建太多会出现「隧道连上了但域名一直不解析」，等 10~30 分钟再试，或直接换 `CF_PROTO=http2`。
+- QUIC 被网络设备干扰时（日志刷 `no recent network activity`、访问间歇 502）换协议：`CF_PROTO=http2 bash mcp-tunnel.sh`。
+- 公网隧道等于把 root 权限的 exec 挂到互联网，**用完就关**：`kill $(cat /opt/<name>_mcp/tunnel.pid)`。要长期用就上固定隧道（自有域名 + `cloudflared tunnel create`）或端口映射/frp。
 
 ## 三、接入主端（在**主端电脑**上）
 
 ```bash
-python add_fleet_node.py --name fnos --ip 192.168.1.11 --port 3100
+python add_fleet_node.py --name fnos --ip 192.168.1.11 --port 3100          # 内网
+python add_fleet_node.py --name cloud --url https://xxx.trycloudflare.com/mcp   # 公网隧道
 ```
 
-脚本会探测连通性、真实调一次工具、然后自动写进 `~/.workbuddy/mcp.json`。
+脚本会探测连通性、按 MCP 规范握手后真实调一次 `exec`，然后自动写进 `~/.workbuddy/mcp.json`。
 
 其它用法：
 
 ```bash
 python add_fleet_node.py --list                              # 看已注册的副端
 python add_fleet_node.py --name fnos --ip 1.2.3.4 --remove   # 移除
+python probe_fleet.py http://192.168.1.11:3100/mcp           # 纯诊断：握手+列工具+调工具
 ```
 
 也可以手改 `mcp.json`：
@@ -252,6 +256,7 @@ bash /opt/<name>_mcp/mcp-ctl.sh {start|stop|restart|status|log|tunnel}
 | `build_installer.py` | 改完 `mcp_agent.py` 后重新生成 `install.sh` |
 | `fleet-http.service` | 内网静态分发服务的 systemd 单元 |
 | `mcp_agent_config.example.json` | 配置样例 |
+| `probe_fleet.py` | 纯诊断脚本（握手 + 列工具 + 调工具），连不上时先用它定位 |
 
 安装完成后，副端目录里还会生成：
 
