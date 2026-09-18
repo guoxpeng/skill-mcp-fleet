@@ -1,0 +1,11 @@
+{
+  "name": "node",
+  "tool_prefix": "",
+  "version": "1.0.0",
+  "sudo_password": "",
+  "work_dir": "/",
+  "command_timeout": 120,
+  "max_output_bytes": 200000,
+  "allowed_roots": ["/"],
+  "enable_docker": true
+}
