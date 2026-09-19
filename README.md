@@ -151,6 +151,24 @@ bash /opt/<name>_mcp/mcp-tunnel.sh
 
 ## 三、接入主端（在**主端电脑**上）
 
+### 推荐：用 `fleet.py`（零依赖统一 CLI）
+
+`fleet.py` 直接按 MCP 协议访问副端，**改完配置立刻可用，不需要重启 agent**：
+
+```bash
+python fleet.py add --name fnos --ip 192.168.1.11 --port 3100          # 内网
+python fleet.py add --name cloud --url https://xxx.trycloudflare.com/mcp --token <令牌>   # 公网隧道
+python fleet.py list                    # 列已注册副端
+python fleet.py probe fnos              # 握手 + 列工具 + 真调一次 exec
+python fleet.py health                  # 全部节点健康总览
+python fleet.py exec fnos "uptime"      # 在副端执行命令
+python fleet.py sync                    # 按地址目录刷新（隧道换域名后自动跟随）
+```
+
+`python fleet.py --help` 看全部 15 个子命令。
+
+### 或者用 `add_fleet_node.py`（只负责写 mcp.json）
+
 ```bash
 python add_fleet_node.py --name fnos --ip 192.168.1.11 --port 3100          # 内网
 python add_fleet_node.py --name cloud --url https://xxx.trycloudflare.com/mcp   # 公网隧道
@@ -323,6 +341,7 @@ bash /opt/fnos_mcp/mcp-ctl.sh restart
 | 文件 | 用途 |
 |---|---|
 | `install.sh` | **一键安装脚本**（自包含，已内嵌服务器代码）——拷这一个文件就够了 |
+| `fleet.py` | **主端统一 CLI**（零依赖）：列节点 / 体检 / 执行命令 / 调工具 / 注册 / 地址跟随。**改完配置立即可用，不必重启 agent** |
 | `install-offline.sh` | **自解压安装脚本**，内嵌了 install.sh，只需传这一个文件 |
 | `install-offline.b64` | 离线载荷 = `base64(zlib(install.sh))`，**纯 base64 无注释行**（**不是 tar 包**，只需 python3） |
 | `install-offline.partNN.txt` | 同一载荷的分片（默认每片 4000 字符），**纯 base64**，`cat` 拼即可 |
