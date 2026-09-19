@@ -7,7 +7,7 @@ MCP 主端 · 副设备注册工具
 它会：1) 探测副端是否可达  2) 测试工具调用  3) 自动把该副端写入 ~/.workbuddy/mcp.json
 
 用法：
-  python add_fleet_node.py --name fnos --ip 192.168.5.4 --port 3100
+  python add_fleet_node.py --name fnos --ip 192.168.1.4 --port 3100
   python add_fleet_node.py --name nas  --ip 192.168.1.10 --port 3100 --remove
   python add_fleet_node.py --name cloud --url https://xxx.trycloudflare.com/mcp
   python add_fleet_node.py --list
