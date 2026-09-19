@@ -62,7 +62,7 @@ for _stream in (sys.stdout, sys.stderr):
 DEFAULT_CONFIG = {
     "name": "node",             # 副端标识（显示在状态页与 serverInfo）
     "tool_prefix": "",          # 工具名前缀，如 "nas_"；留空则用裸名（exec/read/...）
-    "version": "3.0.0",
+    "version": "3.1.0",
     "sudo_password": "",        # 留空且非 root 时会尝试免密 sudo
     "work_dir": "/",            # 默认工作目录
     "command_timeout": 120,     # 秒
@@ -79,6 +79,17 @@ DEFAULT_CONFIG = {
     # 可选来源 IP 白名单，支持单个 IP 或 CIDR。留空 = 不限制。
     # 例：["192.168.1.0/24", "10.8.0.2"]
     "allow_ips": [],
+    # ---- 加固项（v3.1）----------------------------------------------------
+    # True 时空 auth_token 直接拒绝启动（隧道/公网场景必开，内网建议开）。
+    "require_auth": False,
+    # CORS 白名单。留空 = 完全不发 CORS 响应头（默认，最安全）。
+    # MCP 客户端是程序不是浏览器，本就不需要 CORS；
+    # 只有确有浏览器端调用需求时，才填具体来源，如 ["http://localhost:3000"]。
+    "cors_allow_origins": [],
+    # 单请求体上限（字节），防止 Content-Length 撑爆内存/线程。
+    "max_body_bytes": 1048576,       # 1 MB
+    # SSE 并发连接上限，防止线程被常驻连接打满。
+    "max_sse_conns": 16,
 }
 
 
@@ -91,6 +102,31 @@ def load_config():
         except Exception as e:
             print("[warn] 读配置失败，用默认值: %s" % e, file=sys.stderr)
     return cfg
+
+
+def save_config(cfg):
+    """写回配置文件，并**无条件**收紧权限为 0600。
+
+    配置里有 auth_token（可能还有 sudo_password）。0644 意味着同机任何用户
+    都能读到它 —— 所以权限不能只在「首次安装」时设一次，必须每次写都收紧。
+    """
+    try:
+        with open(CONFIG_PATH, "w", encoding="utf-8") as f:
+            json.dump(cfg, f, ensure_ascii=False, indent=2)
+            f.write("\n")
+    except Exception as e:
+        print("[warn] 写配置失败: %s" % e, file=sys.stderr)
+        return False
+    try:
+        os.chmod(CONFIG_PATH, 0o600)
+    except Exception:
+        pass
+    return True
+
+
+def gen_token():
+    """生成 32 字节 urlsafe 随机令牌（约 43 字符），不含引号/特殊字符。"""
+    return base64.urlsafe_b64encode(os.urandom(32)).decode().rstrip("=")
 
 
 CFG = load_config()
@@ -191,8 +227,11 @@ def check_access(ip, headers):
     if not tok:
         return None
     got = _token_of(headers)
-    # 常数时间比较，避免按字符猜测
-    if got and hmac.compare_digest(got, tok):
+    # 常数时间比较，避免按字符猜测。
+    # 必须比 bytes：HTTP 头按 latin-1 解码，请求头里塞非 ASCII 字节会让
+    # compare_digest(str, str) 抛 TypeError —— 一条可被外部触发的未捕获异常路径。
+    if got and hmac.compare_digest(got.encode("utf-8", "surrogateescape"),
+                                   tok.encode("utf-8", "surrogateescape")):
         AUTH_FAILS.pop(ip, None)
         return None
     _note_auth_fail(ip)
@@ -202,11 +241,20 @@ def check_access(ip, headers):
 
 
 def _check_path(p):
-    """安全边界：只允许 allowed_roots 下的路径。"""
+    """安全边界：只允许 allowed_roots 下的路径。
+
+    用 realpath 而非 abspath —— abspath 不解析软链，在允许目录里放一个
+    指向 /etc/shadow 的软链即可逃逸（cat/sed 会跟随软链），等于没拦。
+    另请注意：本边界只作用于 read/write/edit/list_dir，**不约束 exec**，
+    默认 allowed_roots=["/"] 时它提供零实际保护。
+    """
     roots = CFG.get("allowed_roots") or ["/"]
-    ap = os.path.abspath(p)
+    ap = os.path.realpath(p)
     for r in roots:
-        if r == "/" or ap == r or ap.startswith(r.rstrip("/") + "/"):
+        rr = "/" if str(r) == "/" else os.path.realpath(r)
+        # 用 os.sep 拼后缀：硬写 "/" 在 Windows 上拼不出 "\"，前缀判断会永远失败
+        # （Linux 下 os.sep 就是 "/"，与原行为完全等价）
+        if rr == "/" or ap == rr or ap.startswith(rr.rstrip("/\\") + os.sep):
             return ap
     raise ValueError("路径不在允许范围内: %s" % ap)
 
@@ -534,6 +582,10 @@ def handle_rpc(msg):
 
 SESSIONS = {}
 
+# SSE 并发计数：每个 /sse 连接会常驻一个 while True 线程，无上限时可被打满。
+SSE_LOCK = threading.Lock()
+SSE_ACTIVE = 0
+
 
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
@@ -542,15 +594,32 @@ class Handler(BaseHTTPRequestHandler):
         pass
 
     def _cors(self):
-        self.send_header("Access-Control-Allow-Origin", "*")
-        self.send_header("Access-Control-Allow-Headers", "*")
-        self.send_header("Access-Control-Allow-Methods", "GET,POST,OPTIONS,DELETE")
+        """默认**不发**任何 CORS 响应头。
+
+        原实现对每个响应都回 Access-Control-Allow-Origin: * —— 在无鉴权时，
+        你只要访问过任意一个被挂马的网页，该网页就能 fetch 本机 :3100 执行
+        命令**并读到返回值**。MCP 客户端是程序不是浏览器，本就不需要 CORS；
+        确需跨域时在配置里填 cors_allow_origins，按 Origin 精确回显。
+        """
+        allow = CFG.get("cors_allow_origins") or []
+        if not allow:
+            return
+        origin = (self.headers.get("Origin") or "").strip()
+        if origin and origin in allow:
+            self.send_header("Access-Control-Allow-Origin", origin)
+            self.send_header("Vary", "Origin")
+            self.send_header("Access-Control-Allow-Headers",
+                             "Authorization, Content-Type, Mcp-Session-Id, X-Fleet-Token")
+            self.send_header("Access-Control-Allow-Methods", "GET,POST,OPTIONS,DELETE")
 
     def _guard(self):
         """鉴权闸门。返回 True 表示已拦截（响应也发完了）。"""
         ip = self.client_address[0] if self.client_address else "?"
         denied = check_access(ip, self.headers)
         if denied is None:
+            # 只有「配了 token 且校验通过」才算可信；裸奔模式下不算，
+            # 状态页据此收敛输出，避免向未认证者暴露指纹。
+            self._trusted = bool(CFG.get("auth_token") or "")
             return False
         code, why = denied
         body = json.dumps({"error": why, "hint": "auth_token 配置见 mcp_agent_config.json"},
@@ -589,7 +658,16 @@ class Handler(BaseHTTPRequestHandler):
         if self._guard():
             return
         path = self.path.split("?")[0].rstrip("/")
-        length = int(self.headers.get("Content-Length") or 0)
+        # 边界校验：length 原来直接取自请求头且无上限 —— -1 会一直读到 EOF，
+        # 超大值会一次性吃满内存，单连接即可长时间占住一个线程。
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+        except (TypeError, ValueError):
+            length = -1
+        limit = int(CFG.get("max_body_bytes", 1048576))
+        if length < 0 or length > limit:
+            self._json(413, {"error": "Content-Length 非法或超过上限 %d 字节" % limit})
+            return
         raw = self.rfile.read(length) if length else b""
 
         if path == "/messages":
@@ -631,20 +709,31 @@ class Handler(BaseHTTPRequestHandler):
         self._json(200, resp, sid=sid)
 
     def do_GET(self):
+        global SSE_ACTIVE
         if self._guard():
             return
         path = self.path.split("?")[0].rstrip("/") or "/"
         if path in ("/", "/health", "/status"):
-            self._json(200, {
-                "status": "ok", "server": SERVER_NAME, "version": SERVER_VERSION,
-                "tools": len(TOOLS), "tool_names": [t["name"] for t in TOOLS],
-                "tool_prefix": PREFIX, "root": _is_root(),
-                "auth": bool(CFG.get("auth_token") or ""),
-                "allow_ips": CFG.get("allow_ips") or [],
-                "transports": ["POST /mcp (streamable-http)", "GET /sse (sse)"],
-            })
+            # 探活本身要留（负载均衡/监控要用），但**不向未认证者** dump
+            # 工具清单 / 运行身份 / 是否开鉴权 —— 原输出等于告诉扫描器
+            # 「这里有个不带锁的 root shell」。
+            body = {"status": "ok", "server": SERVER_NAME, "version": SERVER_VERSION}
+            if getattr(self, "_trusted", False):
+                body.update({
+                    "tools": len(TOOLS), "tool_names": [t["name"] for t in TOOLS],
+                    "tool_prefix": PREFIX, "root": _is_root(),
+                    "auth": bool(CFG.get("auth_token") or ""),
+                    "allow_ips": CFG.get("allow_ips") or [],
+                    "transports": ["POST /mcp (streamable-http)", "GET /sse (sse)"],
+                })
+            self._json(200, body)
             return
         if path == "/sse":
+            with SSE_LOCK:
+                if SSE_ACTIVE >= int(CFG.get("max_sse_conns", 16)):
+                    self._json(429, {"error": "SSE 并发连接数已达上限，请稍后重试"})
+                    return
+                SSE_ACTIVE += 1
             sid = uuid.uuid4().hex
             SESSIONS[sid] = []
             self.send_response(200)
@@ -673,6 +762,8 @@ class Handler(BaseHTTPRequestHandler):
                 pass
             finally:
                 SESSIONS.pop(sid, None)
+                with SSE_LOCK:
+                    SSE_ACTIVE -= 1
             return
         self._json(404, {"error": "not found"})
 
@@ -684,9 +775,30 @@ class Handler(BaseHTTPRequestHandler):
 
 def main():
     ap = argparse.ArgumentParser(description="MCP 副端 Agent（零依赖）")
-    ap.add_argument("--host", default="0.0.0.0")
+    # 默认只绑本机：要对外服务必须显式写 --host 0.0.0.0。
+    # 原默认即 0.0.0.0，一次手滑启动就等于全网卡裸奔。
+    ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=3100)
+    ap.add_argument("--require-auth", action="store_true",
+                    help="未配置 auth_token 时拒绝启动（公网/隧道场景建议开启）")
+    ap.add_argument("--generate-token", action="store_true",
+                    help="未配置 auth_token 时自动生成一个并写回配置文件（权限 0600）")
     args = ap.parse_args()
+
+    # ---- 鉴权前置校验（v3.1）---------------------------------------------
+    if args.generate_token and not (CFG.get("auth_token") or ""):
+        CFG["auth_token"] = gen_token()
+        if save_config(CFG):
+            print("  [ok] 已生成随机 auth_token 并写入 %s（权限 0600）" % CONFIG_PATH)
+            print("  [ok] 令牌: %s" % CFG["auth_token"])
+            print("  [ok] 请填入主端 mcp.json 的 headers：Authorization: Bearer <令牌>")
+        else:
+            print("  [!] 生成令牌后写配置失败，本次仍以无鉴权启动", file=sys.stderr)
+    if (args.require_auth or CFG.get("require_auth")) and not (CFG.get("auth_token") or ""):
+        print("[FATAL] 已要求鉴权但 auth_token 为空，拒绝启动。", file=sys.stderr)
+        print("        先执行：python3 mcp_agent.py --generate-token --require-auth",
+              file=sys.stderr)
+        sys.exit(2)
 
     httpd = ThreadingHTTPServer((args.host, args.port), Handler)
     print("MCP 副端 Agent 已启动: %s v%s" % (SERVER_NAME, SERVER_VERSION))
