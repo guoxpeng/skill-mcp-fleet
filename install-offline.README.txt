@@ -1,6 +1,6 @@
 MCP 副端 · 全离线安装包说明
 ============================================================
-内嵌的是 install.sh：77092 字节，md5 482310d6e15d84ad9f78591bba0b7fb7
+内嵌的是 install.sh：88743 字节，md5 ba8d4c106adc6185a22c7586f696b46e
 载荷格式 = base64( zlib( install.sh ) ) —— **单个压缩文件，不是 tar 包**，
 不要用 `tar xf` 去解，那样只会报错。
 
@@ -22,24 +22,24 @@ MCP 副端 · 全离线安装包说明
 只有 base64，没有任何注释行 —— 所以下面这条命令是**整文件直接解码**，不用预处理：
 
     python3 -c "import base64,zlib;open('/tmp/mcp-install.sh','wb').write(zlib.decompress(base64.b64decode(open('install-offline.b64','rb').read())))"
-    md5sum /tmp/mcp-install.sh      # 应为 482310d6e15d84ad9f78591bba0b7fb7
+    md5sum /tmp/mcp-install.sh      # 应为 ba8d4c106adc6185a22c7586f696b46e
     sudo bash /tmp/mcp-install.sh --name <名字> --port 3100
 
 ------------------------------------------------------------
 【3】install-offline.partNN.txt —— 单条消息有长度限制时用
 ------------------------------------------------------------
-共 9 片，每片 4000 字符，全部是纯 base64。**按序号顺序拼起来**即可：
+共 10 片，每片 4000 字符，全部是纯 base64。**按序号顺序拼起来**即可：
 
     cat install-offline.part*.txt > install-offline.b64
     md5sum install-offline.b64      # 与上面的 install-offline.b64 一致
 
 然后照【2】的命令还原安装。
-（别把片名里的数字当顺序乱拼；`cat` 是按文件名排序的，part01…part09 正好对。）
+（别把片名里的数字当顺序乱拼；`cat` 是按文件名排序的，part01…part10 正好对。）
 
 ------------------------------------------------------------
 校验
 ------------------------------------------------------------
-    md5sum install.sh                        482310d6e15d84ad9f78591bba0b7fb7   ← 解出来的应是这个
+    md5sum install.sh                        ba8d4c106adc6185a22c7586f696b46e   ← 解出来的应是这个
     python3 make-offline.py --check          # 逐字节比对全部产物
 
 全部产物的校验和见 install-offline.sha256。
