@@ -55,6 +55,7 @@ import argparse
 import json
 import os
 import re
+import shlex
 import shutil
 import socket
 import subprocess
@@ -65,7 +66,7 @@ import urllib.request
 
 # ---------------------------------------------------------------- 基础
 
-VERSION = "1.0.0"
+VERSION = "1.1.0"
 REGISTRY = os.path.join(os.path.expanduser("~"), ".mcp-fleet", "nodes.json")
 PROTOCOL = "2024-11-05"
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -223,6 +224,79 @@ def base_of(url):
     return url[:-4] if url.endswith("/mcp") else url.rstrip("/")
 
 
+# ------------------------------------------------ 地址采信前的防投毒校验
+def host_of(url):
+    """从 http(s)://host:port/mcp 取 host（小写、不含端口）。失败返回 ""。"""
+    try:
+        from urllib.parse import urlparse
+        return (urlparse(url or "").hostname or "").lower()
+    except Exception:
+        return ""
+
+
+def reg_suffix(host):
+    """取注册域（末两段）：a.b.trycloudflare.com -> trycloudflare.com。
+
+    IP 地址原样返回（本来就精确到主机）。
+    """
+    h = (host or "").lower()
+    if not h:
+        return ""
+    if re.match(r"^[\d.]+$", h) or ":" in h:
+        return h
+    parts = h.split(".")
+    return ".".join(parts[-2:]) if len(parts) >= 2 else h
+
+
+def domain_ok(cur_url, new_url):
+    """新地址的域名是否「配得上」旧地址 —— 防地址目录投毒。
+
+    同 host 直接通过；换了 host 但注册域相同也算通过（quick tunnel 重建是常态：
+    xxx.trycloudflare.com → yyy.trycloudflare.com）。注册域都变了
+    （例如跳到 evil.example.com）则拒绝，需人工确认。
+    设 FLEET_ALLOW_DOMAIN_CHANGE=1 可显式放行。
+    """
+    ch, nh = host_of(cur_url), host_of(new_url)
+    if not ch or not nh:
+        return True
+    if ch == nh:
+        return True
+    same = reg_suffix(ch) == reg_suffix(nh)
+    if same:
+        return True
+    return os.environ.get("FLEET_ALLOW_DOMAIN_CHANGE") == "1"
+
+
+def probe_anonymous(url, timeout=6):
+    """**不带任何凭据**探活：True 表示对面看起来确实是个 MCP 副端。
+
+    存在的意义是「先确认对面像副端，再把令牌发出去」—— 原实现把节点令牌
+    直接发给目录给的新地址，投毒者只要回一个 {"status":"ok"} 就能收走令牌。
+    这里连 401 都算通过：那恰恰说明对面是个开了鉴权的副端。
+    """
+    payload = {"jsonrpc": "2.0", "id": 1, "method": "initialize",
+               "params": {"protocolVersion": "2024-11-05", "capabilities": {},
+                          "clientInfo": {"name": "fleet-probe", "version": VERSION}}}
+    try:
+        req = urllib.request.Request(
+            url, method="POST", data=json.dumps(payload).encode("utf-8"),
+            headers={"Content-Type": "application/json", "Accept": "application/json"})
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            body = r.read(8192).decode("utf-8", "ignore")
+        return ("jsonrpc" in body) or ("serverInfo" in body)
+    except urllib.error.HTTPError as e:
+        if e.code not in (401, 403):
+            return False
+        try:
+            detail = e.read(1024).decode("utf-8", "ignore")
+        except Exception:
+            detail = ""
+        # 副端 401 响应体里有辨识度很高的提示语
+        return ("auth_token" in detail) or ("Bearer" in detail) or ("mcp" in detail.lower())
+    except Exception:
+        return False
+
+
 def parse_exec(text):
     """副端 exec 返回格式：[exit N]\\n<stdout>[\\n--- stderr ---\\n<err>]
     返回 (exit_code, stdout, stderr)。"""
@@ -290,6 +364,12 @@ def save_registry(reg):
     with open(REGISTRY, "w", encoding="utf-8") as f:
         json.dump(reg, f, ensure_ascii=False, indent=2)
         f.write("\n")
+    # 登记表里有各副端的明文 Bearer 令牌，必须收紧权限；
+    # 原来既不 chmod 也不设 umask，Linux 上默认 0644 = 同机任何用户可读。
+    try:
+        os.chmod(REGISTRY, 0o600)
+    except Exception:
+        pass
 
 
 def load_json_config(path):
@@ -422,6 +502,24 @@ def sync_from_directory(name, cur_url=None, timeout=8, quiet=False, verbose=True
         return None
     new_mcp = normalize_url(new)
     if new_mcp == cur_url:
+        return None
+    # ---- 防投毒闸门 1：域名必须「配得上」旧地址 ----
+    # 否则投毒者 POST /register 把 name 指向自己的地址，主端就会把该副端的
+    # Bearer 令牌送过去，并把假地址永久写进登记表。
+    if not domain_ok(cur_url, new_mcp):
+        if not quiet:
+            print(warn("目录给的地址换了域名：%s → %s"
+                       % (host_of(cur_url) or "(空)", host_of(new_mcp))), file=sys.stderr)
+            print(dim("    出于防投毒考虑不自动采信（否则会把副端令牌发给未知地址）。"),
+                  file=sys.stderr)
+            print(dim("    确认无误后手工改：fleet.py add %s %s --token <原令牌>"
+                      % (name, new_mcp)), file=sys.stderr)
+        return None
+    # ---- 防投毒闸门 2：先不带凭据确认对面像副端，令牌最后才发出 ----
+    if not probe_anonymous(new_mcp, timeout=min(timeout, 6)):
+        if not quiet:
+            print(warn("目录给的 %s 看起来不是 MCP 副端（无凭据探活未通过）" % new),
+                  file=sys.stderr)
         return None
     try:
         if not http_probe(new_mcp, timeout=min(timeout, 6), token=token):
@@ -796,34 +894,41 @@ def cmd_health(a):
 
 
 MIRRORS = {
-    "github": "https://raw.githubusercontent.com/guoxpeng/mcp-fleet/main/install.sh",
-    "jsdelivr": "https://cdn.jsdelivr.net/gh/guoxpeng/mcp-fleet@main/install.sh",
-    "ghfast": "https://ghfast.top/https://raw.githubusercontent.com/guoxpeng/mcp-fleet/main/install.sh",
-    "ghproxy": "https://ghproxy.net/https://raw.githubusercontent.com/guoxpeng/mcp-fleet/main/install.sh",
-    "ghproxycom": "https://gh-proxy.com/https://raw.githubusercontent.com/guoxpeng/mcp-fleet/main/install.sh",
+    "github": "https://raw.githubusercontent.com/guoxpeng/skill-mcp-fleet/main/install.sh",
+    "jsdelivr": "https://cdn.jsdelivr.net/gh/guoxpeng/skill-mcp-fleet@main/install.sh",
+    "ghfast": "https://ghfast.top/https://raw.githubusercontent.com/guoxpeng/skill-mcp-fleet/main/install.sh",
+    "ghproxy": "https://ghproxy.net/https://raw.githubusercontent.com/guoxpeng/skill-mcp-fleet/main/install.sh",
+    "ghproxycom": "https://gh-proxy.com/https://raw.githubusercontent.com/guoxpeng/skill-mcp-fleet/main/install.sh",
 }
 
 
 def cmd_install_cmd(a):
-    opts = "--name %s --port %d" % (a.name, a.port)
+    # 一律走 shlex.quote：原来用单引号手工拼接，值里只要含 ' 就会破坏引号
+    # （命令注入），而 --name / --prefix 干脆没加引号。
+    q = shlex.quote
+    opts = "--name %s --port %d" % (q(str(a.name)), a.port)
     if a.prefix:
-        opts += " --prefix %s" % a.prefix
+        opts += " --prefix %s" % q(str(a.prefix))
     if a.sudo_pass:
-        opts += " --sudo-pass '%s'" % a.sudo_pass
+        opts += " --sudo-pass %s" % q(str(a.sudo_pass))
     if a.tunnel:
         opts += " --tunnel"
     if a.mode and a.mode != "auto":
-        opts += " --mode %s" % a.mode
+        opts += " --mode %s" % q(str(a.mode))
     if getattr(a, "auth_token", None):
-        opts += " --auth-token '%s'" % a.auth_token
+        opts += " --auth-token %s" % q(str(a.auth_token))
     if getattr(a, "allow_ips", None):
-        opts += " --allow-ips '%s'" % a.allow_ips
+        opts += " --allow-ips %s" % q(str(a.allow_ips))
     if getattr(a, "directory", None):
-        opts += " --directory %s" % a.directory
+        opts += " --directory %s" % q(str(a.directory))
     if getattr(a, "directory_token", None):
-        opts += " --directory-token '%s'" % a.directory_token
+        opts += " --directory-token %s" % q(str(a.directory_token))
     if getattr(a, "no_keepalive", False):
         opts += " --no-keepalive"
+    if getattr(a, "generate_token", False):
+        opts += " --generate-token"
+    if getattr(a, "require_auth", False):
+        opts += " --require-auth"
     if a.uninstall:
         opts += " --uninstall"
 
@@ -903,31 +1008,42 @@ def cmd_bootstrap(a):
 
     dest = "%s@%s" % (a.user, a.host)
     keyopt = ["-i", a.key] if a.key else []
+    # accept-new：首次连接仍自动接受（保住「一条命令装完」的体验），
+    # 但主机密钥一旦记录就严格校验。原 StrictHostKeyChecking=no 等于完全放弃
+    # MITM 防护，而这条通道推的正是以 root 执行的安装脚本。
+    hostkey = "StrictHostKeyChecking=accept-new"
     ssh_base = pre + ["ssh"] + keyopt + [
-        "-p", str(a.ssh_port), "-o", "StrictHostKeyChecking=no",
+        "-p", str(a.ssh_port), "-o", hostkey,
         "-o", "ConnectTimeout=%d" % a.timeout, dest]
     scp_base = pre + ["scp"] + keyopt + [
-        "-P", str(a.ssh_port), "-o", "StrictHostKeyChecking=no"]
+        "-P", str(a.ssh_port), "-o", hostkey]
 
-    opts = "--name %s --port %d" % (a.name, a.node_port)
+    # 一律走 shlex.quote：原来用单引号手工拼接，值里只要含 ' 就会破坏引号
+    # （命令注入），而 --name / --prefix 干脆没加引号。
+    q = shlex.quote
+    opts = "--name %s --port %d" % (q(str(a.name)), a.node_port)
     if a.prefix:
-        opts += " --prefix %s" % a.prefix
+        opts += " --prefix %s" % q(str(a.prefix))
     if a.sudo_pass:
-        opts += " --sudo-pass '%s'" % a.sudo_pass
+        opts += " --sudo-pass %s" % q(str(a.sudo_pass))
     if a.tunnel:
         opts += " --tunnel"
     if a.mode and a.mode != "auto":
-        opts += " --mode %s" % a.mode
+        opts += " --mode %s" % q(str(a.mode))
     if getattr(a, "auth_token", None):
-        opts += " --auth-token '%s'" % a.auth_token
+        opts += " --auth-token %s" % q(str(a.auth_token))
     if getattr(a, "allow_ips", None):
-        opts += " --allow-ips '%s'" % a.allow_ips
+        opts += " --allow-ips %s" % q(str(a.allow_ips))
     if getattr(a, "directory", None):
-        opts += " --directory %s" % a.directory
+        opts += " --directory %s" % q(str(a.directory))
     if getattr(a, "directory_token", None):
-        opts += " --directory-token '%s'" % a.directory_token
+        opts += " --directory-token %s" % q(str(a.directory_token))
     if getattr(a, "no_keepalive", False):
         opts += " --no-keepalive"
+    if getattr(a, "generate_token", False):
+        opts += " --generate-token"
+    if getattr(a, "require_auth", False):
+        opts += " --require-auth"
 
     print("== bootstrap %s ==" % dest)
     try:
@@ -1193,6 +1309,16 @@ def cmd_sync(a):
         cur = ((load_registry().get("nodes") or {}).get(name) or {}).get("url") \
             or (discover_nodes(a.agent).get(name) or {}).get("url") or ""
         age = v.get("age")
+        # 采信前同样要过防投毒校验：cmd_sync 原本比 sync_from_directory 更宽松
+        # （完全不探测、直接落盘），是最容易被投毒利用的入口。
+        if cur and cur != new:
+            if not domain_ok(cur, new):
+                print("  %-16s %s" % (name, warn("跳过：域名由 %s 变为 %s，需人工确认"
+                                                % (host_of(cur), host_of(new)))))
+                continue
+            if not probe_anonymous(new, timeout=min(a.timeout, 6)):
+                print("  %-16s %s" % (name, warn("跳过：%s 不像 MCP 副端" % new)))
+                continue
         flag = ok("NEW ") if cur and cur != new else dim("ok  ")
         if cur != new:
             changed += 1
@@ -1325,6 +1451,10 @@ def build_parser():
     sp.add_argument("--directory", help="地址目录地址，副端保活守护会把隧道地址上报到这里")
     sp.add_argument("--directory-token", help="地址目录的令牌（目录开了鉴权时填）")
     sp.add_argument("--no-keepalive", action="store_true", help="不装保活守护（默认装）")
+    sp.add_argument("--generate-token", action="store_true",
+                    help="副端还没令牌时自动生成一个强随机 auth_token（推荐，内网也建议）")
+    sp.add_argument("--require-auth", action="store_true",
+                    help="把「必须鉴权」写进副端配置：没有令牌就拒绝启动")
     sp.add_argument("--uninstall", action="store_true", help="打印卸载命令")
     sp.add_argument("--mirror", default="auto",
                     choices=["auto", "github", "jsdelivr", "ghfast", "ghproxy", "ghproxycom"],
@@ -1350,6 +1480,10 @@ def build_parser():
     sp.add_argument("--directory", help="地址目录地址（副端保活上报隧道地址用）")
     sp.add_argument("--directory-token", help="地址目录令牌")
     sp.add_argument("--no-keepalive", action="store_true", help="不装保活守护")
+    sp.add_argument("--generate-token", action="store_true",
+                    help="副端还没令牌时自动生成一个强随机 auth_token（推荐）")
+    sp.add_argument("--require-auth", action="store_true",
+                    help="把「必须鉴权」写进副端配置：没有令牌就拒绝启动")
     sp.add_argument("--online", action="store_true", help="不用本地 install.sh，让副设备自己下载")
     sp.add_argument("--dry-run", action="store_true")
     sp.add_argument("--timeout", type=int, default=20)
