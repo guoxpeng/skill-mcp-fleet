@@ -66,7 +66,8 @@ curl -fsSL https://api.github.com/repos/guoxpeng/mcp-fleet/contents/install.sh \
 sudo bash install.sh --name fnos --port 3100
 ```
 
-各通道内容一致，MD5 `44f8ec8951f345c2209321e1f2b49473`（43.8 KB，v2.3）。
+各通道内容一致，MD5 `e1d2f08ad314ca707abf0bf8be3eb28f`（76250 B，v3.0）。
+下载后建议核对一遍：`md5sum install.sh`。
 
 看到 `服务状态: active`（systemd 机型）或 `已启动`（容器机型）加 `本机自检通过` 就成了。
 
@@ -81,6 +82,11 @@ sudo bash install.sh --name fnos --port 3100
 | `--sudo-pass` | 需要 sudo 提权时写入配置的密码 | 空（自动用免密 sudo） |
 | `--mode` | 托管方式：`auto` / `systemd` / `nohup` | `auto` |
 | `--tunnel` | 装完顺带起一条公网隧道（云容器/无内网入口时用） | 关 |
+| `--auth-token` | 访问令牌（Bearer）。留空=不鉴权；开隧道时脚本会自动补一个 | 空 |
+| `--allow-ips` | IP/CIDR 白名单，逗号分隔，如 `'10.0.0.0/8,203.0.113.7'` | 空（不限来源） |
+| `--directory` | 地址目录地址，如 `http://192.168.1.10:8790`；填了保活守护会上报隧道地址 | 空 |
+| `--directory-token` | 地址目录的 `X-Fleet-Token` | 空 |
+| `--no-keepalive` | 不装保活守护（默认装：systemd timer 或常驻进程） | 关 |
 | `--uninstall` | 卸载（停服务+删单元+删目录+清隧道进程） | — |
 
 ### 常见场景
@@ -137,9 +143,11 @@ bash /opt/<name>_mcp/mcp-tunnel.sh
   # 在主端电脑上跑，返回 200 就是好的
   curl -s -o /dev/null -w '%{http_code}\n' https://xxx.trycloudflare.com/
   ```
-- **别反复重开隧道**：trycloudflare 对新建快隧有频率限制，短时间建太多会出现「隧道连上了但域名一直不解析」，等 10~30 分钟再试。v2.2 起脚本会复用已有隧道，正常不会触发。
-- QUIC 被网络设备干扰时（日志刷 `no recent network activity`、访问间歇 502）换协议：`CF_PROTO=http2 bash mcp-tunnel.sh`。
-- 公网隧道等于把 root 权限的 exec 挂到互联网，**用完就关**：`kill $(cat /opt/<name>_mcp/tunnel.pid)`。要长期用就上固定隧道（自有域名 + `cloudflared tunnel create`）或端口映射/frp。
+- **别反复重开隧道**：trycloudflare 对新建快隧有频率限制，短时间建太多会出现「隧道连上了但域名一直不解析」，等 10~30 分钟再试。脚本默认**复用已有隧道**，保活守护的铁律也是「能复用绝不重建」，正常不会触发。
+- QUIC 被网络设备干扰时（日志刷 `no recent network activity`、访问间歇 502）换协议：`CF_PROTO=http2 bash mcp-tunnel.sh`。**这一步脚本会自动做**：起隧道后 36 秒内轮询日志，命中 QUIC 报错就杀掉、记下 `.tunnel_proto=http2` 并自动重启为 http2，下次直接沿用。
+- **开隧道前必须设 token**：脚本检测到 `auth_token` 为空会自动生成 32 字节随机 token、写进配置、重启副端，并打印主端该加的 `headers`。见「六、安全说明」。
+- 公网隧道**用完就关**：`kill $(cat /opt/<name>_mcp/tunnel.pid)`。要长期用就上固定隧道（自有域名 + `cloudflared tunnel create`，地址恒定，配 `CF_TOKEN` 走 named tunnel）或端口映射/frp。
+- 地址变了不用手工改 mcp.json —— 配「地址目录」让主端自动跟随，见「八之二」。
 
 ## 三、接入主端（在**主端电脑**上）
 
@@ -231,10 +239,48 @@ bash /opt/<name>_mcp/mcp-ctl.sh {start|stop|restart|status|log|tunnel}
 
 ## 六、安全说明
 
-- 服务以 **root** 运行（systemd 默认），所以 `sudo` 类工具可直接用。**只在内网部署**，不要把端口暴露到公网。
+### 6.1 访问控制（v3.0）
+
+副端以 **root** 运行，`exec` 工具等于**把 root shell 挂出去**。v3.0 起加了两道闸：
+
+| 配置 | 作用 |
+|---|---|
+| `auth_token` | Bearer 令牌。请求要带 `Authorization: Bearer <token>` 或 `X-Fleet-Token`。**留空 = 完全不鉴权** |
+| `allow_ips` | IP/CIDR 白名单。**非空即生效**，不在名单内直接 403（在鉴权之前判） |
+
+另外还有**暴力破解节流**：同一 IP 连续失败 10 次 / 60 秒窗口后，每次鉴权失败
+额外 `sleep 1s`。令牌比对用 `hmac.compare_digest`（常数时间，防时序侧信道）。
+
+启动时如果 `auth_token` 为空，日志会打印一段醒目警告：
+
+```
+鉴权            : [!] 未开启
+[!] 未设置 auth_token：任何能访问本端口的人都等于拿到本机 shell。
+[!] 仅限内网使用；一旦开公网隧道（mcp-tunnel.sh），请务必先设置：
+```
+
+**开隧道时脚本会兜底**：`mcp-tunnel.sh` 检测到 `auth_token` 为空，会
+自动生成 32 字节随机 token、写进配置、重启副端，然后打印 token 和主端该加的
+`headers` 片段。确实不要这层保护（只在完全可信的内网里用）才用
+`FLEET_NO_AUTH=1 bash mcp-tunnel.sh`（会大声警告）。
+
+```bash
+# 安装时就指定
+sudo bash install.sh --name fnos --port 3100 --auth-token '一串随机'
+
+# 或只允许内网网段（此时不要开隧道）
+sudo bash install.sh --name fnos --port 3100 --allow-ips '192.168.1.0/24,10.0.0.0/8'
+```
+
+> `allow_ips` 和公网隧道**基本互斥** —— 走隧道时来源是 cloudflared 本机地址。
+> 要公网访问就用 token。
+
+### 6.2 其他
+
 - 建议用防火墙限制来源：`ufw allow from 192.168.1.0/24 to any port 3100`。
 - `allowed_roots` 是文件读写的安全边界，默认 `/`（不限制）。按需收紧。
 - `install.sh` 不含任何硬编码密码，`--sudo-pass` 由你在安装时传入，明文存于配置文件（root 可读）。
+- 公网隧道**用完就关**：`kill $(cat /opt/<name>_mcp/tunnel.pid)`。
 
 ## 七、常见问题（FAQ）
 
@@ -277,6 +323,11 @@ bash /opt/fnos_mcp/mcp-ctl.sh restart
 | 文件 | 用途 |
 |---|---|
 | `install.sh` | **一键安装脚本**（自包含，已内嵌服务器代码）——拷这一个文件就够了 |
+| `install-offline.sh` | **自解压安装脚本**，内嵌了 install.sh，只需传这一个文件 |
+| `install-offline.b64` | 纯文本离线载荷 = `base64(zlib(install.sh))`（**不是 tar 包**，只需 python3） |
+| `install-offline.partNN.txt` | 同一载荷的分片（默认每片 4000 字符），单条消息有长度限制时用 |
+| `make-offline.py` | 由 `install.sh` 生成上面三个离线文件；`--check` 校验一致性 |
+| `fleet-directory.py` | **地址目录服务**：副端上报隧道地址、主端按名字查最新地址 |
 | `mcp_agent.py` | 副端服务器源码（与内嵌版一致，便于阅读/改） |
 | `add_fleet_node.py` | 主端注册工具（探测 + 测试 + 写 mcp.json） |
 | `build_installer.py` | 改完 `mcp_agent.py` 后重新生成 `install.sh` |
@@ -285,15 +336,74 @@ bash /opt/fnos_mcp/mcp-ctl.sh restart
 | `probe_fleet.py` | 纯诊断脚本（握手 + 列工具 + 调工具），连不上时先用它定位 |
 | `call_node.py` | 直接调用副端工具（不必重启 WorkBuddy），`--list` 列工具、`--tool` 调任意工具 |
 
+> 改了 `mcp_agent.py` 要按顺序重新生成：`python3 build_installer.py && python3 make-offline.py`。
+> 只跑前者的话 `install-offline.*` 还是旧的 —— 跑 `python3 make-offline.py --check` 能发现。
+
 安装完成后，副端目录里还会生成：
 
 | 文件 | 用途 |
 |---|---|
-| `mcp-ctl.sh` | 控制脚本（无 systemd 环境使用） |
+| `mcp-ctl.sh` | 控制脚本（无 systemd 环境使用，两种机型都能看状态） |
 | `_supervisor.sh` | 守护壳，崩溃 3 秒自动重启 |
 | `_portkill.py` | 零依赖按端口清理僵尸进程（替代 `fuser`） |
-| `mcp-tunnel.sh` | cloudflared 公网隧道 |
-| `port.txt` / `agent.pid` / `tunnel.pid` / `agent.log` / `tunnel.log` | 运行时文件 |
+| `mcp-tunnel.sh` | cloudflared 公网隧道（自动补 token、QUIC 自动回退） |
+| `mcp-watchdog.sh` | **保活守护**（`--once` 或常驻循环） |
+| `unit.txt` | 记录 systemd 单元名 |
+| `.want_tunnel` / `.no_keepalive` / `.tunnel_proto` | 标记：要隧道 / 关保活 / 选定的隧道协议 |
+| `current_url.txt` | 当前可用的公网地址（保活守护持续刷新） |
+| `port.txt` / `agent.pid` / `watchdog.pid` / `tunnel.pid` / `agent.log` / `tunnel.log` / `watchdog.log` | 运行时文件 |
+
+## 八之二、保活与地址自动跟随（v3.0）
+
+### 保活：让主端「随时可连」
+
+副端可能因为 OOM、容器重启、隧道进程掉线而失联。保活守护每 60 秒做三件事：
+
+1. **agent 挂了 → 拉起来**（systemd 机型走 `systemctl restart`，容器机型走 `mcp-ctl.sh start`）
+2. **隧道进程没了 → 重建**（*只在进程真的没了时* —— 能复用就绝不重建，避免撞 trycloudflare 限流）
+3. **把当前地址写进 `current_url.txt`，并上报「地址目录」**
+
+systemd 机型用 oneshot service + timer，不占常驻进程：
+
+```bash
+systemctl status <name>-mcp-watchdog.timer
+systemctl start  <name>-mcp-watchdog.service    # 立刻跑一轮
+cat /opt/<name>_mcp/watchdog.log
+```
+
+容器机型用常驻循环（`mcp-ctl.sh start` 会自动拉起）：
+
+```bash
+bash /opt/<name>_mcp/mcp-ctl.sh watchdog    # 跑一轮 + 看守护状态
+bash /opt/<name>_mcp/mcp-ctl.sh wdlog 50    # 看保活日志
+bash /opt/<name>_mcp/mcp-ctl.sh keepalive off   # 关掉
+```
+
+### 地址目录：隧道换域名也不用改 mcp.json
+
+副端重启会换 trycloudflare 域名，主端写死的地址立刻失效。两步解决：
+
+```bash
+# 1) 在一台 7x24 的机器上跑目录服务（NAS 就行）
+python3 fleet-directory.py --port 8790 --token <一串随机>
+
+# 2) 副端安装时告诉它目录在哪
+sudo bash install.sh --name cloud --port 3100 --tunnel \
+  --directory http://192.168.1.10:8790 --directory-token <同一串>
+
+# 3) 主端登记目录
+python3 fleet.py directory --url http://192.168.1.10:8790 --token <同一串>
+```
+
+之后主端在地址不通时会自动问一次目录、换成新地址并回写登记表：
+
+```bash
+python3 fleet.py sync              # 手动刷一遍
+python3 fleet.py exec cloud "uptime"   # 地址失效时自动纠正后重试
+```
+
+目录服务接口：`POST /register`（上报）、`GET /nodes`、`GET /resolve?name=<n>`、
+`DELETE /nodes?name=<n>`。零依赖，落盘 `~/.mcp-fleet/directory.json`。
 
 ## 九、已踩过的坑（别重犯）
 
@@ -309,3 +419,13 @@ bash /opt/fnos_mcp/mcp-ctl.sh restart
 10. **登录 shell 会把容器的欢迎横幅塞进每一次工具返回**——`bash -lc` 会 source `/etc/profile`，PAI-DSW 这类镜像在那里打印 ASCII 图。用配置项 `login_shell: false` 切成 `bash -c` 解决。
 11. **Windows 上做语法检查别直接敲 `bash`**——可能解析到 `C:\Windows\System32\bash.exe`（WSL 桩），在有安全策略的机器上会被拦且报错莫名其妙。用系统里真实 Git Bash 的绝对路径。
 12. **重装不等于更新（v2.2 修复）**——老版本再装一次会打印「已在运行 (pid xxx)」直接跳过，**跑的还是老代码**，你会以为改动没生效。现在：nohup 分支检测到旧实例自动 `restart`，systemd 分支把 `enable --now` 拆成 `enable` + `restart`（`enable --now` 对已 active 的单元不会重启）。配置文件仍然保留、不覆盖。
+
+### v3.0 新增踩过的坑
+
+13. **`pkill -f <关键字>` 会杀掉自己**——这条在开发 v3.0 时又踩了两次：`pkill -f fleet-directory.py` 会把执行该命令的 shell 一起杀掉（因为它的命令行里也含这个字符串），表现是**整条命令毫无输出**。要么用 `pkill -f '[f]leet-directory.py'` 这种方括号技巧，要么把 pkill 写进脚本文件里（脚本自己的命令行只有脚本路径）。
+14. **重装换模式时老的 `_supervisor.sh` 会和 systemd 抢端口**——先用 nohup 装、再用 systemd 装（或反过来），老 supervisor 还在每 3 秒拉起 `mcp_agent.py`，日志里只见 `OSError: [Errno 98] Address already in use` 反复刷，但 `systemctl status` 看起来又是好的。v3.0 起 `install.sh` 在启动前会 `systemctl stop` + 按安装目录 `pkill` 清干净。
+15. **`--auth-token` 在重装时被静默忽略**——配置文件「已存在则不覆盖」是好事（保住你的调参），但副作用是命令行给的 `--auth-token` / `--allow-ips` / `--directory` 全不生效，表现为「我明明传了 token，副端却还在用旧的」。v3.0 起这些参数会**合并进**已有配置（不带则保留原值）。
+16. **`mcp-ctl.sh status` 说「未运行」但服务是好的**——老脚本只看 `agent.pid`，systemd 机型根本没这个文件。v3.0 起先问 `systemctl is-active`，输出 `运行中（systemd: xxx，状态 active）`，并带上保活定时器和当前隧道地址。
+17. **自解压脚本别用 heredoc 喂给 python**——`python3 -c '...' "$TMP" <<'EOF' ... EOF` 在 Git-Bash + 原生 Windows Python 下 stdin 拿不到数据（解出 0 字节）。`make-offline.py` 生成的脚本改成「让 python 读脚本自己、按 `FLEET_PAYLOAD_BEGIN/END` 标记切出载荷」，任何平台都稳，且载荷行前缀 `#` 所以 `bash -n` 也能过。
+18. **探测死地址抛异常会盖住真正的成功**——`urlopen` 对死地址抛 `URLError`。如果不吞掉，用户看到的是「连不上」，而不是「自动纠正到新地址后成功了」。所有探活调用都要 `try/except`。
+19. **改了 `install.sh` 忘了重新生成离线包**——`install-offline.*` 是**生成物**，不会自动跟着变。跑 `python3 make-offline.py --check` 会逐字节比对三个产物与 `install.sh`，不一致就报错。发布前务必跑一次。
