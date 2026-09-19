@@ -225,8 +225,9 @@ say "[D] 模型完整: $FINAL 字节"
 # ---------- E. 起 ollama serve（先于 create，确保 daemon 在）----------
 say "[E] 启动 ollama serve (0.0.0.0:11434) ..."
 if ! pgrep -f "ollama serve" >/dev/null 2>&1; then
+  DETACH=""; command -v setsid >/dev/null 2>&1 && DETACH="setsid"
   OLLAMA_MODELS="$OLLAMA_MODELS" OLLAMA_HOST=0.0.0.0:11434 OLLAMA_KEEP_ALIVE=24h OLLAMA_NUM_PARALLEL=1 \
-    setsid nohup ollama serve > "$BASE/ollama.log" 2>&1 < /dev/null &
+    $DETACH nohup ollama serve > "$BASE/ollama.log" 2>&1 < /dev/null &
   sleep 8
 fi
 curl -s -m 10 -o /dev/null -w "[E] /api/tags HTTP %{http_code}\n" http://127.0.0.1:11434/api/tags || true
@@ -292,9 +293,10 @@ if pgrep -f "$BASE/worker.sh" >/dev/null 2>&1; then
   say "  worker 已在运行，不重复派发"
 else
   : > "$LOG"
-  setsid nohup bash "$BASE/worker.sh" >> "$LOG" 2>&1 < /dev/null &
+  DETACH=""; command -v setsid >/dev/null 2>&1 && DETACH="setsid"
+  $DETACH nohup bash "$BASE/worker.sh" >> "$LOG" 2>&1 < /dev/null &
   sleep 2
-  say "  已派发（pid $(pgrep -f "$BASE/worker.sh" | head -1)）"
+  say "  已派发（pid $(pgrep -f "$BASE/worker.sh" 2>/dev/null | head -1)）"
 fi
 
 say "--- 4/4 完成 ---"
