@@ -1,6 +1,6 @@
 MCP 副端 · 全离线安装包说明
 ============================================================
-内嵌的是 install.sh：76250 字节，md5 e1d2f08ad314ca707abf0bf8be3eb28f
+内嵌的是 install.sh：77092 字节，md5 482310d6e15d84ad9f78591bba0b7fb7
 载荷格式 = base64( zlib( install.sh ) ) —— **单个压缩文件，不是 tar 包**，
 不要用 `tar xf` 去解，那样只会报错。
 
@@ -22,7 +22,7 @@ MCP 副端 · 全离线安装包说明
 只有 base64，没有任何注释行 —— 所以下面这条命令是**整文件直接解码**，不用预处理：
 
     python3 -c "import base64,zlib;open('/tmp/mcp-install.sh','wb').write(zlib.decompress(base64.b64decode(open('install-offline.b64','rb').read())))"
-    md5sum /tmp/mcp-install.sh      # 应为 e1d2f08ad314ca707abf0bf8be3eb28f
+    md5sum /tmp/mcp-install.sh      # 应为 482310d6e15d84ad9f78591bba0b7fb7
     sudo bash /tmp/mcp-install.sh --name <名字> --port 3100
 
 ------------------------------------------------------------
@@ -39,7 +39,7 @@ MCP 副端 · 全离线安装包说明
 ------------------------------------------------------------
 校验
 ------------------------------------------------------------
-    md5sum install.sh                        e1d2f08ad314ca707abf0bf8be3eb28f   ← 解出来的应是这个
+    md5sum install.sh                        482310d6e15d84ad9f78591bba0b7fb7   ← 解出来的应是这个
     python3 make-offline.py --check          # 逐字节比对全部产物
 
 全部产物的校验和见 install-offline.sha256。
