@@ -66,7 +66,7 @@ curl -fsSL https://api.github.com/repos/guoxpeng/mcp-fleet/contents/install.sh \
 sudo bash install.sh --name fnos --port 3100
 ```
 
-各通道内容一致，MD5 `e1d2f08ad314ca707abf0bf8be3eb28f`（76250 B，v3.0）。
+各通道内容一致，MD5 `482310d6e15d84ad9f78591bba0b7fb7`（77092 B，v3.0）。
 下载后建议核对一遍：`md5sum install.sh`。
 
 看到 `服务状态: active`（systemd 机型）或 `已启动`（容器机型）加 `本机自检通过` 就成了。
@@ -324,9 +324,11 @@ bash /opt/fnos_mcp/mcp-ctl.sh restart
 |---|---|
 | `install.sh` | **一键安装脚本**（自包含，已内嵌服务器代码）——拷这一个文件就够了 |
 | `install-offline.sh` | **自解压安装脚本**，内嵌了 install.sh，只需传这一个文件 |
-| `install-offline.b64` | 纯文本离线载荷 = `base64(zlib(install.sh))`（**不是 tar 包**，只需 python3） |
-| `install-offline.partNN.txt` | 同一载荷的分片（默认每片 4000 字符），单条消息有长度限制时用 |
-| `make-offline.py` | 由 `install.sh` 生成上面三个离线文件；`--check` 校验一致性 |
+| `install-offline.b64` | 离线载荷 = `base64(zlib(install.sh))`，**纯 base64 无注释行**（**不是 tar 包**，只需 python3） |
+| `install-offline.partNN.txt` | 同一载荷的分片（默认每片 4000 字符），**纯 base64**，`cat` 拼即可 |
+| `install-offline.README.txt` | 离线包的使用说明（三条路径的命令、校验值、注意事项） |
+| `install-offline.sha256` | 全部产物的 md5 校验和 |
+| `make-offline.py` | 由 `install.sh` 生成上面几个离线文件；`--check` 逐字节校验一致性 |
 | `fleet-directory.py` | **地址目录服务**：副端上报隧道地址、主端按名字查最新地址 |
 | `mcp_agent.py` | 副端服务器源码（与内嵌版一致，便于阅读/改） |
 | `add_fleet_node.py` | 主端注册工具（探测 + 测试 + 写 mcp.json） |
@@ -335,6 +337,7 @@ bash /opt/fnos_mcp/mcp-ctl.sh restart
 | `mcp_agent_config.example.json` | 配置样例 |
 | `probe_fleet.py` | 纯诊断脚本（握手 + 列工具 + 调工具），连不上时先用它定位 |
 | `call_node.py` | 直接调用副端工具（不必重启 WorkBuddy），`--list` 列工具、`--tool` 调任意工具 |
+| `.gitattributes` | 强制全仓库 LF 换行，防止 Windows 上 clone 后 shell 脚本被转成 CRLF |
 
 > 改了 `mcp_agent.py` 要按顺序重新生成：`python3 build_installer.py && python3 make-offline.py`。
 > 只跑前者的话 `install-offline.*` 还是旧的 —— 跑 `python3 make-offline.py --check` 能发现。
@@ -429,3 +432,16 @@ python3 fleet.py exec cloud "uptime"   # 地址失效时自动纠正后重试
 17. **自解压脚本别用 heredoc 喂给 python**——`python3 -c '...' "$TMP" <<'EOF' ... EOF` 在 Git-Bash + 原生 Windows Python 下 stdin 拿不到数据（解出 0 字节）。`make-offline.py` 生成的脚本改成「让 python 读脚本自己、按 `FLEET_PAYLOAD_BEGIN/END` 标记切出载荷」，任何平台都稳，且载荷行前缀 `#` 所以 `bash -n` 也能过。
 18. **探测死地址抛异常会盖住真正的成功**——`urlopen` 对死地址抛 `URLError`。如果不吞掉，用户看到的是「连不上」，而不是「自动纠正到新地址后成功了」。所有探活调用都要 `try/except`。
 19. **改了 `install.sh` 忘了重新生成离线包**——`install-offline.*` 是**生成物**，不会自动跟着变。跑 `python3 make-offline.py --check` 会逐字节比对三个产物与 `install.sh`，不一致就报错。发布前务必跑一次。
+20. **离线载荷文件里绝不能写注释说明**——`install-offline.b64` 和 `install-offline.partNN.txt` 原本各带一个 `# ... 第 1/9 片` 的说明头。看起来无害，实际是致命的：头里的 `MCP`、`install`、`sh`、`1/9` **全都在 base64 字母表内**，`b64decode` 不会丢弃它们，而是当成数据插进流里 → `zlib.error: incorrect header check`。而文档给用户的命令恰恰是「整文件解码」和「`cat` 拼接」，所以用户照着做必然失败。现在这两个文件只放纯 base64，说明文字统一挪到 `install-offline.README.txt`。
+21. **校验脚本不能自己「帮」用户预处理**——上面的 bug 之所以一直没被发现，是因为 `make-offline.py --check` 里**自己先剥掉了 `#` 注释行**再去解码，于是永远绿。校验必须用**用户实际会敲的那条命令**（整文件 `b64decode`、朴素 `cat`）去跑，否则校验通过 ≠ 用户能跑通。现在 `--check` 还会检查载荷里有没有 base64 字母表之外的字符。
+22. **`--uninstall` 漏删保活定时器**——早先卸载只删 `${UNIT}.service`，忘了 `${UNIT}-watchdog.timer` / `.service`。而 timer 是 `enabled` + `active` 的，安装目录被 `rm -rf` 之后它仍会**每 60 秒**触发一次 oneshot，单元里的 `WorkingDirectory=$DIR` 已不存在，于是 journal 里永远刷：
+    ```
+    Failed at step CHDIR spawning /bin/bash: No such file or directory
+    nasbeta-mcp-watchdog.service: Failed with result 'exit-code'.
+    ```
+    现在卸载会**先** `disable --now` 掉 timer、停掉 service、删掉两个单元文件，再删目录。遇到老版本装出来的机器，手工清一下：
+    ```bash
+    systemctl disable --now <name>-mcp-watchdog.timer
+    rm -f /etc/systemd/system/<name>-mcp-watchdog.{timer,service}
+    systemctl daemon-reload
+    ```
