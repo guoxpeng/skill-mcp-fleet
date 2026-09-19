@@ -55,6 +55,7 @@ import argparse
 import hmac
 import json
 import os
+import re
 import sys
 import threading
 import time
@@ -67,9 +68,18 @@ try:
 except Exception:
     pass
 
-VERSION = "1.0.0"
+VERSION = "1.1.0"
 HOME_DIR = os.path.join(os.path.expanduser("~"), ".mcp-fleet")
 STORE = os.path.join(HOME_DIR, "directory.json")
+
+# 节点名白名单：避免超长名/奇怪字符把目录撑坏（目录是按 name 覆盖写的）
+NAME_RE = re.compile(r"^[A-Za-z0-9_.-]{1,64}$")
+MAX_NODES = 200
+
+# 注册限速：默认无 token 时注册接口对任何来源开放，不加限速可被刷爆内存/磁盘
+RATE = {}            # {ip: [次数, 窗口起点]}
+RATE_LIMIT = 30      # 每窗口最多注册次数
+RATE_WINDOW = 60     # 窗口秒数
 
 _lock = threading.Lock()
 _state = {"nodes": {}}
@@ -101,20 +111,52 @@ def save_store():
         with open(tmp, "w", encoding="utf-8") as f:
             json.dump(_state, f, ensure_ascii=False, indent=2)
         os.replace(tmp, STORE)
+        try:
+            os.chmod(STORE, 0o600)      # 节点清单属于内部拓扑，不收权限等于对外公开
+        except Exception:
+            pass
     except Exception as e:
         print("[!] 写 %s 失败：%r" % (STORE, e))
+
+
+def rate_ok(ip):
+    """按来源 IP 限速，防止注册接口被刷（默认无 token 时它是对任何来源开放的）。"""
+    now = time.time()
+    with _lock:
+        cnt, start = RATE.get(ip, [0, now])
+        if now - start > RATE_WINDOW:
+            cnt, start = 0, now
+        cnt += 1
+        RATE[ip] = [cnt, start]
+        # 字典只增不减会成为内存慢泄漏，顺手清理过期条目
+        if len(RATE) > 512:
+            for k in [k for k, v in list(RATE.items()) if now - v[1] > RATE_WINDOW * 5]:
+                RATE.pop(k, None)
+    return cnt <= RATE_LIMIT
 
 
 # --------------------------------------------------------------------------- #
 # 业务
 # --------------------------------------------------------------------------- #
+def _host_of(u):
+    try:
+        return (urlparse(u).hostname or "").lower()
+    except Exception:
+        return ""
+
+
 def register(payload):
     name = (payload.get("name") or "").strip()
     url = (payload.get("url") or "").strip().rstrip("/")
     if not name:
         return 400, {"ok": False, "error": "缺少 name"}
+    # name 是覆盖写的唯一键，必须限字符与长度，否则可被超长/畸形名撑坏
+    if not NAME_RE.match(name):
+        return 400, {"ok": False, "error": "name 仅允许字母数字._- 且不超过 64 字符"}
     if not url.startswith(("http://", "https://")):
         return 400, {"ok": False, "error": "url 必须是 http(s):// 开头"}
+    if len(url) > 512:
+        return 400, {"ok": False, "error": "url 过长"}
 
     port = payload.get("port") or 0
     try:
@@ -130,18 +172,32 @@ def register(payload):
 
     with _lock:
         old = _state["nodes"].get(name)
+        if old is None and len(_state["nodes"]) >= MAX_NODES:
+            return 429, {"ok": False, "error": "节点数已达上限 %d" % MAX_NODES}
         changed = (not old) or old.get("url") != url
+        old_host = _host_of(old.get("url") or "") if old else ""
+        new_host = _host_of(url)
+        # 域名整体换掉（不只是路径/端口）是个强信号：quick tunnel 重建属正常，
+        # 但也正是「投毒」的形态。这里只做标记，是否采信由主端决定。
+        domain_changed = bool(old_host) and old_host != new_host
+        hits = (old or {}).get("hits", 0) + 1
         _state["nodes"][name] = {
             "url": url,
             "port": port,
             "ts": ts,
             "seen": int(time.time()),
-            "hits": (old or {}).get("hits", 0) + 1,
+            "hits": hits,
             "remote": payload.get("_remote", ""),
+            "domain_changed": domain_changed,
         }
-        save_store()
-    print("[+] %s -> %s%s" % (name, url, "  (地址变更)" if changed else ""))
-    return 200, {"ok": True, "name": name, "url": url, "changed": changed}
+        # 只在地址变化或每 10 次上报时落盘：原实现每次注册都写盘，
+        # 无 token 时可被刷爆磁盘 IO。
+        if changed or hits % 10 == 1:
+            save_store()
+    print("[+] %s -> %s%s%s" % (name, url, "  (地址变更)" if changed else "",
+                                "  [域名变更]" if domain_changed else ""))
+    return 200, {"ok": True, "name": name, "url": url, "changed": changed,
+                 "domain_changed": domain_changed}
 
 
 def nodes_view():
@@ -173,9 +229,20 @@ class Handler(BaseHTTPRequestHandler):
         self.send_response(code)
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(body)))
-        self.send_header("Access-Control-Allow-Origin", "*")
-        self.send_header("Access-Control-Allow-Headers", "Content-Type, X-Fleet-Token, Authorization")
-        self.send_header("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS")
+        # 默认不发任何 CORS 头。原实现无条件回 Access-Control-Allow-Origin: *，
+        # 等于允许任意网页跨域读取整个集群的节点清单与入口地址。
+        # 目录服务是给主端/副端程序调的，浏览器本就不该直连。
+        try:
+            allow = list(ARGS.cors_origins or []) if ARGS is not None else []
+        except Exception:
+            allow = []
+        origin = (self.headers.get("Origin") or "").strip()
+        if allow and origin and origin in allow:
+            self.send_header("Access-Control-Allow-Origin", origin)
+            self.send_header("Vary", "Origin")
+            self.send_header("Access-Control-Allow-Headers",
+                             "Content-Type, X-Fleet-Token, Authorization")
+            self.send_header("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS")
         self.end_headers()
         try:
             self.wfile.write(body)
@@ -191,7 +258,12 @@ class Handler(BaseHTTPRequestHandler):
             auth = self.headers.get("Authorization", "")
             if auth.lower().startswith("bearer "):
                 got = auth[7:].strip()
-        return bool(got) and hmac.compare_digest(got, ARGS.token)
+        if not got:
+            return False
+        # 必须比 bytes：HTTP 头按 latin-1 解码，请求头里塞非 ASCII 字节会让
+        # compare_digest(str, str) 抛 TypeError —— 一条可被外部触发的异常路径。
+        return hmac.compare_digest(got.encode("utf-8", "surrogateescape"),
+                                   ARGS.token.encode("utf-8", "surrogateescape"))
 
     def _json_body(self):
         try:
@@ -215,6 +287,9 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(404, {"ok": False, "error": "未知路径，试试 POST /register"})
         if not self._authed():
             return self._send(401, {"ok": False, "error": "鉴权失败：缺少或错误的 X-Fleet-Token"})
+        ip = self.client_address[0] if self.client_address else "?"
+        if not rate_ok(ip):
+            return self._send(429, {"ok": False, "error": "注册过于频繁，请稍后重试"})
         payload = self._json_body()
         payload["_remote"] = self.client_address[0] if self.client_address else ""
         code, resp = register(payload)
@@ -254,6 +329,16 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(200, {"ok": True, "ttl": ARGS.ttl, "nodes": nodes_view()})
 
         if path == "/":
+            # 探活留着（监控/负载均衡要用），但**不向未认证者** dump 全量
+            # 节点清单与落盘路径 —— 原实现任何人 GET / 就能拿到整个集群的
+            # 公网入口列表 + 服务端存储路径。
+            if not self._authed():
+                return self._send(200, {
+                    "ok": True,
+                    "service": "fleet-directory",
+                    "version": VERSION,
+                    "auth_required": True,
+                })
             return self._send(200, {
                 "ok": True,
                 "service": "fleet-directory",
@@ -277,13 +362,33 @@ def main():
         description="MCP-Fleet 地址目录：副端上报自己的公网地址，主端按名字查最新地址",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__.split("用法")[-1] if "用法" in __doc__ else "")
-    ap.add_argument("--host", default="0.0.0.0", help="监听地址（默认 0.0.0.0）")
+    ap.add_argument("--host", default="127.0.0.1",
+                    help="监听地址（默认 127.0.0.1；要给别的机器用请显式写 --host 0.0.0.0）")
     ap.add_argument("--port", type=int, default=8790, help="监听端口（默认 8790）")
     ap.add_argument("--token", default=os.environ.get("FLEET_DIRECTORY_TOKEN", ""),
-                    help="可选：注册/查询都要带的 X-Fleet-Token")
+                    help="注册/查询都要带的 X-Fleet-Token（对非本机监听时为必需）")
+    ap.add_argument("--cors-origins", default="",
+                    help="可选：允许跨域的来源，逗号分隔。留空 = 完全不发 CORS 头（推荐）")
+    ap.add_argument("--i-know-its-insecure", action="store_true",
+                    help="明知风险：在无 token 且监听非本机的情况下强行启动")
     ap.add_argument("--ttl", type=int, default=600,
                     help="多少秒没上报就算「陈旧」（默认 600，仅用于标记，不删数据）")
     ARGS = ap.parse_args()
+    ARGS.cors_origins = [s.strip() for s in (ARGS.cors_origins or "").split(",") if s.strip()]
+
+    # ---- 启动前安全校验（v1.1）-------------------------------------------
+    if not ARGS.token and ARGS.host not in ("127.0.0.1", "localhost", "::1"):
+        if not ARGS.i_know_its_insecure:
+            print("[FATAL] 监听 %s 但未设置 --token。" % ARGS.host, file=sys.stderr)
+            print("        无 token 的注册接口对任何来源开放 = 任何人都能改写节点地址；",
+                  file=sys.stderr)
+            print("        主端随后会把副端令牌发向他们指定的地址（令牌泄漏 + 节点劫持）。",
+                  file=sys.stderr)
+            print("        请加 --token <强随机串>；确实要裸跑请再加 --i-know-its-insecure。",
+                  file=sys.stderr)
+            sys.exit(2)
+        print("[warn] 无 token 且监听 %s —— 任何能访问该端口的人都能注册/改写节点地址。"
+              % ARGS.host, file=sys.stderr)
 
     load_store()
 
