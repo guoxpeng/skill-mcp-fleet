@@ -1,0 +1,24 @@
+# 换行符策略 —— 强制 LF
+# ---------------------------------------------------------------------------
+# 仓库里有 shell 脚本。如果 clone 到 Windows 后被 autocrlf 转成 CRLF，
+# 传回 Linux 上会跑不起来（`set -euo pipefail` 那一行就开始报错）。
+# 所有文本文件统一按 LF 存、按 LF 检出，避免这个坑。
+#
+# 自检：
+#   python -c "print(open('install.sh','rb').read().count(b'\r\n'))"   # 必须是 0
+# ---------------------------------------------------------------------------
+
+* text=auto eol=lf
+
+*.sh      text eol=lf
+*.py      text eol=lf
+*.md      text eol=lf
+*.json    text eol=lf
+*.txt     text eol=lf
+*.b64     text eol=lf
+*.service text eol=lf
+*.sha256  text eol=lf
+
+install.sh            text eol=lf
+install-offline.sh    text eol=lf
+install-offline.b64   text eol=lf
