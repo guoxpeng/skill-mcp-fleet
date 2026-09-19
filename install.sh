@@ -25,6 +25,9 @@
 #      --no-keepalive      关闭保活守护（默认开启：agent 挂了拉起、隧道断了重建、
 #                          地址持续上报）
 #      --tunnel           装完顺便起 cloudflared 快速隧道（云容器/无公网入口时用）
+#      --require-auth      把「必须鉴权」写进配置：没有 auth_token 时副端拒绝启动
+#                          （公网/隧道场景建议加；内网也推荐）
+#      --generate-token    若还没有 auth_token，自动生成一个强随机值写进配置
 #      --uninstall         卸载（停服务 + 删单元 + 删目录）
 #
 #  依赖：python3（只用标准库，无需 pip）。
@@ -47,6 +50,8 @@ ALLOW_IPS_JSON="[]"
 DIRECTORY_URL=""
 DIRECTORY_TOKEN=""
 KEEPALIVE="1"
+REQUIRE_AUTH="0"
+GEN_TOKEN="0"
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -62,8 +67,10 @@ while [ $# -gt 0 ]; do
     --directory)  DIRECTORY_URL="${2:-}"; shift 2 ;;
     --directory-token) DIRECTORY_TOKEN="${2:-}"; shift 2 ;;
     --no-keepalive) KEEPALIVE="0"; shift ;;
+    --require-auth) REQUIRE_AUTH="1"; shift ;;
+    --generate-token) GEN_TOKEN="1"; shift ;;
     --uninstall)  UNINSTALL="1"; shift ;;
-    -h|--help)    sed -n '2,40p' "$0" 2>/dev/null || echo "(管道方式不支持 --help，请见 README)"; exit 0 ;;
+    -h|--help)    sed -n '2,44p' "$0" 2>/dev/null || echo "(管道方式不支持 --help，请见 README)"; exit 0 ;;
     *) echo "[!] 未知参数: $1"; exit 1 ;;
   esac
 done
@@ -231,7 +238,7 @@ for _stream in (sys.stdout, sys.stderr):
 DEFAULT_CONFIG = {
     "name": "node",             # 副端标识（显示在状态页与 serverInfo）
     "tool_prefix": "",          # 工具名前缀，如 "nas_"；留空则用裸名（exec/read/...）
-    "version": "3.0.0",
+    "version": "3.1.0",
     "sudo_password": "",        # 留空且非 root 时会尝试免密 sudo
     "work_dir": "/",            # 默认工作目录
     "command_timeout": 120,     # 秒
@@ -248,6 +255,17 @@ DEFAULT_CONFIG = {
     # 可选来源 IP 白名单，支持单个 IP 或 CIDR。留空 = 不限制。
     # 例：["192.168.1.0/24", "10.8.0.2"]
     "allow_ips": [],
+    # ---- 加固项（v3.1）----------------------------------------------------
+    # True 时空 auth_token 直接拒绝启动（隧道/公网场景必开，内网建议开）。
+    "require_auth": False,
+    # CORS 白名单。留空 = 完全不发 CORS 响应头（默认，最安全）。
+    # MCP 客户端是程序不是浏览器，本就不需要 CORS；
+    # 只有确有浏览器端调用需求时，才填具体来源，如 ["http://localhost:3000"]。
+    "cors_allow_origins": [],
+    # 单请求体上限（字节），防止 Content-Length 撑爆内存/线程。
+    "max_body_bytes": 1048576,       # 1 MB
+    # SSE 并发连接上限，防止线程被常驻连接打满。
+    "max_sse_conns": 16,
 }
 
 
@@ -260,6 +278,31 @@ def load_config():
         except Exception as e:
             print("[warn] 读配置失败，用默认值: %s" % e, file=sys.stderr)
     return cfg
+
+
+def save_config(cfg):
+    """写回配置文件，并**无条件**收紧权限为 0600。
+
+    配置里有 auth_token（可能还有 sudo_password）。0644 意味着同机任何用户
+    都能读到它 —— 所以权限不能只在「首次安装」时设一次，必须每次写都收紧。
+    """
+    try:
+        with open(CONFIG_PATH, "w", encoding="utf-8") as f:
+            json.dump(cfg, f, ensure_ascii=False, indent=2)
+            f.write("\n")
+    except Exception as e:
+        print("[warn] 写配置失败: %s" % e, file=sys.stderr)
+        return False
+    try:
+        os.chmod(CONFIG_PATH, 0o600)
+    except Exception:
+        pass
+    return True
+
+
+def gen_token():
+    """生成 32 字节 urlsafe 随机令牌（约 43 字符），不含引号/特殊字符。"""
+    return base64.urlsafe_b64encode(os.urandom(32)).decode().rstrip("=")
 
 
 CFG = load_config()
@@ -360,8 +403,11 @@ def check_access(ip, headers):
     if not tok:
         return None
     got = _token_of(headers)
-    # 常数时间比较，避免按字符猜测
-    if got and hmac.compare_digest(got, tok):
+    # 常数时间比较，避免按字符猜测。
+    # 必须比 bytes：HTTP 头按 latin-1 解码，请求头里塞非 ASCII 字节会让
+    # compare_digest(str, str) 抛 TypeError —— 一条可被外部触发的未捕获异常路径。
+    if got and hmac.compare_digest(got.encode("utf-8", "surrogateescape"),
+                                   tok.encode("utf-8", "surrogateescape")):
         AUTH_FAILS.pop(ip, None)
         return None
     _note_auth_fail(ip)
@@ -371,11 +417,20 @@ def check_access(ip, headers):
 
 
 def _check_path(p):
-    """安全边界：只允许 allowed_roots 下的路径。"""
+    """安全边界：只允许 allowed_roots 下的路径。
+
+    用 realpath 而非 abspath —— abspath 不解析软链，在允许目录里放一个
+    指向 /etc/shadow 的软链即可逃逸（cat/sed 会跟随软链），等于没拦。
+    另请注意：本边界只作用于 read/write/edit/list_dir，**不约束 exec**，
+    默认 allowed_roots=["/"] 时它提供零实际保护。
+    """
     roots = CFG.get("allowed_roots") or ["/"]
-    ap = os.path.abspath(p)
+    ap = os.path.realpath(p)
     for r in roots:
-        if r == "/" or ap == r or ap.startswith(r.rstrip("/") + "/"):
+        rr = "/" if str(r) == "/" else os.path.realpath(r)
+        # 用 os.sep 拼后缀：硬写 "/" 在 Windows 上拼不出 "\"，前缀判断会永远失败
+        # （Linux 下 os.sep 就是 "/"，与原行为完全等价）
+        if rr == "/" or ap == rr or ap.startswith(rr.rstrip("/\\") + os.sep):
             return ap
     raise ValueError("路径不在允许范围内: %s" % ap)
 
@@ -703,6 +758,10 @@ def handle_rpc(msg):
 
 SESSIONS = {}
 
+# SSE 并发计数：每个 /sse 连接会常驻一个 while True 线程，无上限时可被打满。
+SSE_LOCK = threading.Lock()
+SSE_ACTIVE = 0
+
 
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
@@ -711,15 +770,32 @@ class Handler(BaseHTTPRequestHandler):
         pass
 
     def _cors(self):
-        self.send_header("Access-Control-Allow-Origin", "*")
-        self.send_header("Access-Control-Allow-Headers", "*")
-        self.send_header("Access-Control-Allow-Methods", "GET,POST,OPTIONS,DELETE")
+        """默认**不发**任何 CORS 响应头。
+
+        原实现对每个响应都回 Access-Control-Allow-Origin: * —— 在无鉴权时，
+        你只要访问过任意一个被挂马的网页，该网页就能 fetch 本机 :3100 执行
+        命令**并读到返回值**。MCP 客户端是程序不是浏览器，本就不需要 CORS；
+        确需跨域时在配置里填 cors_allow_origins，按 Origin 精确回显。
+        """
+        allow = CFG.get("cors_allow_origins") or []
+        if not allow:
+            return
+        origin = (self.headers.get("Origin") or "").strip()
+        if origin and origin in allow:
+            self.send_header("Access-Control-Allow-Origin", origin)
+            self.send_header("Vary", "Origin")
+            self.send_header("Access-Control-Allow-Headers",
+                             "Authorization, Content-Type, Mcp-Session-Id, X-Fleet-Token")
+            self.send_header("Access-Control-Allow-Methods", "GET,POST,OPTIONS,DELETE")
 
     def _guard(self):
         """鉴权闸门。返回 True 表示已拦截（响应也发完了）。"""
         ip = self.client_address[0] if self.client_address else "?"
         denied = check_access(ip, self.headers)
         if denied is None:
+            # 只有「配了 token 且校验通过」才算可信；裸奔模式下不算，
+            # 状态页据此收敛输出，避免向未认证者暴露指纹。
+            self._trusted = bool(CFG.get("auth_token") or "")
             return False
         code, why = denied
         body = json.dumps({"error": why, "hint": "auth_token 配置见 mcp_agent_config.json"},
@@ -758,7 +834,16 @@ class Handler(BaseHTTPRequestHandler):
         if self._guard():
             return
         path = self.path.split("?")[0].rstrip("/")
-        length = int(self.headers.get("Content-Length") or 0)
+        # 边界校验：length 原来直接取自请求头且无上限 —— -1 会一直读到 EOF，
+        # 超大值会一次性吃满内存，单连接即可长时间占住一个线程。
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+        except (TypeError, ValueError):
+            length = -1
+        limit = int(CFG.get("max_body_bytes", 1048576))
+        if length < 0 or length > limit:
+            self._json(413, {"error": "Content-Length 非法或超过上限 %d 字节" % limit})
+            return
         raw = self.rfile.read(length) if length else b""
 
         if path == "/messages":
@@ -800,20 +885,31 @@ class Handler(BaseHTTPRequestHandler):
         self._json(200, resp, sid=sid)
 
     def do_GET(self):
+        global SSE_ACTIVE
         if self._guard():
             return
         path = self.path.split("?")[0].rstrip("/") or "/"
         if path in ("/", "/health", "/status"):
-            self._json(200, {
-                "status": "ok", "server": SERVER_NAME, "version": SERVER_VERSION,
-                "tools": len(TOOLS), "tool_names": [t["name"] for t in TOOLS],
-                "tool_prefix": PREFIX, "root": _is_root(),
-                "auth": bool(CFG.get("auth_token") or ""),
-                "allow_ips": CFG.get("allow_ips") or [],
-                "transports": ["POST /mcp (streamable-http)", "GET /sse (sse)"],
-            })
+            # 探活本身要留（负载均衡/监控要用），但**不向未认证者** dump
+            # 工具清单 / 运行身份 / 是否开鉴权 —— 原输出等于告诉扫描器
+            # 「这里有个不带锁的 root shell」。
+            body = {"status": "ok", "server": SERVER_NAME, "version": SERVER_VERSION}
+            if getattr(self, "_trusted", False):
+                body.update({
+                    "tools": len(TOOLS), "tool_names": [t["name"] for t in TOOLS],
+                    "tool_prefix": PREFIX, "root": _is_root(),
+                    "auth": bool(CFG.get("auth_token") or ""),
+                    "allow_ips": CFG.get("allow_ips") or [],
+                    "transports": ["POST /mcp (streamable-http)", "GET /sse (sse)"],
+                })
+            self._json(200, body)
             return
         if path == "/sse":
+            with SSE_LOCK:
+                if SSE_ACTIVE >= int(CFG.get("max_sse_conns", 16)):
+                    self._json(429, {"error": "SSE 并发连接数已达上限，请稍后重试"})
+                    return
+                SSE_ACTIVE += 1
             sid = uuid.uuid4().hex
             SESSIONS[sid] = []
             self.send_response(200)
@@ -842,6 +938,8 @@ class Handler(BaseHTTPRequestHandler):
                 pass
             finally:
                 SESSIONS.pop(sid, None)
+                with SSE_LOCK:
+                    SSE_ACTIVE -= 1
             return
         self._json(404, {"error": "not found"})
 
@@ -853,9 +951,30 @@ class Handler(BaseHTTPRequestHandler):
 
 def main():
     ap = argparse.ArgumentParser(description="MCP 副端 Agent（零依赖）")
-    ap.add_argument("--host", default="0.0.0.0")
+    # 默认只绑本机：要对外服务必须显式写 --host 0.0.0.0。
+    # 原默认即 0.0.0.0，一次手滑启动就等于全网卡裸奔。
+    ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=3100)
+    ap.add_argument("--require-auth", action="store_true",
+                    help="未配置 auth_token 时拒绝启动（公网/隧道场景建议开启）")
+    ap.add_argument("--generate-token", action="store_true",
+                    help="未配置 auth_token 时自动生成一个并写回配置文件（权限 0600）")
     args = ap.parse_args()
+
+    # ---- 鉴权前置校验（v3.1）---------------------------------------------
+    if args.generate_token and not (CFG.get("auth_token") or ""):
+        CFG["auth_token"] = gen_token()
+        if save_config(CFG):
+            print("  [ok] 已生成随机 auth_token 并写入 %s（权限 0600）" % CONFIG_PATH)
+            print("  [ok] 令牌: %s" % CFG["auth_token"])
+            print("  [ok] 请填入主端 mcp.json 的 headers：Authorization: Bearer <令牌>")
+        else:
+            print("  [!] 生成令牌后写配置失败，本次仍以无鉴权启动", file=sys.stderr)
+    if (args.require_auth or CFG.get("require_auth")) and not (CFG.get("auth_token") or ""):
+        print("[FATAL] 已要求鉴权但 auth_token 为空，拒绝启动。", file=sys.stderr)
+        print("        先执行：python3 mcp_agent.py --generate-token --require-auth",
+              file=sys.stderr)
+        sys.exit(2)
 
     httpd = ThreadingHTTPServer((args.host, args.port), Handler)
     print("MCP 副端 Agent 已启动: %s v%s" % (SERVER_NAME, SERVER_VERSION))
@@ -904,7 +1023,7 @@ else
 {
   "name": "$NAME",
   "tool_prefix": "$PREFIX",
-  "version": "3.0.0",
+  "version": "3.1.0",
   "sudo_password": "$SUDO_PASS",
   "work_dir": "/",
   "command_timeout": 120,
@@ -914,6 +1033,8 @@ else
   "login_shell": true,
   "auth_token": "$AUTH_TOKEN",
   "allow_ips": $ALLOW_IPS_JSON,
+  "require_auth": $( [ "$REQUIRE_AUTH" = "1" ] && echo true || echo false ),
+  "cors_allow_origins": [],
   "directory_url": "$DIRECTORY_URL",
   "directory_token": "$DIRECTORY_TOKEN",
   "tunnel_url": ""
@@ -926,10 +1047,11 @@ fi
 # 否则重装时 --auth-token / --allow-ips / --directory 会被静默忽略，
 # 表现为「我明明传了 token，副端却还在用旧的」。
 if [ "$CFG_PREEXIST" = "1" ] \
-   && { [ -n "$AUTH_TOKEN" ] || [ -n "$ALLOW_IPS" ] || [ -n "$DIRECTORY_URL" ] || [ -n "$DIRECTORY_TOKEN" ]; }; then
-  "$PY3" - "$CFG_FILE" "$AUTH_TOKEN" "$ALLOW_IPS" "$DIRECTORY_URL" "$DIRECTORY_TOKEN" <<'MERGE_PY_EOF'
+   && { [ -n "$AUTH_TOKEN" ] || [ -n "$ALLOW_IPS" ] || [ -n "$DIRECTORY_URL" ] \
+        || [ -n "$DIRECTORY_TOKEN" ] || [ "$REQUIRE_AUTH" = "1" ]; }; then
+  "$PY3" - "$CFG_FILE" "$AUTH_TOKEN" "$ALLOW_IPS" "$DIRECTORY_URL" "$DIRECTORY_TOKEN" "$REQUIRE_AUTH" <<'MERGE_PY_EOF'
 import json, sys
-p, tok, ips, durl, dtok = sys.argv[1:6]
+p, tok, ips, durl, dtok, reqauth = sys.argv[1:7]
 try:
     d = json.load(open(p, encoding="utf-8"))
 except Exception:
@@ -942,16 +1064,55 @@ if durl:
     d["directory_url"] = durl
 if dtok:
     d["directory_token"] = dtok
-d["version"] = "3.0.0"
+if reqauth == "1":
+    d["require_auth"] = True
+d["version"] = "3.1.0"
 d.setdefault("name", "")
 with open(p, "w", encoding="utf-8") as f:
     json.dump(d, f, ensure_ascii=False, indent=2)
     f.write("\n")
 print("已合并命令行参数：%s" % ", ".join(
     k for k, v in (("auth_token", tok), ("allow_ips", ips),
-                   ("directory_url", durl), ("directory_token", dtok)) if v))
+                   ("directory_url", durl), ("directory_token", dtok),
+                   ("require_auth", "1" if reqauth == "1" else "")) if v))
 MERGE_PY_EOF
   chmod 600 "$CFG_FILE" 2>/dev/null || true
+fi
+
+# ---------------------------------------------------------------------------
+# 无条件收紧配置权限（v3.1 加固）
+# 配置里有 auth_token / sudo_password。原实现只在「新建配置」和「带参数重装」
+# 两个分支 chmod 600，**重装不带参数时旧权限原样保留** —— 实测常见 0644 root:root，
+# 意味着同机任何用户都能读到这个 root shell 的令牌。这里一律收紧。
+# ---------------------------------------------------------------------------
+chmod 600 "$CFG_FILE" 2>/dev/null || true
+
+# ---------------------------------------------------------------------------
+# --generate-token：还没有令牌就现场生成一个
+# ---------------------------------------------------------------------------
+if [ "$GEN_TOKEN" = "1" ]; then
+  CUR_TOK="$("$PY3" -c "import json;print(json.load(open('$CFG_FILE')).get('auth_token',''))" 2>/dev/null || echo '')"
+  if [ -n "$CUR_TOK" ]; then
+    log "已有 auth_token，--generate-token 跳过（不覆盖既有令牌）"
+  else
+    NEW_TOK="$("$PY3" -c 'import secrets;print(secrets.token_urlsafe(32))')"
+    "$PY3" - "$CFG_FILE" "$NEW_TOK" <<'GENTOK_PY_EOF'
+import json, sys
+p, tok = sys.argv[1], sys.argv[2]
+try:
+    d = json.load(open(p, encoding="utf-8"))
+except Exception:
+    d = {}
+d["auth_token"] = tok
+with open(p, "w", encoding="utf-8") as f:
+    json.dump(d, f, ensure_ascii=False, indent=2)
+    f.write("\n")
+GENTOK_PY_EOF
+    chmod 600 "$CFG_FILE" 2>/dev/null || true
+    log "已生成随机 auth_token（已写入配置，权限 0600）"
+    log "令牌: $NEW_TOK"
+    warn "主端 mcp.json 必须同步加：\"headers\": { \"Authorization\": \"Bearer $NEW_TOK\" }"
+  fi
 fi
 
 # 按端口清理僵尸进程（零依赖，替代可能不存在的 fuser）
@@ -1315,15 +1476,40 @@ if [ ! -x "$BIN" ]; then
     *) echo "[x] 不支持的 CPU 架构: $ARCH"; exit 1 ;;
   esac
   echo "[+] 下载 cloudflared ($CF) ..."
+  # 顺序：官方源优先（供应链更可信），失败再退到第三方反代。
+  # 反代有能力篡改内容，而 cloudflared 是以 root 常驻运行的 —— 所以下载后
+  # 一律做「ELF 魔数 + 最小体积」校验；要更严就 export CF_SHA256=<官方哈希>。
   ok=0
   for M in \
+    "https://github.com/cloudflare/cloudflared/releases/latest/download/$CF" \
     "https://ghfast.top/https://github.com/cloudflare/cloudflared/releases/latest/download/$CF" \
-    "https://ghproxy.net/https://github.com/cloudflare/cloudflared/releases/latest/download/$CF" \
-    "https://github.com/cloudflare/cloudflared/releases/latest/download/$CF" ; do
-    if curl -fsSL --connect-timeout 20 -o "$BIN" "$M"; then ok=1; break; fi
+    "https://ghproxy.net/https://github.com/cloudflare/cloudflared/releases/latest/download/$CF" ; do
+    if curl -fsSL --connect-timeout 12 -o "$BIN" "$M"; then
+      # 校验 1：必须是 ELF（镜像/网关出错时经常返回一个 HTML 错误页）
+      if ! "$PY" -c "import sys;sys.exit(0 if open(sys.argv[1],'rb').read(4)==b'\x7fELF' else 1)" "$BIN" 2>/dev/null; then
+        echo "[!] 下载物不是 ELF 可执行文件，丢弃该通道"
+        rm -f "$BIN"; continue
+      fi
+      # 校验 2：体积下限（真实二进制数十 MB，明显偏小说明被截断或替换）
+      SZ="$(wc -c < "$BIN" 2>/dev/null || echo 0)"
+      if [ "${SZ:-0}" -lt 5000000 ]; then
+        echo "[!] 下载物体积异常（${SZ:-0} 字节），丢弃该通道"
+        rm -f "$BIN"; continue
+      fi
+      # 校验 3：可选的固定哈希（export CF_SHA256=<官方 sha256>）
+      if [ -n "${CF_SHA256:-}" ]; then
+        GOT="$("$PY" -c "import hashlib,sys;print(hashlib.sha256(open(sys.argv[1],'rb').read()).hexdigest())" "$BIN" 2>/dev/null || echo '')"
+        if [ "$GOT" != "$CF_SHA256" ]; then
+          echo "[!] sha256 不匹配（期望 $CF_SHA256，实际 $GOT），丢弃该通道"
+          rm -f "$BIN"; continue
+        fi
+        echo "[+] cloudflared sha256 校验通过"
+      fi
+      ok=1; break
+    fi
     echo "[!] 通道失败，试下一个"
   done
-  [ "$ok" = "1" ] || { echo "[x] cloudflared 下载失败，请手动放置到 $BIN"; exit 1; }
+  [ "$ok" = "1" ] || { echo "[x] cloudflared 下载失败或校验未通过，请手动放置到 $BIN"; exit 1; }
   chmod +x "$BIN"
 fi
 
@@ -1865,3 +2051,30 @@ $(if [ -n "$AUTH_TOK" ]; then echo "      \"headers\": { \"Authorization\": \"Be
      需要：bash $DIR/mcp-tunnel.sh   拿到公网地址后再填 mcp.json。
 ============================================================================
 EOF
+
+# ---------------------------------------------------------------------------
+# 未设令牌时的加固提示（v3.1）
+# 审计实测：内网安装默认不带 token，等于把 root shell 对同网段裸奔。
+# ---------------------------------------------------------------------------
+if [ -z "$AUTH_TOK" ]; then
+cat <<NOAUTH_HINT
+
+============================================================================
+ [!] 本次安装**没有设置 auth_token**
+     任何能访问 $PORT 端口的人都能以 root 身份操作这台设备（同网段里的其它
+     设备、被挂马的网页都能打进来）。"在内网所以没事"是不成立的。
+
+ 一条命令加固（生成强随机令牌 → 写入配置 → 重启）：
+   bash $DIR/mcp-ctl.sh stop; \\
+   python3 -c "import json,secrets;p='$DIR/mcp_agent_config.json';d=json.load(open(p));d['auth_token']=secrets.token_urlsafe(32);d['require_auth']=True;json.dump(d,open(p,'w'),ensure_ascii=False,indent=2)"; \\
+   chmod 600 "$DIR/mcp_agent_config.json"; bash $DIR/mcp-ctl.sh start; \\
+   python3 -c "import json;print('token =',json.load(open('$DIR/mcp_agent_config.json'))['auth_token'])"
+
+ 拿到令牌后，在**主端** mcp.json 的 "$NAME" 条目里补上：
+   "headers": { "Authorization": "Bearer <令牌>" }
+ 再重启 WorkBuddy。漏了 headers 的话，加完令牌主端就会一直收到 401。
+
+ 或者重装时直接带上参数： --generate-token --require-auth
+============================================================================
+NOAUTH_HINT
+fi
