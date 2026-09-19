@@ -52,7 +52,7 @@ else
   ok=0
   for M in "${MCP_MIRROR[@]}"; do
     say "   试 $M"
-    if curl -fsSL --connect-timeout 15 -m 60 "$M/guoxpeng/mcp-fleet/main/install.sh" -o /tmp/mcp-install.sh \
+    if curl -fsSL --connect-timeout 15 -m 60 "$M/guoxpeng/skill-mcp-fleet/main/install.sh" -o /tmp/mcp-install.sh \
        && [ "$(wc -c < /tmp/mcp-install.sh 2>/dev/null || echo 0)" -gt 40000 ]; then ok=1; break; fi
   done
   if [ "$ok" = 1 ]; then
