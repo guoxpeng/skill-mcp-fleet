@@ -14,6 +14,16 @@
 #      --prefix  <前缀>    工具名前缀（默认空，工具名即 exec/read/...）
 #      --sudo-pass <密码>  可选：写入配置，供 sudo 提权使用
 #      --mode    <模式>    auto(默认) | systemd | nohup
+#      --auth-token <串>   可选：访问令牌。设了之后所有请求都要带
+#                          Authorization: Bearer <串>。公网隧道场景必填
+#                          （--tunnel 时若为空会自动生成一个）
+#      --allow-ips <列表>  可选：来源 IP 白名单，逗号分隔，支持 CIDR
+#                          例：--allow-ips '192.168.1.0/24,10.8.0.2'
+#      --directory <URL>   可选：地址目录地址。副端会把当前隧道地址上报过去，
+#                          主端据此自动更新，不用手工改 mcp.json
+#      --directory-token <串> 可选：地址目录的访问令牌
+#      --no-keepalive      关闭保活守护（默认开启：agent 挂了拉起、隧道断了重建、
+#                          地址持续上报）
 #      --tunnel           装完顺便起 cloudflared 快速隧道（云容器/无公网入口时用）
 #      --uninstall         卸载（停服务 + 删单元 + 删目录）
 #
@@ -31,6 +41,12 @@ SUDO_PASS=""
 UNINSTALL="0"
 MODE="auto"
 DO_TUNNEL="0"
+AUTH_TOKEN=""
+ALLOW_IPS=""
+ALLOW_IPS_JSON="[]"
+DIRECTORY_URL=""
+DIRECTORY_TOKEN=""
+KEEPALIVE="1"
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -41,11 +57,23 @@ while [ $# -gt 0 ]; do
     --sudo-pass)  SUDO_PASS="${2:-}"; shift 2 ;;
     --mode)       MODE="${2:-}"; shift 2 ;;
     --tunnel)     DO_TUNNEL="1"; shift ;;
+    --auth-token) AUTH_TOKEN="${2:-}"; shift 2 ;;
+    --allow-ips)  ALLOW_IPS="${2:-}"; shift 2 ;;
+    --directory)  DIRECTORY_URL="${2:-}"; shift 2 ;;
+    --directory-token) DIRECTORY_TOKEN="${2:-}"; shift 2 ;;
+    --no-keepalive) KEEPALIVE="0"; shift ;;
     --uninstall)  UNINSTALL="1"; shift ;;
-    -h|--help)    sed -n '2,30p' "$0" 2>/dev/null || echo "(管道方式不支持 --help，请见 README)"; exit 0 ;;
+    -h|--help)    sed -n '2,40p' "$0" 2>/dev/null || echo "(管道方式不支持 --help，请见 README)"; exit 0 ;;
     *) echo "[!] 未知参数: $1"; exit 1 ;;
   esac
 done
+
+# --allow-ips 收 "192.168.1.0/24,10.8.0.2" 这种逗号分隔串，转成 JSON 数组
+if [ -n "$ALLOW_IPS" ]; then
+  ALLOW_IPS_JSON="$(printf '%s' "$ALLOW_IPS" | tr ',' '\n' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' \
+    | grep -v '^$' | sed 's/.*/"&"/' | paste -sd, - 2>/dev/null || true)"
+  [ -n "$ALLOW_IPS_JSON" ] && ALLOW_IPS_JSON="[$ALLOW_IPS_JSON]" || ALLOW_IPS_JSON="[]"
+fi
 
 # ---------- 基本信息 ----------
 if [ -z "$NAME" ]; then
@@ -166,6 +194,8 @@ import base64
 import json
 import os
 import re
+import hmac
+import ipaddress
 import shlex
 import subprocess
 import sys
@@ -177,10 +207,19 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 HERE = os.path.dirname(os.path.abspath(__file__))
 CONFIG_PATH = os.path.join(HERE, "mcp_agent_config.json")
 
+# 日志行缓冲：副端是被 nohup/systemd 拉起的常驻进程，stdout 重定向到文件时
+# 默认是块缓冲，启动横幅和诊断信息会一直卡在缓冲区里；进程被 kill 时直接丢失，
+# 表现为 agent.log 一直是空的。这里强制行缓冲。
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(line_buffering=True)
+    except Exception:
+        pass
+
 DEFAULT_CONFIG = {
     "name": "node",             # 副端标识（显示在状态页与 serverInfo）
     "tool_prefix": "",          # 工具名前缀，如 "nas_"；留空则用裸名（exec/read/...）
-    "version": "1.0.0",
+    "version": "3.0.0",
     "sudo_password": "",        # 留空且非 root 时会尝试免密 sudo
     "work_dir": "/",            # 默认工作目录
     "command_timeout": 120,     # 秒
@@ -190,6 +229,13 @@ DEFAULT_CONFIG = {
     "login_shell": True,        # True=bash -lc（会 source /etc/profile）；
                                 # 容器里 profile 打了欢迎横幅（PAI-DSW 等）时设 False，
                                 # 改成 bash -c，输出干净且 PATH 通常够用
+    # ---- 访问控制（v3.0）--------------------------------------------------
+    # 非空则所有请求必须带 Authorization: Bearer <token>（或 X-Fleet-Token）。
+    # 副端以 root 运行、exec 等于 root shell，走公网隧道时**必须**设置。
+    "auth_token": "",
+    # 可选来源 IP 白名单，支持单个 IP 或 CIDR。留空 = 不限制。
+    # 例：["192.168.1.0/24", "10.8.0.2"]
+    "allow_ips": [],
 }
 
 
@@ -223,6 +269,93 @@ def _truncate(s):
     if len(b) <= limit:
         return s
     return b[:limit].decode("utf-8", "ignore") + "\n...[输出已截断，共 %d 字节]" % len(b)
+
+
+# ---------------------------------------------------------------------------
+# 访问控制（v3.0）
+#   副端以 root 运行，exec 等于一个 root shell。内网裸奔尚可接受，
+#   一旦通过 cloudflared 之类的公网隧道暴露，**必须**开 token 鉴权。
+# ---------------------------------------------------------------------------
+AUTH_FAILS = {}          # {ip: [失败次数, 首次失败时间戳]}
+AUTH_FAIL_LIMIT = 10     # 60 秒内失败超过这个数就拖慢响应
+AUTH_FAIL_WINDOW = 60
+
+
+def _norm_net(item):
+    """把 "192.168.1.0/24" / "10.0.0.5" 归一成 ipaddress 网络对象；非法返回 None。"""
+    s = str(item or "").strip()
+    if not s:
+        return None
+    try:
+        if "/" in s:
+            return ipaddress.ip_network(s, strict=False)
+        return ipaddress.ip_network(s + ("/32" if ":" not in s else "/128"), strict=False)
+    except ValueError:
+        return None
+
+
+def _ip_allowed(ip):
+    """allow_ips 为空 → 放行；否则必须在白名单内。"""
+    nets = CFG.get("allow_ips") or []
+    if not nets:
+        return True
+    try:
+        addr = ipaddress.ip_address(ip)
+    except ValueError:
+        return False
+    for item in nets:
+        net = _norm_net(item)
+        if net is None:
+            continue
+        # 只比较同族，避免 IPv4 地址去匹配 IPv6 网段
+        if net.version == addr.version and addr in net:
+            return True
+    return False
+
+
+def _note_auth_fail(ip):
+    now = time.time()
+    cnt, first = AUTH_FAILS.get(ip, [0, now])
+    if now - first > AUTH_FAIL_WINDOW:
+        cnt, first = 0, now
+    cnt += 1
+    AUTH_FAILS[ip] = [cnt, first]
+    if cnt > AUTH_FAIL_LIMIT:
+        time.sleep(1.0)          # 简单拖慢暴力破解，不阻塞其他来源
+    if cnt == AUTH_FAIL_LIMIT:
+        print("[warn] 来自 %s 的鉴权失败已达 %d 次，可能存在探测/爆破" % (ip, cnt),
+              file=sys.stderr)
+
+
+def _token_of(headers):
+    """从请求头取 token：优先 Authorization: Bearer，其次 X-Fleet-Token。"""
+    raw = (headers.get("Authorization") or "").strip()
+    if raw:
+        parts = raw.split(None, 1)
+        if len(parts) == 2 and parts[0].lower() == "bearer":
+            return parts[1].strip()
+        if len(parts) == 1 and parts[0].lower() not in ("bearer",):
+            return parts[0].strip()
+    return (headers.get("X-Fleet-Token") or "").strip()
+
+
+def check_access(ip, headers):
+    """返回 None 表示放行；否则返回 (http_code, 给用户看的说明)。"""
+    if not _ip_allowed(ip):
+        _note_auth_fail(ip)
+        return 403, "来源 IP %s 不在 allow_ips 白名单内" % ip
+    tok = CFG.get("auth_token") or ""
+    if not tok:
+        return None
+    got = _token_of(headers)
+    # 常数时间比较，避免按字符猜测
+    if got and hmac.compare_digest(got, tok):
+        AUTH_FAILS.pop(ip, None)
+        return None
+    _note_auth_fail(ip)
+    if not got:
+        return 401, "缺少凭据。请在请求头带 Authorization: Bearer <token>"
+    return 401, "token 不正确"
 
 
 def _check_path(p):
@@ -570,6 +703,25 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Access-Control-Allow-Headers", "*")
         self.send_header("Access-Control-Allow-Methods", "GET,POST,OPTIONS,DELETE")
 
+    def _guard(self):
+        """鉴权闸门。返回 True 表示已拦截（响应也发完了）。"""
+        ip = self.client_address[0] if self.client_address else "?"
+        denied = check_access(ip, self.headers)
+        if denied is None:
+            return False
+        code, why = denied
+        body = json.dumps({"error": why, "hint": "auth_token 配置见 mcp_agent_config.json"},
+                          ensure_ascii=False).encode("utf-8")
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        if code == 401:
+            self.send_header("WWW-Authenticate", 'Bearer realm="mcp-fleet"')
+        self.send_header("Connection", "close")
+        self.end_headers()
+        self.wfile.write(body)
+        return True
+
     def _json(self, code, obj, sid=None):
         body = json.dumps(obj, ensure_ascii=False).encode("utf-8")
         self.send_response(code)
@@ -591,6 +743,8 @@ class Handler(BaseHTTPRequestHandler):
         self._empty(204)
 
     def do_POST(self):
+        if self._guard():
+            return
         path = self.path.split("?")[0].rstrip("/")
         length = int(self.headers.get("Content-Length") or 0)
         raw = self.rfile.read(length) if length else b""
@@ -634,12 +788,16 @@ class Handler(BaseHTTPRequestHandler):
         self._json(200, resp, sid=sid)
 
     def do_GET(self):
+        if self._guard():
+            return
         path = self.path.split("?")[0].rstrip("/") or "/"
         if path in ("/", "/health", "/status"):
             self._json(200, {
                 "status": "ok", "server": SERVER_NAME, "version": SERVER_VERSION,
                 "tools": len(TOOLS), "tool_names": [t["name"] for t in TOOLS],
                 "tool_prefix": PREFIX, "root": _is_root(),
+                "auth": bool(CFG.get("auth_token") or ""),
+                "allow_ips": CFG.get("allow_ips") or [],
                 "transports": ["POST /mcp (streamable-http)", "GET /sse (sse)"],
             })
             return
@@ -676,6 +834,8 @@ class Handler(BaseHTTPRequestHandler):
         self._json(404, {"error": "not found"})
 
     def do_DELETE(self):
+        if self._guard():
+            return
         self._empty(204)
 
 
@@ -693,6 +853,22 @@ def main():
     print("  工具数          : %d (%s)" % (len(TOOLS), ", ".join(t["name"] for t in TOOLS[:4]) + " ..."))
     print("  工作目录        : %s" % CFG.get("work_dir"))
     print("  运行身份        : %s" % ("root" if _is_root() else "非 root"))
+
+    tok = CFG.get("auth_token") or ""
+    nets = CFG.get("allow_ips") or []
+    if tok:
+        print("  鉴权            : 已开启（Bearer token，%d 字符）" % len(tok))
+    else:
+        print("  鉴权            : [!] 未开启")
+        print("  " + "!" * 68)
+        print("  [!] 未设置 auth_token：任何能访问本端口的人都等于拿到本机 shell。")
+        print("  [!] 仅限内网使用；一旦开公网隧道（mcp-tunnel.sh），请务必先设置：")
+        print("  [!]   python3 -c \"import json;p='%s';d=json.load(open(p));"
+              "d['auth_token']='<强随机串>';json.dump(d,open(p,'w'),ensure_ascii=False)\"" % CONFIG_PATH)
+        print("  [!] 或直接跑 mcp-tunnel.sh，它会自动生成并写入。")
+        print("  " + "!" * 68)
+    if nets:
+        print("  来源白名单      : %s" % ", ".join(str(n) for n in nets))
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:
@@ -705,24 +881,65 @@ if __name__ == "__main__":
 MCP_AGENT_PY_EOF
 
 # 配置文件（已存在则不覆盖，避免冲掉你的设置）
+CFG_PREEXIST="0"
 if [ -f "$DIR/mcp_agent_config.json" ]; then
   warn "配置文件已存在，保留原文件（如需重置请手动删除）"
   CFG_FILE="$DIR/mcp_agent_config.json"
+  CFG_PREEXIST="1"
 else
   CFG_FILE="$DIR/mcp_agent_config.json"
   cat > "$CFG_FILE" <<CFG_EOF
 {
   "name": "$NAME",
   "tool_prefix": "$PREFIX",
-  "version": "1.0.0",
+  "version": "3.0.0",
   "sudo_password": "$SUDO_PASS",
   "work_dir": "/",
   "command_timeout": 120,
   "max_output_bytes": 200000,
   "allowed_roots": ["/"],
-  "enable_docker": true
+  "enable_docker": true,
+  "login_shell": true,
+  "auth_token": "$AUTH_TOKEN",
+  "allow_ips": $ALLOW_IPS_JSON,
+  "directory_url": "$DIRECTORY_URL",
+  "directory_token": "$DIRECTORY_TOKEN",
+  "tunnel_url": ""
 }
 CFG_EOF
+  chmod 600 "$CFG_FILE" 2>/dev/null || true
+fi
+
+# 已存在的配置不整体覆盖（免得冲掉你的调参），但**命令行明确给了的参数必须生效** ——
+# 否则重装时 --auth-token / --allow-ips / --directory 会被静默忽略，
+# 表现为「我明明传了 token，副端却还在用旧的」。
+if [ "$CFG_PREEXIST" = "1" ] \
+   && { [ -n "$AUTH_TOKEN" ] || [ -n "$ALLOW_IPS" ] || [ -n "$DIRECTORY_URL" ] || [ -n "$DIRECTORY_TOKEN" ]; }; then
+  "$PY3" - "$CFG_FILE" "$AUTH_TOKEN" "$ALLOW_IPS" "$DIRECTORY_URL" "$DIRECTORY_TOKEN" <<'MERGE_PY_EOF'
+import json, sys
+p, tok, ips, durl, dtok = sys.argv[1:6]
+try:
+    d = json.load(open(p, encoding="utf-8"))
+except Exception:
+    d = {}
+if tok:
+    d["auth_token"] = tok
+if ips:
+    d["allow_ips"] = [x.strip() for x in ips.split(",") if x.strip()]
+if durl:
+    d["directory_url"] = durl
+if dtok:
+    d["directory_token"] = dtok
+d["version"] = "3.0.0"
+d.setdefault("name", "")
+with open(p, "w", encoding="utf-8") as f:
+    json.dump(d, f, ensure_ascii=False, indent=2)
+    f.write("\n")
+print("已合并命令行参数：%s" % ", ".join(
+    k for k, v in (("auth_token", tok), ("allow_ips", ips),
+                   ("directory_url", durl), ("directory_token", dtok)) if v))
+MERGE_PY_EOF
+  chmod 600 "$CFG_FILE" 2>/dev/null || true
 fi
 
 # 按端口清理僵尸进程（零依赖，替代可能不存在的 fuser）
@@ -820,7 +1037,7 @@ LOG="$DIR/agent.log"
 echo $$ > "$DIR/agent.pid"
 echo "[$(date '+%F %T')] supervisor 启动 (pid=$$, port=$PORT, py=$PY)" >> "$LOG"
 while true; do
-  "$PY" "$DIR/mcp_agent.py" --host 0.0.0.0 --port "$PORT" >> "$LOG" 2>&1
+  "$PY" -u "$DIR/mcp_agent.py" --host 0.0.0.0 --port "$PORT" >> "$LOG" 2>&1
   code=$?
   echo "[$(date '+%F %T')] agent 退出 (code=$code)，3 秒后重启" >> "$LOG"
   sleep 3
@@ -830,12 +1047,17 @@ SUP_SH_EOF
 # 控制脚本（无 systemd 环境的手动开关，比记 nohup 命令稳）
 cat > "$DIR/mcp-ctl.sh" <<'CTL_SH_EOF'
 #!/usr/bin/env bash
-# MCP 副端控制脚本： start | stop | restart | status | log | tunnel
+# MCP 副端控制脚本： start | stop | restart | status | log | tunnel | watchdog
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PORT="$(cat "$DIR/port.txt" 2>/dev/null || echo 3100)"
 PY="${PY:-$(command -v python3 || echo /usr/bin/python3)}"
 PIDF="$DIR/agent.pid"
 LOG="$DIR/agent.log"
+WDPIDF="$DIR/watchdog.pid"
+# systemd 单元名（安装时写入 unit.txt），保活开关需要用它定位 watchdog.timer
+NAME="$(cat "$DIR/unit.txt" 2>/dev/null || echo '')"
+[ -z "$NAME" ] && NAME="mcp-agent"
+WD_UNIT="$NAME-watchdog.timer"
 
 running() {
   [ -f "$PIDF" ] || return 1
@@ -844,8 +1066,41 @@ running() {
   kill -0 "$p" 2>/dev/null
 }
 
+wd_running() {
+  [ -f "$WDPIDF" ] || return 1
+  local p; p="$(cat "$WDPIDF" 2>/dev/null)"
+  [ -n "$p" ] || return 1
+  kill -0 "$p" 2>/dev/null
+}
+
+# 保活守护：让副端「随时可连」。已有 systemd timer 的环境由 timer 负责，
+# 这里只管没有 systemd 的容器场景（常驻循环）。
+wd_start() {
+  [ -x "$DIR/mcp-watchdog.sh" ] || return 0
+  [ -f "$DIR/.no_keepalive" ] && return 0
+  if wd_running; then return 0; fi
+  setsid nohup bash "$DIR/mcp-watchdog.sh" >> "$DIR/watchdog.log" 2>&1 < /dev/null &
+  sleep 1
+  wd_running && echo "保活守护已启动 (pid $(cat "$WDPIDF"))" || echo "保活守护启动失败（见 watchdog.log）"
+}
+
+wd_stop() {
+  if [ -f "$WDPIDF" ]; then
+    local p; p="$(cat "$WDPIDF" 2>/dev/null)"
+    [ -n "${p:-}" ] && kill -TERM "$p" 2>/dev/null || true
+    rm -f "$WDPIDF"
+  fi
+  pkill -f "$DIR/mcp-watchdog.sh" 2>/dev/null || true
+  echo "保活守护已停止"
+}
+
 start() {
-  if running; then echo "已在运行 (pid $(cat "$PIDF"))"; return 0; fi
+  if [ -f "/etc/systemd/system/${NAME}.service" ] && command -v systemctl >/dev/null 2>&1; then
+    systemctl start "$NAME" 2>/dev/null && echo "已启动（systemd: $NAME）" || echo "systemctl start 失败"
+    wd_start
+    return 0
+  fi
+  if running; then echo "已在运行 (pid $(cat "$PIDF"))"; wd_start; return 0; fi
   "$PY" "$DIR/_portkill.py" "$PORT" >/dev/null 2>&1 || true
   rm -f "$PIDF"
   cd "$DIR"
@@ -856,12 +1111,16 @@ start() {
   done
   if running; then
     echo "已启动 (守护 pid $(cat "$PIDF"), 端口 $PORT)"
+    wd_start
   else
     echo "启动失败，见 $LOG"; tail -n 15 "$LOG" 2>/dev/null; return 1
   fi
 }
 
 stop() {
+  if [ -f "/etc/systemd/system/${NAME}.service" ] && command -v systemctl >/dev/null 2>&1; then
+    systemctl stop "$NAME" 2>/dev/null || true
+  fi
   if [ -f "$PIDF" ]; then
     local p; p="$(cat "$PIDF" 2>/dev/null)"
     if [ -n "${p:-}" ]; then
@@ -876,14 +1135,52 @@ stop() {
 }
 
 status() {
-  if running; then
+  # systemd 模式下没有 agent.pid，只看 pid 文件会误报「未运行」，先问 systemd
+  local SYS_UNIT=""
+  if [ -f "/etc/systemd/system/${NAME}.service" ] && command -v systemctl >/dev/null 2>&1; then
+    SYS_UNIT="$NAME"
+  fi
+  if [ -n "$SYS_UNIT" ]; then
+    local st; st="$(systemctl is-active "$SYS_UNIT" 2>/dev/null || echo unknown)"
+    echo "运行中（systemd: $SYS_UNIT，状态 $st）"
+    [ "$st" = "active" ] || echo "  [!] 服务未激活，用 systemctl status $SYS_UNIT 看原因"
+  elif running; then
     echo "运行中 (守护 pid $(cat "$PIDF"), 端口 $PORT)"
   else
     echo "未运行"
     return 1
   fi
   if command -v curl >/dev/null 2>&1; then
-    echo "健康检查: $(curl -s -m 5 "http://127.0.0.1:$PORT/" || echo '(无响应)')"
+    # 开了鉴权就必须带 token，否则这里只会打印一个 401，看不出副端到底活没活
+    TOK="$("$PY" -c "import json;print(json.load(open('$DIR/mcp_agent_config.json')).get('auth_token',''))" 2>/dev/null || echo '')"
+    if [ -n "$TOK" ]; then
+      CODE="$(curl -s -m 5 -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $TOK" "http://127.0.0.1:$PORT/" || true)"
+      BODY="$(curl -s -m 5 -H "Authorization: Bearer $TOK" "http://127.0.0.1:$PORT/" || echo '(无响应)')"
+    else
+      CODE="$(curl -s -m 5 -o /dev/null -w '%{http_code}' "http://127.0.0.1:$PORT/" || true)"
+      BODY="$(curl -s -m 5 "http://127.0.0.1:$PORT/" || echo '(无响应)')"
+    fi
+    echo "健康检查: HTTP ${CODE:-000} $BODY"
+  fi
+  # 保活与隧道状态：一眼看出「随时可连」还成不成立
+  if [ -n "$SYS_UNIT" ] && command -v systemctl >/dev/null 2>&1 \
+     && [ -f "/etc/systemd/system/$WD_UNIT" ]; then
+    local wst; wst="$(systemctl is-active "$WD_UNIT" 2>/dev/null || echo unknown)"
+    echo "保活定时器: $wst（$WD_UNIT，每 60s）"
+  elif wd_running; then
+    echo "保活守护: 运行中 (pid $(cat "$WDPIDF"))"
+  elif [ -f "$DIR/.no_keepalive" ]; then
+    echo "保活守护: 已关闭（mcp-ctl.sh keepalive on 可恢复）"
+  else
+    echo "保活守护: 未运行（用 mcp-ctl.sh start 拉起）"
+  fi
+  if [ -f "$DIR/.want_tunnel" ]; then
+    if [ -f "$DIR/tunnel.pid" ] && kill -0 "$(cat "$DIR/tunnel.pid" 2>/dev/null)" 2>/dev/null; then
+      echo "公网隧道: 运行中 pid=$(cat "$DIR/tunnel.pid")"
+    else
+      echo "公网隧道: 未运行（保活守护会在一分钟内拉起）"
+    fi
+    [ -f "$DIR/current_url.txt" ] && echo "当前地址: $(cat "$DIR/current_url.txt")"
   fi
 }
 
@@ -903,7 +1200,38 @@ case "${1:-status}" in
   status)  status ;;
   log)     tail -n "${2:-40}" "$LOG" ;;
   tunnel)  shift; bash "$DIR/mcp-tunnel.sh" "$@" ;;
-  *) echo "用法: bash $DIR/mcp-ctl.sh {start|stop|restart|status|log [n]|tunnel}"; exit 1 ;;
+  watchdog)
+    # 跑一轮保活检查（等价 systemd timer 的动作），并回报结果
+    bash "$DIR/mcp-watchdog.sh" --once && echo "保活检查完成"
+    wd_running && echo "常驻守护: 运行中 (pid $(cat "$WDPIDF"))" || echo "常驻守护: 未运行（容器环境建议 start 一次）"
+    ;;
+  wdlog)   tail -n "${2:-40}" "$DIR/watchdog.log" ;;
+  keepalive)
+    # 开关保活：keepalive on / off / status
+    case "${2:-status}" in
+      on)
+        rm -f "$DIR/.no_keepalive"
+        wd_start
+        if [ -f "/etc/systemd/system/$WD_UNIT" ]; then
+          systemctl enable --now "$WD_UNIT" >/dev/null 2>&1 \
+            && echo "systemd 保活定时器已启用" || echo "systemd 保活定时器启用失败（可忽略，常驻守护已接管）"
+        fi
+        ;;
+      off)
+        touch "$DIR/.no_keepalive"
+        wd_stop
+        if [ -f "/etc/systemd/system/$WD_UNIT" ]; then
+          systemctl disable --now "$WD_UNIT" >/dev/null 2>&1 || true
+          echo "systemd 保活定时器已停用"
+        fi
+        ;;
+      *)
+        [ -f "$DIR/.no_keepalive" ] && echo "保活: 已关闭（.no_keepalive）" || echo "保活: 已开启"
+        wd_running && echo "常驻守护: 运行中 (pid $(cat "$WDPIDF"))" || echo "常驻守护: 未运行"
+        ;;
+    esac
+    ;;
+  *) echo "用法: bash $DIR/mcp-ctl.sh {start|stop|restart|status|log [n]|tunnel|watchdog|wdlog [n]|keepalive on|off|status}"; exit 1 ;;
 esac
 CTL_SH_EOF
 
@@ -918,8 +1246,54 @@ PORT="$(cat "$DIR/port.txt" 2>/dev/null || echo 3100)"
 BIN="$DIR/cloudflared"
 LOG="$DIR/tunnel.log"
 PIDF="$DIR/tunnel.pid"
+PROTOF="$DIR/.tunnel_proto"
 PY="$(command -v python3 || echo /usr/bin/python3)"
+CREATED="0"
+# 上次自动降级过就记住，省掉每次 12 秒的探测等待
+if [ -z "${CF_PROTO:-}" ] && [ -f "$PROTOF" ]; then
+  CF_PROTO="$(cat "$PROTOF" 2>/dev/null || true)"
+  [ -n "$CF_PROTO" ] && echo "[i] 沿用上次选定的隧道协议: $CF_PROTO"
+fi
 NAME="$("$PY" -c "import json;print(json.load(open('$DIR/mcp_agent_config.json'))['name'])" 2>/dev/null || echo node)"
+
+# ============================================================================
+# 安全闸门（v3.0）：开公网隧道之前，必须先把鉴权配上
+# ----------------------------------------------------------------------------
+# 副端以 root 运行，exec 等于一个 root shell。隧道一开，任何拿到这个 URL 的人
+# 都能在你设备上以 root 执行任意命令 —— 而 trycloudflare 的地址是可以被扫描到的。
+# 所以这里默认强制：没有 auth_token 就自动生成一个强随机值写进配置并重启副端。
+# 已有 token 则复用（幂等）。确实想裸奔：FLEET_NO_AUTH=1 bash mcp-tunnel.sh
+# ============================================================================
+TOKEN="$("$PY" -c "import json;print(json.load(open('$DIR/mcp_agent_config.json')).get('auth_token',''))" 2>/dev/null || echo '')"
+if [ -z "$TOKEN" ] && [ "${FLEET_NO_AUTH:-0}" = "1" ]; then
+  echo "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"
+  echo "[!] FLEET_NO_AUTH=1 —— 隧道将**不带任何鉴权**暴露到公网。"
+  echo "[!] 任何拿到该 URL 的人都能以 root 身份在你设备上执行任意命令。"
+  echo "[!] 仅在你完全清楚后果、并且马上就会关掉隧道时才这么做。"
+  echo "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"
+fi
+if [ -z "$TOKEN" ] && [ "${FLEET_NO_AUTH:-0}" != "1" ]; then
+  TOKEN="$("$PY" -c "import secrets;print(secrets.token_urlsafe(32))")"
+  "$PY" - "$DIR/mcp_agent_config.json" "$TOKEN" <<'TOK_PY_EOF'
+import json, sys
+p, tok = sys.argv[1], sys.argv[2]
+with open(p, encoding="utf-8") as f:
+    d = json.load(f)
+d["auth_token"] = tok
+with open(p, "w", encoding="utf-8") as f:
+    json.dump(d, f, ensure_ascii=False, indent=2)
+TOK_PY_EOF
+  chmod 600 "$DIR/mcp_agent_config.json" 2>/dev/null || true
+  echo "[+] 已为公网隧道生成鉴权 token（32 字节随机），写入 mcp_agent_config.json。"
+  echo "[+] 重启副端使配置生效 ..."
+  if [ -f "/etc/systemd/system/${NAME}-mcp.service" ] && command -v systemctl >/dev/null 2>&1; then
+    systemctl restart "${NAME}-mcp" >/dev/null 2>&1 || true
+  else
+    bash "$DIR/mcp-ctl.sh" restart >/dev/null 2>&1 || true
+  fi
+  sleep 2
+  echo "[+] 完成。"
+fi
 
 if [ ! -x "$BIN" ]; then
   ARCH="$(uname -m)"
@@ -941,9 +1315,39 @@ if [ ! -x "$BIN" ]; then
   chmod +x "$BIN"
 fi
 
-# ---- 复用已有隧道：避免撞 trycloudflare 创建频率限制，也让公网地址保持稳定 ----
+# 声明「本副端要用隧道」——保活守护据此决定要不要盯着 cloudflared
+touch "$DIR/.want_tunnel" 2>/dev/null || true
+
+# ---- 固定隧道（named tunnel）：给了 CF_TOKEN 就走这条，地址恒定 ----
+# 快隧的地址每次重启都变、还会撞限流；有 Cloudflare 账号的话用固定隧道最省心：
+#   cloudflared tunnel create <名字>          # 一次性，在任意机器上做
+#   cloudflared tunnel route dns <名字> mcp.你的域名
+#   CF_TOKEN=<tunnel token> bash mcp-tunnel.sh
+# 地址写进 mcp_agent_config.json 的 "tunnel_url"，保活守护就不会再去猜地址。
+NAMED=""
 URL=""
-if [ "${CF_FORCE:-0}" != "1" ] && [ -f "$PIDF" ] && kill -0 "$(cat "$PIDF" 2>/dev/null)" 2>/dev/null; then
+if [ -n "${CF_TOKEN:-}" ]; then
+  NAMED="1"
+  echo "[i] 使用固定隧道（named tunnel）：地址恒定，不受 trycloudflare 限流影响"
+  if [ -f "$PIDF" ] && kill -0 "$(cat "$PIDF" 2>/dev/null)" 2>/dev/null; then
+    echo "[i] 固定隧道已在运行（pid $(cat "$PIDF")），复用。"
+  else
+    : > "$LOG"
+    setsid nohup "$BIN" tunnel --no-autoupdate run --token "$CF_TOKEN" >> "$LOG" 2>&1 < /dev/null &
+    sleep 2
+    REAL="$(pgrep -f "$BIN tunnel --no-autoupdate run --token" 2>/dev/null | head -1 || true)"
+    if [ -n "$REAL" ]; then echo "$REAL" > "$PIDF"; else echo $! > "$PIDF"; fi
+  fi
+  URL="${FLEET_TUNNEL_URL:-$("$PY" -c "import json;print(json.load(open('$DIR/mcp_agent_config.json')).get('tunnel_url',''))" 2>/dev/null || echo '')}"
+  if [ -z "$URL" ]; then
+    echo "[!] 固定隧道地址未知。请在 mcp_agent_config.json 里补："
+    echo "      \"tunnel_url\": \"https://mcp.你的域名\""
+    echo "    或本次临时指定：FLEET_TUNNEL_URL=https://mcp.你的域名 bash $DIR/mcp-tunnel.sh"
+  fi
+fi
+
+# ---- 复用已有隧道：避免撞 trycloudflare 创建频率限制，也让公网地址保持稳定 ----
+if [ -z "$NAMED" ] && [ "${CF_FORCE:-0}" != "1" ] && [ -f "$PIDF" ] && kill -0 "$(cat "$PIDF" 2>/dev/null)" 2>/dev/null; then
   URL="$(grep -oE 'https://[a-z0-9][a-z0-9-]*\.trycloudflare\.com' "$LOG" 2>/dev/null | head -1)"
   if [ -n "$URL" ]; then
     echo "[i] 已有隧道在运行（pid $(cat "$PIDF")），复用既有地址，不新建。"
@@ -952,9 +1356,10 @@ if [ "${CF_FORCE:-0}" != "1" ] && [ -f "$PIDF" ] && kill -0 "$(cat "$PIDF" 2>/de
   fi
 fi
 
-if [ -z "$URL" ]; then
+if [ -z "$NAMED" ] && [ -z "$URL" ]; then
 if [ -f "$PIDF" ]; then kill "$(cat "$PIDF")" 2>/dev/null || true; rm -f "$PIDF"; sleep 1; fi
 : > "$LOG"
+CREATED="1"
 # 偶发 502 时可试：CF_PROTO=http2 bash mcp-tunnel.sh  （QUIC 被限速的网络下更稳）
 PROTO_ARGS=""
 [ -n "${CF_PROTO:-}" ] && PROTO_ARGS="--protocol ${CF_PROTO}"
@@ -978,7 +1383,37 @@ if [ -z "$URL" ]; then
 fi
 fi
 
+# ---- QUIC 被网络设备干扰时，自动降级到 http2 重建 ----
+# 症状：日志反复刷 "no recent network activity"，域名能解析，但主端访问一律 502。
+# 这在不少家宽/路由设备上都会出现，属于环境问题而非隧道本身坏了。
+# 与其让用户读文档手工重跑，这里自动探测一次并换协议重建；选定后记下来，
+# 下次直接沿用（CF_NO_FALLBACK=1 可关闭该行为）。
+if [ -z "$NAMED" ] && [ "$CREATED" = "1" ] && [ "${CF_PROTO:-}" != "http2" ] && [ "${CF_NO_FALLBACK:-0}" != "1" ]; then
+  echo "[i] 探测隧道连通性（最多 36s；QUIC 被干扰会自动切 http2）..."
+  _i=0
+  while [ "$_i" -lt 12 ]; do
+    if grep -qE 'no recent network activity|failed to accept QUIC stream|datagram manager error' "$LOG" 2>/dev/null; then
+      echo
+      echo "[!] 检测到 QUIC(UDP 7844) 被网络设备干扰："
+      echo "    $(grep -oE 'no recent network activity|failed to accept QUIC stream|datagram manager error' "$LOG" | tail -1)"
+      echo "[!] 自动改用 http2 重建隧道（公网地址会变），以后默认沿用 http2 ..."
+      kill "$(cat "$PIDF" 2>/dev/null)" 2>/dev/null || true
+      rm -f "$PIDF"
+      echo "http2" > "$PROTOF"
+      exec env CF_PROTO=http2 CF_NO_FALLBACK=1 bash "$0"
+    fi
+    sleep 3
+    _i=$((_i + 1))
+  done
+  echo "[i] 隧道连接正常（quic）。"
+fi
+
 # ---- 自检 1：域名是否解析 ----
+# 把最终地址落盘，保活守护和主端都读它
+if [ -n "$URL" ]; then
+  printf '%s' "$URL" > "$DIR/.tunnel_url" 2>/dev/null || true
+  printf '%s' "$URL" > "$DIR/current_url.txt" 2>/dev/null || true
+fi
 HOST="${URL#https://}"
 DNS_OK="0"
 for _ in $(seq 1 15); do
@@ -988,18 +1423,33 @@ for _ in $(seq 1 15); do
   sleep 2
 done
 
-# ---- 自检 2：公网是否真的能访问到本机 agent ----
+# ---- 自检 2：公网是否真的能访问到本机 agent（开了鉴权就带上 token）----
 HTTP_CODE=""
 if command -v curl >/dev/null 2>&1; then
-  HTTP_CODE="$(curl -s -m 15 -o /dev/null -w '%{http_code}' "$URL/" 2>/dev/null || true)"
+  if [ -n "$TOKEN" ]; then
+    HTTP_CODE="$(curl -s -m 15 -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $TOKEN" "$URL/" 2>/dev/null || true)"
+  else
+    HTTP_CODE="$(curl -s -m 15 -o /dev/null -w '%{http_code}' "$URL/" 2>/dev/null || true)"
+  fi
+fi
+
+if [ -n "$TOKEN" ]; then
+  LOCAL_AGENT="$(curl -s -m 5 -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $TOKEN" "http://127.0.0.1:$PORT/" 2>/dev/null || echo 000)"
+else
+  LOCAL_AGENT="$(curl -s -m 5 -o /dev/null -w '%{http_code}' "http://127.0.0.1:$PORT/" 2>/dev/null || echo 000)"
 fi
 
 echo
 echo "============================================================"
 echo " 公网隧道地址：$URL"
 echo " MCP 端点    ：$URL/mcp"
+if [ -n "$TOKEN" ]; then
+  echo " 鉴权 token  ：$TOKEN"
+else
+  echo " 鉴权 token  ：(未设置 —— 公网裸奔，请尽快补上)"
+fi
 echo "------------------------------------------------------------"
-echo " 本地 agent  ：$(curl -s -m 5 "http://127.0.0.1:$PORT/" >/dev/null 2>&1 && echo 正常 || echo 无响应)"
+echo " 本地 agent  ：$([ "$LOCAL_AGENT" = "200" ] && echo 正常 || echo "异常(HTTP ${LOCAL_AGENT})")"
 echo " 域名解析    ：$([ "$DNS_OK" = "1" ] && echo 已解析 || echo "未解析(异常)")"
 echo " 公网访问    ：${HTTP_CODE:-未检测}$([ "$HTTP_CODE" = "200" ] && echo " (通)" || echo " (仅本机视角，见下方说明)")"
 echo "------------------------------------------------------------"
@@ -1007,9 +1457,25 @@ echo " 主端 ~/.workbuddy/mcp.json 增加："
 echo
 echo "   \"$NAME\": {"
 echo "     \"type\": \"http\","
-echo "     \"url\": \"$URL/mcp\""
+echo "     \"url\": \"$URL/mcp\"$([ -n "$TOKEN" ] && printf ',')"
+if [ -n "$TOKEN" ]; then
+  echo "     \"headers\": { \"Authorization\": \"Bearer $TOKEN\" }"
+fi
 echo "   }"
+echo "------------------------------------------------------------"
+echo " 或直接用主端脚本一行搞定（自动带上 token）："
+if [ -n "$TOKEN" ]; then
+  echo "   python fleet.py add --name $NAME --url $URL/mcp --token $TOKEN"
+else
+  echo "   python fleet.py add --name $NAME --url $URL/mcp"
+fi
 echo "============================================================"
+
+if [ -z "$TOKEN" ]; then
+  echo
+  echo "[!] 当前隧道**没有任何鉴权**。强烈建议立即补上："
+  echo "    bash $DIR/mcp-tunnel.sh      # 重新跑一次会自动生成 token 并重启副端"
+fi
 
 if [ "$DNS_OK" != "1" ] || { [ -n "$HTTP_CODE" ] && [ "$HTTP_CODE" != "200" ]; }; then
   echo
@@ -1031,13 +1497,178 @@ fi
 echo " 停止隧道：kill \$(cat "$PIDF")      日志：$LOG"
 TUN_SH_EOF
 
-chmod +x "$DIR/_supervisor.sh" "$DIR/mcp-ctl.sh" "$DIR/mcp-tunnel.sh" 2>/dev/null || true
+# ============================================================================
+# 保活守护（v3.0）：让副端「随时可连」
+# ----------------------------------------------------------------------------
+# 三件事：
+#   1) agent 挂了 → 拉起来
+#   2) 隧道进程没了 → 重建（**只在真的没了时重建**）
+#   3) 把当前可用地址持续写进 current_url.txt，并上报「地址目录」
+#
+# 铁律：能复用就不重建。trycloudflare 快隧每重建一次就换一次地址，而且短时间
+# 重建多次会撞限流（表现为「隧道连上了但域名一直不解析」，要等 10~30 分钟）。
+# 所以这里只守护、不折腾 —— 进程还活着就绝不动它。
+# ============================================================================
+cat > "$DIR/mcp-watchdog.sh" <<'WATCHDOG_SH_EOF'
+#!/usr/bin/env bash
+# MCP 副端保活守护。两种用法：
+#   bash mcp-watchdog.sh --once    跑一轮就退出（配 systemd timer / cron）
+#   bash mcp-watchdog.sh           常驻循环（无 systemd 的容器环境）
+set -uo pipefail
+DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PORT="$(cat "$DIR/port.txt" 2>/dev/null || echo 3100)"
+PY="$(command -v python3 || echo /usr/bin/python3)"
+LOG="$DIR/watchdog.log"
+CUR="$DIR/current_url.txt"
+PIDF="$DIR/watchdog.pid"
+CFG="$DIR/mcp_agent_config.json"
+INTERVAL="${WATCHDOG_INTERVAL:-60}"
+ONCE="0"
+[ "${1:-}" = "--once" ] && ONCE="1"
+
+# systemd 单元名（安装时写入 unit.txt）
+UNIT="$(cat "$DIR/unit.txt" 2>/dev/null || echo '')"
+[ -z "$UNIT" ] && UNIT="mcp-agent"
+
+log() { echo "[$(date '+%F %T')] $*" >> "$LOG"; }
+
+cfg() { "$PY" -c "import json;print(json.load(open('$CFG')).get('$1',''))" 2>/dev/null || echo ''; }
+
+alive_agent()  { pgrep -f "$DIR/mcp_agent.py" >/dev/null 2>&1; }
+alive_tunnel() { [ -f "$DIR/tunnel.pid" ] && kill -0 "$(cat "$DIR/tunnel.pid" 2>/dev/null)" 2>/dev/null; }
+
+# 把当前地址上报到「地址目录」，主端据此自动更新，不必手工改 mcp.json
+report() {
+  local url="$1" durl dtok name
+  durl="$(cfg directory_url)"
+  [ -z "$durl" ] && return 0
+  dtok="$(cfg directory_token)"
+  name="$(cfg name)"
+  # 成功不写日志（否则每 60s 一条把 watchdog.log 撑爆），失败才留痕
+  "$PY" - "$durl" "$name" "$url" "$PORT" "$dtok" <<'REPORT_PY_EOF' >/dev/null 2>>"$LOG"
+import json, sys, time, urllib.request
+base, name, url, port, dtok = sys.argv[1:6]
+body = json.dumps({"name": name or "node", "url": url,
+                   "port": int(port or 0), "ts": int(time.time())}).encode("utf-8")
+req = urllib.request.Request(base.rstrip("/") + "/register", data=body,
+                             headers={"Content-Type": "application/json"}, method="POST")
+if dtok:
+    req.add_header("X-Fleet-Token", dtok)
+try:
+    with urllib.request.urlopen(req, timeout=10) as r:
+        r.read()
+except Exception as e:
+    sys.stderr.write("[report] 上报失败 %r\n" % (e,))
+REPORT_PY_EOF
+}
+
+# 拉起 agent：systemd 环境交给 systemctl（避免和 Restart=always 抢），否则用 mcp-ctl.sh
+ensure_agent() {
+  if alive_agent; then return 0; fi
+  if [ -f "/etc/systemd/system/${UNIT}.service" ] && command -v systemctl >/dev/null 2>&1; then
+    log "agent 未运行 → systemctl restart $UNIT"
+    systemctl restart "$UNIT" >> "$LOG" 2>&1 || log "systemctl restart 失败"
+  else
+    log "agent 未运行 → mcp-ctl.sh start"
+    bash "$DIR/mcp-ctl.sh" start >> "$LOG" 2>&1 || log "拉起 agent 失败"
+  fi
+  sleep 3
+}
+
+round() {
+  # --- 1) agent 保活 ---
+  ensure_agent
+
+  # --- 2) 隧道保活（只对声明过要用隧道的副端）---
+  if [ ! -f "$DIR/.want_tunnel" ]; then
+    return 0
+  fi
+  if ! alive_tunnel; then
+    log "隧道进程不在 → 重建（地址会变）"
+    CF_NO_FALLBACK=0 bash "$DIR/mcp-tunnel.sh" >> "$LOG" 2>&1 || log "隧道重建失败"
+    sleep 3
+  fi
+
+  # --- 3) 记录并上报当前地址 ---
+  local url=""
+  if [ -f "$DIR/.tunnel_url" ]; then
+    url="$(cat "$DIR/.tunnel_url" 2>/dev/null)"
+  fi
+  if [ -z "$url" ]; then
+    url="$(grep -oE 'https://[a-z0-9][a-z0-9-]*\.trycloudflare\.com' "$DIR/tunnel.log" 2>/dev/null | tail -1)"
+  fi
+  [ -z "$url" ] && { log "还没拿到隧道地址"; return 0; }
+
+  if [ "$(cat "$CUR" 2>/dev/null)" != "$url" ]; then
+    echo "$url" > "$CUR"
+    log "地址变更 → $url"
+  fi
+  report "$url"
+}
+
+# 保活总开关：关掉后连 --once 也不做事（systemd timer 同时会被 disable）
+if [ -f "$DIR/.no_keepalive" ]; then
+  exit 0
+fi
+
+if [ "$ONCE" = "1" ]; then
+  round
+  exit 0
+fi
+
+# 常驻模式：单实例 + 每 INTERVAL 秒跑一轮
+if [ -f "$PIDF" ] && kill -0 "$(cat "$PIDF" 2>/dev/null)" 2>/dev/null; then
+  echo "[i] watchdog 已在运行 (pid $(cat "$PIDF"))"
+  exit 0
+fi
+echo $$ > "$PIDF"
+trap 'rm -f "$PIDF"; exit 0' INT TERM EXIT
+log "watchdog 启动 (pid=$$, interval=${INTERVAL}s, port=$PORT)"
+while true; do
+  round
+  sleep "$INTERVAL"
+done
+WATCHDOG_SH_EOF
+
+chmod +x "$DIR/_supervisor.sh" "$DIR/mcp-ctl.sh" "$DIR/mcp-tunnel.sh" "$DIR/mcp-watchdog.sh" 2>/dev/null || true
 
 $PY3 -c "import ast,sys; ast.parse(open('$DIR/mcp_agent.py',encoding='utf-8').read())" \
   || die "服务器代码语法校验失败"
 
 IP="$(hostname -I 2>/dev/null | awk '{print $1}')"
 [ -z "$IP" ] && IP="<本机IP>"
+
+# ---------- 保活开关落盘 ----------
+# mcp-ctl.sh 是静态脚本（不知道安装参数），用一个标记文件让它知道要不要拉保活守护。
+printf '%s\n' "$UNIT" > "$DIR/unit.txt" 2>/dev/null || true
+if [ "$KEEPALIVE" = "1" ]; then
+  rm -f "$DIR/.no_keepalive" 2>/dev/null || true
+else
+  touch "$DIR/.no_keepalive" 2>/dev/null || true
+fi
+
+# ---------- 清掉可能残留的旧实例 ----------
+# 最常见的坑：先用 nohup 模式装过，再用 systemd 模式装（或反过来）。
+# 老的 _supervisor.sh 会一直每 3 秒把 mcp_agent.py 拉起来，和新实例抢端口，
+# 日志里只看到「Address already in use」反复刷，服务状态却像是好的。
+# 所以这里先把老进程清干净，再进入安装/启动。
+if [ "$UNINSTALL" != "1" ]; then
+  # 先停 systemd 单元（含保活定时器），免得它在我们清理时又把 agent 拉起来
+  if command -v systemctl >/dev/null 2>&1; then
+    systemctl stop "${UNIT}-watchdog.timer" >/dev/null 2>&1 || true
+    systemctl stop "$UNIT" >/dev/null 2>&1 || true
+  fi
+  if [ -x "$DIR/mcp-ctl.sh" ]; then
+    # 有控制脚本时优先用它（会顺带清 pid 文件、按端口收尾）
+    bash "$DIR/mcp-ctl.sh" stop >/dev/null 2>&1 || true
+  fi
+  # 再兜底：按安装目录精确匹配（不会误伤别的副端，也不会匹配到本安装脚本自己）
+  pkill -f "$DIR/_supervisor.sh" 2>/dev/null || true
+  pkill -f "$DIR/mcp_agent.py" 2>/dev/null || true
+  pkill -f "$DIR/mcp-watchdog.sh" 2>/dev/null || true
+  rm -f "$DIR/agent.pid" "$DIR/watchdog.pid" "$DIR/tunnel.pid" 2>/dev/null || true
+  sleep 1
+fi
 
 # ---------- 安装 / 启动 ----------
 if [ "$MODE" = "systemd" ]; then
@@ -1051,7 +1682,7 @@ Wants=network-online.target
 [Service]
 Type=simple
 WorkingDirectory=$DIR
-ExecStart=$PY3 $DIR/mcp_agent.py --host 0.0.0.0 --port $PORT
+ExecStart=$PY3 -u $DIR/mcp_agent.py --host 0.0.0.0 --port $PORT
 Restart=always
 RestartSec=3
 StandardOutput=append:$DIR/agent.log
@@ -1060,6 +1691,39 @@ StandardError=append:$DIR/agent.log
 [Install]
 WantedBy=multi-user.target
 UNIT_EOF
+
+  # ---- 保活守护：systemd timer 每 60s 跑一轮 watchdog ----
+  # 不用常驻进程，交给 systemd 托管：崩了自动重跑，开机自动启动，零额外依赖。
+  if [ "$KEEPALIVE" = "1" ]; then
+    log "写入保活单元: /etc/systemd/system/${UNIT}-watchdog.{service,timer}"
+    cat > "/etc/systemd/system/${UNIT}-watchdog.service" <<WD_UNIT_EOF
+[Unit]
+Description=MCP Agent ($NAME) 保活检查
+After=${UNIT}.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=$DIR
+ExecStart=/bin/bash $DIR/mcp-watchdog.sh --once
+TimeoutStartSec=180
+WD_UNIT_EOF
+
+    cat > "/etc/systemd/system/${UNIT}-watchdog.timer" <<WD_TIMER_EOF
+[Unit]
+Description=MCP Agent ($NAME) 保活定时器（每 60s）
+
+[Timer]
+OnBootSec=90
+OnUnitActiveSec=60
+AccuracySec=5s
+Unit=${UNIT}-watchdog.service
+
+[Install]
+WantedBy=timers.target
+WD_TIMER_EOF
+  else
+    log "已按 --no-keepalive 跳过保活单元注册"
+  fi
 
   systemctl daemon-reload || warn "daemon-reload 失败"
   # 端口若被旧进程占用，先清掉（按端口杀，避免 pkill 关键字误伤）
@@ -1075,6 +1739,18 @@ UNIT_EOF
     warn "服务未激活，最近日志："
     journalctl -u "$UNIT" -n 20 --no-pager 2>/dev/null || tail -20 "$DIR/agent.log" 2>/dev/null || true
   fi
+
+  # 保活定时器：先跑一轮（立刻校验一次），再 enable 常驻
+  if [ "$KEEPALIVE" = "1" ]; then
+    systemctl enable "$UNIT-watchdog.timer" >/dev/null 2>&1 || warn "watchdog timer enable 失败"
+    systemctl restart "$UNIT-watchdog.timer" >/dev/null 2>&1 || warn "watchdog timer 启动失败"
+    sleep 1
+    systemctl start "$UNIT-watchdog.service" >/dev/null 2>&1 || true
+    WD_STATE="$(systemctl is-active "$UNIT-watchdog.timer" 2>/dev/null || echo unknown)"
+    log "保活定时器: $WD_STATE（每 60s 检查 agent 与隧道）"
+    [ "$WD_STATE" = "active" ] || warn "保活定时器未激活，可手动 systemctl start $UNIT-watchdog.timer"
+  fi
+
   VERIFY_CMD="systemctl status $UNIT"
 else
   if [ "$SYSTEMD_OK" = "1" ]; then
@@ -1093,13 +1769,25 @@ else
 fi
 
 # ---------- 自检 ----------
+# 重装时配置里的 token 会保留，所以自检要用「配置里实际生效的 token」，
+# 不能只看命令行是否传了 --auth-token，否则会误报自检失败。
+EFF_TOKEN="$AUTH_TOKEN"
+if [ -z "$EFF_TOKEN" ] && [ -f "$DIR/mcp_agent_config.json" ]; then
+  EFF_TOKEN="$($PY3 -c "import json;print(json.load(open('$DIR/mcp_agent_config.json')).get('auth_token',''))" 2>/dev/null || echo '')"
+fi
 sleep 1
 if command -v curl >/dev/null 2>&1; then
-  HEALTH="$(curl -s -m 5 "http://127.0.0.1:${PORT}/" || true)"
-  if [ -n "$HEALTH" ]; then
+  if [ -n "$EFF_TOKEN" ]; then
+    HEALTH_CODE="$(curl -s -m 5 -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $EFF_TOKEN" "http://127.0.0.1:${PORT}/" || true)"
+    HEALTH="$(curl -s -m 5 -H "Authorization: Bearer $EFF_TOKEN" "http://127.0.0.1:${PORT}/" || true)"
+  else
+    HEALTH_CODE="$(curl -s -m 5 -o /dev/null -w '%{http_code}' "http://127.0.0.1:${PORT}/" || true)"
+    HEALTH="$(curl -s -m 5 "http://127.0.0.1:${PORT}/" || true)"
+  fi
+  if [ "$HEALTH_CODE" = "200" ]; then
     log "本机自检通过: $HEALTH"
   else
-    warn "本机自检失败，请查看 $DIR/agent.log"
+    warn "本机自检失败（HTTP ${HEALTH_CODE:-无响应}），请查看 $DIR/agent.log"
     tail -n 20 "$DIR/agent.log" 2>/dev/null || true
   fi
 else
@@ -1124,6 +1812,8 @@ else
   URL_NOTE=""
 fi
 
+AUTH_TOK="$($PY3 -c "import json;print(json.load(open('$DIR/mcp_agent_config.json')).get('auth_token',''))" 2>/dev/null || echo '')"
+
 cat <<EOF
 
 ============================================================================
@@ -1133,11 +1823,12 @@ cat <<EOF
  监听端口 : $PORT
  安装目录 : $DIR
  运行模式 : $MODE$([ "$MODE" = "systemd" ] && echo "（服务单元 ${UNIT}.service）" || echo "（守护进程，用 mcp-ctl.sh 管理）")
+ 鉴权     : $(if [ -n "$AUTH_TOK" ]; then echo "已开启（Bearer token）"; else echo "未开启 —— 仅限内网；开公网隧道前请先设 auth_token"; fi)
  状态查看 : $VERIFY_CMD
  实时日志 : tail -f $DIR/agent.log
  重启服务 : $(if [ "$MODE" = "systemd" ]; then echo "systemctl restart $UNIT"; else echo "bash $DIR/mcp-ctl.sh restart"; fi)
  控制脚本 : bash $DIR/mcp-ctl.sh {start|stop|restart|status|log|tunnel}
- 手动前台 : $PY3 $DIR/mcp_agent.py --host 0.0.0.0 --port $PORT
+ 手动前台 : $PY3 -u $DIR/mcp_agent.py --host 0.0.0.0 --port $PORT
 
 ----------------------------------------------------------------------------
  在主端（WorkBuddy 所在电脑）的 ~/.workbuddy/mcp.json 里加这一段：
@@ -1145,7 +1836,8 @@ cat <<EOF
   "mcpServers": {
     "$NAME": {
       "type": "http",
-      "url": "$MCP_URL"
+      "url": "$MCP_URL"$(if [ -n "$AUTH_TOK" ]; then echo ","; fi)
+$(if [ -n "$AUTH_TOK" ]; then echo "      \"headers\": { \"Authorization\": \"Bearer $AUTH_TOK\" }"; fi)
     }
   }
  $URL_NOTE
