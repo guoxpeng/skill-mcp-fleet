@@ -890,7 +890,16 @@ status() {
 case "${1:-status}" in
   start)   start ;;
   stop)    stop ;;
-  restart) stop; sleep 1; start ;;
+  restart)
+    # ★ 先把「延迟 start」脱离进程组挂到后台，再执行 stop。
+    #   原因：若本次调用来自副端自己的 exec 工具，stop 会把调用者（也就是这条命令）一起杀掉，
+    #   导致后面的 start 永远执行不到 —— 表现为重启后 agent 再也没起来（隧道 502、端口无响应）。
+    if command -v setsid >/dev/null 2>&1; then
+      setsid nohup bash -c "sleep 2; bash '$DIR/mcp-ctl.sh' start" >>"$DIR/ctl.log" 2>&1 </dev/null &
+    else
+      nohup bash -c "sleep 2; bash '$DIR/mcp-ctl.sh' start" >>"$DIR/ctl.log" 2>&1 </dev/null &
+    fi
+    stop ;;
   status)  status ;;
   log)     tail -n "${2:-40}" "$LOG" ;;
   tunnel)  shift; bash "$DIR/mcp-tunnel.sh" "$@" ;;
