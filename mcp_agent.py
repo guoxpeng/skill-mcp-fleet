@@ -37,6 +37,8 @@ import base64
 import json
 import os
 import re
+import hmac
+import ipaddress
 import shlex
 import subprocess
 import sys
@@ -48,10 +50,19 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 HERE = os.path.dirname(os.path.abspath(__file__))
 CONFIG_PATH = os.path.join(HERE, "mcp_agent_config.json")
 
+# 日志行缓冲：副端是被 nohup/systemd 拉起的常驻进程，stdout 重定向到文件时
+# 默认是块缓冲，启动横幅和诊断信息会一直卡在缓冲区里；进程被 kill 时直接丢失，
+# 表现为 agent.log 一直是空的。这里强制行缓冲。
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(line_buffering=True)
+    except Exception:
+        pass
+
 DEFAULT_CONFIG = {
     "name": "node",             # 副端标识（显示在状态页与 serverInfo）
     "tool_prefix": "",          # 工具名前缀，如 "nas_"；留空则用裸名（exec/read/...）
-    "version": "1.0.0",
+    "version": "3.0.0",
     "sudo_password": "",        # 留空且非 root 时会尝试免密 sudo
     "work_dir": "/",            # 默认工作目录
     "command_timeout": 120,     # 秒
@@ -61,6 +72,13 @@ DEFAULT_CONFIG = {
     "login_shell": True,        # True=bash -lc（会 source /etc/profile）；
                                 # 容器里 profile 打了欢迎横幅（PAI-DSW 等）时设 False，
                                 # 改成 bash -c，输出干净且 PATH 通常够用
+    # ---- 访问控制（v3.0）--------------------------------------------------
+    # 非空则所有请求必须带 Authorization: Bearer <token>（或 X-Fleet-Token）。
+    # 副端以 root 运行、exec 等于 root shell，走公网隧道时**必须**设置。
+    "auth_token": "",
+    # 可选来源 IP 白名单，支持单个 IP 或 CIDR。留空 = 不限制。
+    # 例：["192.168.1.0/24", "10.8.0.2"]
+    "allow_ips": [],
 }
 
 
@@ -94,6 +112,93 @@ def _truncate(s):
     if len(b) <= limit:
         return s
     return b[:limit].decode("utf-8", "ignore") + "\n...[输出已截断，共 %d 字节]" % len(b)
+
+
+# ---------------------------------------------------------------------------
+# 访问控制（v3.0）
+#   副端以 root 运行，exec 等于一个 root shell。内网裸奔尚可接受，
+#   一旦通过 cloudflared 之类的公网隧道暴露，**必须**开 token 鉴权。
+# ---------------------------------------------------------------------------
+AUTH_FAILS = {}          # {ip: [失败次数, 首次失败时间戳]}
+AUTH_FAIL_LIMIT = 10     # 60 秒内失败超过这个数就拖慢响应
+AUTH_FAIL_WINDOW = 60
+
+
+def _norm_net(item):
+    """把 "192.168.1.0/24" / "10.0.0.5" 归一成 ipaddress 网络对象；非法返回 None。"""
+    s = str(item or "").strip()
+    if not s:
+        return None
+    try:
+        if "/" in s:
+            return ipaddress.ip_network(s, strict=False)
+        return ipaddress.ip_network(s + ("/32" if ":" not in s else "/128"), strict=False)
+    except ValueError:
+        return None
+
+
+def _ip_allowed(ip):
+    """allow_ips 为空 → 放行；否则必须在白名单内。"""
+    nets = CFG.get("allow_ips") or []
+    if not nets:
+        return True
+    try:
+        addr = ipaddress.ip_address(ip)
+    except ValueError:
+        return False
+    for item in nets:
+        net = _norm_net(item)
+        if net is None:
+            continue
+        # 只比较同族，避免 IPv4 地址去匹配 IPv6 网段
+        if net.version == addr.version and addr in net:
+            return True
+    return False
+
+
+def _note_auth_fail(ip):
+    now = time.time()
+    cnt, first = AUTH_FAILS.get(ip, [0, now])
+    if now - first > AUTH_FAIL_WINDOW:
+        cnt, first = 0, now
+    cnt += 1
+    AUTH_FAILS[ip] = [cnt, first]
+    if cnt > AUTH_FAIL_LIMIT:
+        time.sleep(1.0)          # 简单拖慢暴力破解，不阻塞其他来源
+    if cnt == AUTH_FAIL_LIMIT:
+        print("[warn] 来自 %s 的鉴权失败已达 %d 次，可能存在探测/爆破" % (ip, cnt),
+              file=sys.stderr)
+
+
+def _token_of(headers):
+    """从请求头取 token：优先 Authorization: Bearer，其次 X-Fleet-Token。"""
+    raw = (headers.get("Authorization") or "").strip()
+    if raw:
+        parts = raw.split(None, 1)
+        if len(parts) == 2 and parts[0].lower() == "bearer":
+            return parts[1].strip()
+        if len(parts) == 1 and parts[0].lower() not in ("bearer",):
+            return parts[0].strip()
+    return (headers.get("X-Fleet-Token") or "").strip()
+
+
+def check_access(ip, headers):
+    """返回 None 表示放行；否则返回 (http_code, 给用户看的说明)。"""
+    if not _ip_allowed(ip):
+        _note_auth_fail(ip)
+        return 403, "来源 IP %s 不在 allow_ips 白名单内" % ip
+    tok = CFG.get("auth_token") or ""
+    if not tok:
+        return None
+    got = _token_of(headers)
+    # 常数时间比较，避免按字符猜测
+    if got and hmac.compare_digest(got, tok):
+        AUTH_FAILS.pop(ip, None)
+        return None
+    _note_auth_fail(ip)
+    if not got:
+        return 401, "缺少凭据。请在请求头带 Authorization: Bearer <token>"
+    return 401, "token 不正确"
 
 
 def _check_path(p):
@@ -441,6 +546,25 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Access-Control-Allow-Headers", "*")
         self.send_header("Access-Control-Allow-Methods", "GET,POST,OPTIONS,DELETE")
 
+    def _guard(self):
+        """鉴权闸门。返回 True 表示已拦截（响应也发完了）。"""
+        ip = self.client_address[0] if self.client_address else "?"
+        denied = check_access(ip, self.headers)
+        if denied is None:
+            return False
+        code, why = denied
+        body = json.dumps({"error": why, "hint": "auth_token 配置见 mcp_agent_config.json"},
+                          ensure_ascii=False).encode("utf-8")
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        if code == 401:
+            self.send_header("WWW-Authenticate", 'Bearer realm="mcp-fleet"')
+        self.send_header("Connection", "close")
+        self.end_headers()
+        self.wfile.write(body)
+        return True
+
     def _json(self, code, obj, sid=None):
         body = json.dumps(obj, ensure_ascii=False).encode("utf-8")
         self.send_response(code)
@@ -462,6 +586,8 @@ class Handler(BaseHTTPRequestHandler):
         self._empty(204)
 
     def do_POST(self):
+        if self._guard():
+            return
         path = self.path.split("?")[0].rstrip("/")
         length = int(self.headers.get("Content-Length") or 0)
         raw = self.rfile.read(length) if length else b""
@@ -505,12 +631,16 @@ class Handler(BaseHTTPRequestHandler):
         self._json(200, resp, sid=sid)
 
     def do_GET(self):
+        if self._guard():
+            return
         path = self.path.split("?")[0].rstrip("/") or "/"
         if path in ("/", "/health", "/status"):
             self._json(200, {
                 "status": "ok", "server": SERVER_NAME, "version": SERVER_VERSION,
                 "tools": len(TOOLS), "tool_names": [t["name"] for t in TOOLS],
                 "tool_prefix": PREFIX, "root": _is_root(),
+                "auth": bool(CFG.get("auth_token") or ""),
+                "allow_ips": CFG.get("allow_ips") or [],
                 "transports": ["POST /mcp (streamable-http)", "GET /sse (sse)"],
             })
             return
@@ -547,6 +677,8 @@ class Handler(BaseHTTPRequestHandler):
         self._json(404, {"error": "not found"})
 
     def do_DELETE(self):
+        if self._guard():
+            return
         self._empty(204)
 
 
@@ -564,6 +696,22 @@ def main():
     print("  工具数          : %d (%s)" % (len(TOOLS), ", ".join(t["name"] for t in TOOLS[:4]) + " ..."))
     print("  工作目录        : %s" % CFG.get("work_dir"))
     print("  运行身份        : %s" % ("root" if _is_root() else "非 root"))
+
+    tok = CFG.get("auth_token") or ""
+    nets = CFG.get("allow_ips") or []
+    if tok:
+        print("  鉴权            : 已开启（Bearer token，%d 字符）" % len(tok))
+    else:
+        print("  鉴权            : [!] 未开启")
+        print("  " + "!" * 68)
+        print("  [!] 未设置 auth_token：任何能访问本端口的人都等于拿到本机 shell。")
+        print("  [!] 仅限内网使用；一旦开公网隧道（mcp-tunnel.sh），请务必先设置：")
+        print("  [!]   python3 -c \"import json;p='%s';d=json.load(open(p));"
+              "d['auth_token']='<强随机串>';json.dump(d,open(p,'w'),ensure_ascii=False)\"" % CONFIG_PATH)
+        print("  [!] 或直接跑 mcp-tunnel.sh，它会自动生成并写入。")
+        print("  " + "!" * 68)
+    if nets:
+        print("  来源白名单      : %s" % ", ".join(str(n) for n in nets))
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:
