@@ -31,14 +31,14 @@
 ### 方式 A：两条命令（推荐，最稳）
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/guoxpeng/mcp-fleet/main/install.sh -o install.sh
+curl -fsSL https://raw.githubusercontent.com/guoxpeng/skill-mcp-fleet/main/install.sh -o install.sh
 sudo bash install.sh --name fnos --port 3100
 ```
 
 ### 方式 B：一条命令（下载即装，需当前为 root）
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/guoxpeng/mcp-fleet/main/install.sh | sudo bash -s -- --name fnos --port 3100
+curl -fsSL https://raw.githubusercontent.com/guoxpeng/skill-mcp-fleet/main/install.sh | sudo bash -s -- --name fnos --port 3100
 ```
 
 > 管道方式下脚本自己会用 `sudo bash -s --` 承接参数；若当前用户非 root 且未加 `sudo`，脚本会给出明确提示而不是卡住。
@@ -47,26 +47,26 @@ curl -fsSL https://raw.githubusercontent.com/guoxpeng/mcp-fleet/main/install.sh 
 
 ```bash
 # jsDelivr CDN
-curl -fsSL https://cdn.jsdelivr.net/gh/guoxpeng/mcp-fleet@main/install.sh -o install.sh
+curl -fsSL https://cdn.jsdelivr.net/gh/guoxpeng/skill-mcp-fleet@main/install.sh -o install.sh
 
 # ghfast.top 加速
-curl -fsSL https://ghfast.top/https://raw.githubusercontent.com/guoxpeng/mcp-fleet/main/install.sh -o install.sh
+curl -fsSL https://ghfast.top/https://raw.githubusercontent.com/guoxpeng/skill-mcp-fleet/main/install.sh -o install.sh
 
 # ghproxy.net 加速
-curl -fsSL https://ghproxy.net/https://raw.githubusercontent.com/guoxpeng/mcp-fleet/main/install.sh -o install.sh
+curl -fsSL https://ghproxy.net/https://raw.githubusercontent.com/guoxpeng/skill-mcp-fleet/main/install.sh -o install.sh
 
 # gh-proxy.com 加速
-curl -fsSL https://gh-proxy.com/https://raw.githubusercontent.com/guoxpeng/mcp-fleet/main/install.sh -o install.sh
+curl -fsSL https://gh-proxy.com/https://raw.githubusercontent.com/guoxpeng/skill-mcp-fleet/main/install.sh -o install.sh
 
 # GitHub API（返回 base64，大陆通常可达；公开仓库可省略 Token）
-curl -fsSL https://api.github.com/repos/guoxpeng/mcp-fleet/contents/install.sh \
+curl -fsSL https://api.github.com/repos/guoxpeng/skill-mcp-fleet/contents/install.sh \
   | python3 -c "import sys,json,base64;open('install.sh','wb').write(base64.b64decode(json.load(sys.stdin)['content']))"
 
 # 下载后照方式 A 安装
 sudo bash install.sh --name fnos --port 3100
 ```
 
-各通道内容一致，MD5 `482310d6e15d84ad9f78591bba0b7fb7`（77092 B，v3.0）。
+各通道内容一致，MD5 `ba8d4c106adc6185a22c7586f696b46e`（88743 B，v3.1）。
 下载后建议核对一遍：`md5sum install.sh`。
 
 看到 `服务状态: active`（systemd 机型）或 `已启动`（容器机型）加 `本机自检通过` 就成了。
@@ -269,6 +269,28 @@ bash /opt/<name>_mcp/mcp-ctl.sh {start|stop|restart|status|log|tunnel}
 另外还有**暴力破解节流**：同一 IP 连续失败 10 次 / 60 秒窗口后，每次鉴权失败
 额外 `sleep 1s`。令牌比对用 `hmac.compare_digest`（常数时间，防时序侧信道）。
 
+### 6.2 v3.1 的加固（默认值改安全）
+
+v3.0 的问题不在「有没有闸」，而在**默认值全是反的**：默认无鉴权、默认绑 `0.0.0.0`、
+默认 `allowed_roots=["/"]`。v3.1 把默认值调正，并补了几个可被外部触发的洞：
+
+| 改动 | 之前 | 现在 |
+|---|---|---|
+| 监听地址 | 默认 `0.0.0.0` | 默认 `127.0.0.1`，要对外必须显式 `--host 0.0.0.0` |
+| CORS | 每个响应都回 `Access-Control-Allow-Origin: *` | 默认**不发**任何 CORS 头；要跨域就填 `cors_allow_origins` |
+| 状态页 `GET /` | 谁都能看到工具清单 / 是否 root / 是否开鉴权 | 只有**配了 token 且校验通过**才返回完整信息 |
+| 请求体 | `Content-Length` 无上限 | 超 `max_body_bytes`（1 MB）或为负 → **413** |
+| `/sse` 并发 | 无上限，每连接常驻一线程 | 超 `max_sse_conns`（16）→ **429** |
+| 非 ASCII 凭据 | `compare_digest` 抛 `TypeError`（未捕获） | 按 bytes 比，正常返回 **401** |
+| `allowed_roots` | `abspath`，软链可逃逸 | `realpath`；且文档写明**不约束 `exec`** |
+| 配置权限 | 只在首次安装时 `chmod 600` | `save_config()` 每次写都**无条件** 0600 |
+
+新增两个开关：`--require-auth`（没配 token 就**拒绝启动**，exit 2）和
+`--generate-token`（现场生成 32 字节随机令牌）。公网 / 隧道场景建议两个都用上。
+
+> ⚠️ 别把 `allowed_roots` 当成沙箱：它只作用于 `read` / `write` / `edit` / `list_dir`，
+> 而 `exec` 本来就能读一切。真正的门禁只有 `auth_token`。
+
 启动时如果 `auth_token` 为空，日志会打印一段醒目警告：
 
 ```
@@ -441,6 +463,14 @@ python3 fleet.py exec cloud "uptime"   # 地址失效时自动纠正后重试
 10. **登录 shell 会把容器的欢迎横幅塞进每一次工具返回**——`bash -lc` 会 source `/etc/profile`，PAI-DSW 这类镜像在那里打印 ASCII 图。用配置项 `login_shell: false` 切成 `bash -c` 解决。
 11. **Windows 上做语法检查别直接敲 `bash`**——可能解析到 `C:\Windows\System32\bash.exe`（WSL 桩），在有安全策略的机器上会被拦且报错莫名其妙。用系统里真实 Git Bash 的绝对路径。
 12. **重装不等于更新（v2.2 修复）**——老版本再装一次会打印「已在运行 (pid xxx)」直接跳过，**跑的还是老代码**，你会以为改动没生效。现在：nohup 分支检测到旧实例自动 `restart`，systemd 分支把 `enable --now` 拆成 `enable` + `restart`（`enable --now` 对已 active 的单元不会重启）。配置文件仍然保留、不覆盖。
+
+### v3.1 新增踩过的坑
+
+17. **源码比安装包新，仓库里出现「源码 v3.1 / 安装器 v3.0」**——改完 `mcp_agent.py` 忘了跑 `build_installer.py`，本地看着是新的，用户 `curl` 下来装出来的还是旧版。发布脚本现在会比对 `mcp_agent.py` 与 `install.sh` **内嵌**的 version，不一致就**不上传** `mcp_agent.py` 并提示重跑构建，避免把这种漂移发出去。
+
+18. **GitHub 仓库改名后，旧名字会「假成功」**——`mcp-fleet` 改名成 `skill-mcp-fleet` 之后，对旧名的 API 调用会被 GitHub 重定向、照样返回 200；于是 `POST /user/repos` 用旧名又建出一个**空壳副本**，两边内容还不一样。发布脚本里仓库名写死新名字，**别再建旧的**。
+
+19. **判断「远端是否已是最新」不能用文件大小**——离线分片固定每片 4000 字符，内容变了大小还是 4001 B，按大小跳过会把旧载荷永远留在仓库里。要用 git blob sha：`sha1("blob <len>\0" + content)`，与 Contents API 返回的 `sha` 一致。
 
 ### v3.0 新增踩过的坑
 
