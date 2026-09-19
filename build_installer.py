@@ -157,16 +157,28 @@ fi
 # ---------- 卸载 ----------
 if [ "$UNINSTALL" = "1" ]; then
   log "卸载 $UNIT ..."
+  # 保活单元必须**先**停。踩过的坑：早先只删 ${UNIT}.service，漏了
+  # ${UNIT}-watchdog.timer —— timer 是 enabled+active 的，删掉安装目录后它仍会
+  # 每 60 秒触发一次 oneshot，而单元里的 WorkingDirectory=$DIR 已经不存在，
+  # journal 里会永远刷 `Failed at step CHDIR spawning /bin/bash`。
+  if [ -f "/etc/systemd/system/${UNIT}-watchdog.timer" ] \
+     || [ -f "/etc/systemd/system/${UNIT}-watchdog.service" ]; then
+    [ "$SYSTEMD_OK" = "1" ] && systemctl disable --now "${UNIT}-watchdog.timer" 2>/dev/null || true
+    [ "$SYSTEMD_OK" = "1" ] && systemctl stop "${UNIT}-watchdog.service" 2>/dev/null || true
+    rm -f "/etc/systemd/system/${UNIT}-watchdog.timer" \
+          "/etc/systemd/system/${UNIT}-watchdog.service"
+  fi
   if [ -f "/etc/systemd/system/${UNIT}.service" ]; then
     [ "$SYSTEMD_OK" = "1" ] && systemctl disable --now "$UNIT" 2>/dev/null || true
     rm -f "/etc/systemd/system/${UNIT}.service"
-    [ "$SYSTEMD_OK" = "1" ] && systemctl daemon-reload 2>/dev/null || true
   fi
+  [ "$SYSTEMD_OK" = "1" ] && systemctl daemon-reload 2>/dev/null || true
   if [ -f "$DIR/tunnel.pid" ]; then kill "$(cat "$DIR/tunnel.pid")" 2>/dev/null || true; fi
   pkill -f "$DIR/cloudflared" 2>/dev/null || true
   if [ -f "$DIR/agent.pid" ]; then kill -TERM -"$(cat "$DIR/agent.pid")" 2>/dev/null || kill "$(cat "$DIR/agent.pid")" 2>/dev/null || true; fi
   pkill -f "$DIR/_supervisor.sh" 2>/dev/null || true
   pkill -f "$DIR/mcp_agent.py" 2>/dev/null || true
+  pkill -f "$DIR/mcp-watchdog.sh" 2>/dev/null || true
   if [ -x "$DIR/_portkill.py" ] || [ -f "$DIR/_portkill.py" ]; then
     command -v python3 >/dev/null 2>&1 && python3 "$DIR/_portkill.py" "$PORT" >/dev/null 2>&1 || true
   fi
