@@ -1313,15 +1313,34 @@ if [ ! -f "$KEY" ]; then
   ssh-keygen -t ed25519 -N "" -f "$KEY" -C "mcp-fleet-tunnel" >/dev/null 2>&1 || \
     ssh-keygen -t rsa -b 3072 -N "" -f "$KEY" -C "mcp-fleet-tunnel" >/dev/null 2>&1
 fi
-if [ -f "${KEY}.pub" ]; then
-  echo "------------------------------------------------------------"
-  echo " 把下面这行公钥加到 VPS（$SSH_DEST）的 ~/.ssh/authorized_keys："
-  echo
-  cat "${KEY}.pub"
-  echo
-  echo " 一键追加（会提示输一次 VPS 密码）："
-  echo "   ssh-copy-id -i ${KEY}.pub -p $SSH_PORT $SSH_DEST"
-  echo "------------------------------------------------------------"
+# ---- 密钥自动部署：先测免密通不通，不通就 ssh-copy-id（输一次 VPS 密码） ----
+_ssh_base() {  # _ssh_base <extra-opts...> -- <remote-cmd>
+  ssh -o BatchMode=yes -o ConnectTimeout=8 -o StrictHostKeyChecking=accept-new \
+      -i "$KEY" -p "$SSH_PORT" "$@"
+}
+if ! _ssh_base "$SSH_DEST" true 2>/dev/null; then
+  echo "[+] 密钥尚未部署到 VPS，尝试自动追加（需要输一次 VPS 密码）…"
+  if command -v ssh-copy-id >/dev/null 2>&1; then
+    ssh-copy-id -i "${KEY}.pub" -p "$SSH_PORT" "$SSH_DEST" < /dev/tty 2>&1 | tail -2 || true
+  else
+    # 没有 ssh-copy-id 就手工拼（兼容 Termux）
+    _pub="$(cat "${KEY}.pub" 2>/dev/null || echo)"
+    if [ -n "$_pub" ]; then
+      echo "[i] 正在用密码方式把公钥写入 VPS（输一次密码）…"
+      ssh -o StrictHostKeyChecking=accept-new -p "$SSH_PORT" "$SSH_DEST" \
+        "mkdir -p ~/.ssh && chmod 700 ~/.ssh && grep -qxF '$_pub' ~/.ssh/authorized_keys 2>/dev/null || echo '$_pub' >> ~/.ssh/authorized_keys && chmod 600 ~/.ssh/authorized_keys && echo KEY_OK" < /dev/tty 2>&1 | tail -2 || true
+    fi
+  fi
+  if _ssh_base "$SSH_DEST" true 2>/dev/null; then
+    echo "[+] 免密登录已打通"
+  else
+    echo "[!] 免密仍未打通。请手工把下面这行加到 VPS 的 ~/.ssh/authorized_keys 后再跑：bash $DIR/mcp-tunnel.sh"
+    echo
+    cat "${KEY}.pub" 2>/dev/null || true
+    echo
+  fi
+else
+  echo "[+] 密钥已部署，免密登录正常"
 fi
 
 # ---- 启动反向隧道 ----
