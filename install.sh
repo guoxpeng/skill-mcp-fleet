@@ -174,6 +174,24 @@ log()  { printf '\033[32m[+]\033[0m %s\n' "$*"; }
 warn() { printf '\033[33m[!]\033[0m %s\n' "$*"; }
 die()  { printf '\033[31m[x]\033[0m %s\n' "$*" >&2; exit 1; }
 
+# ---------- 参数占位符拦截 ----------
+# 有人会照抄文档里的 <名字> / <你的VPS>，bash 会把 < > 当重定向，
+# 在这里提前拦下来给一句人话，而不是报莫名其妙的 "No such file"。
+for _pv in NAME DIR SSH_DEST FRP_SERVER FRP_TOKEN DIRECTORY_URL AUTH_TOKEN; do
+  _vv="${!_pv}"
+  case "$_vv" in
+    "<"*">"|*"<"*)
+      _pn="$_pv"; [ "$_pv" = "NAME" ] && _pn="name"
+      die "参数 $_pn 的值 '$_vv' 像个占位符：请换成真实值（把 < > 去掉）。例如：--name phone   --ssh-dest root@38.64.56.15" ;;
+  esac
+done
+# SSH_DEST 格式顺手验一下
+if [ -n "$SSH_DEST" ]; then
+  case "$SSH_DEST" in
+    *"@"*) ;;
+    *) die "--ssh-dest '$SSH_DEST' 格式不对，应为 user@host，例如 --ssh-dest root@38.64.56.15" ;;
+  esac
+fi
 # ---------- 权限 ----------
 if [ "$(id -u)" -ne 0 ]; then
   if is_termux; then
@@ -252,14 +270,26 @@ detect_pm() {
   echo ""
 }
 pm_install() {  # $1=包管理器 $2..=包名；返回 0 表示成功
+  # 全程非交互：用户跑一键脚本就是同意安装，不弹任何确认/配置文件选择
   local _pm="$1"; shift
   case "$_pm" in
-    pkg)     pkg install -y "$@" >/dev/null 2>&1 ;;
-    apt-get) run_priv "$_pm" update -qq >/dev/null 2>&1
-             run_priv "$_pm" install -y -qq "$@" >/dev/null 2>&1 ;;
+    pkg)     DEBIAN_FRONTEND=noninteractive pkg install -y -o Dpkg::Options::="--force-confold" "$@" >/dev/null 2>&1 ;;
+    apt-get) run_priv env DEBIAN_FRONTEND=noninteractive "$_pm" update -qq >/dev/null 2>&1
+             run_priv env DEBIAN_FRONTEND=noninteractive "$_pm" install -y -qq \
+               -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold" "$@" >/dev/null 2>&1 ;;
     dnf|yum) run_priv "$_pm" install -y -q "$@" >/dev/null 2>&1 ;;
     apk)     run_priv "$_pm" add --no-cache "$@" >/dev/null 2>&1 ;;
     pacman)  run_priv "$_pm" -Sy --noconfirm "$@" >/dev/null 2>&1 ;;
+    *)       return 1 ;;
+  esac
+}
+# 包管理器升级也压掉交互（修 curl 这类依赖错位时用）
+pm_upgrade() {
+  local _pm="$1"
+  case "$_pm" in
+    pkg)     DEBIAN_FRONTEND=noninteractive pkg upgrade -y -o Dpkg::Options::="--force-confold" >/dev/null 2>&1 ;;
+    apt-get) run_priv env DEBIAN_FRONTEND=noninteractive "$_pm" upgrade -y -qq \
+               -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold" >/dev/null 2>&1 ;;
     *)       return 1 ;;
   esac
 }
@@ -284,6 +314,31 @@ PM="$(detect_pm)"
 log "包管理器: ${PM:-未知}"
 ensure_cmd python3 python3 python || die "没有 python3，agent 跑不起来"
 ensure_cmd curl curl curl || warn "没有 curl：隧道下载与自检会受影响"
+# ---- curl 能跑≠好用：Termux 常见 curl 与 nghttp2 版本错位导致链接失败 ----
+# 先真跑一次，坏了就地修，修不好就全程用 python urllib 兜底下载。
+CURL_OK=1
+if command -v curl >/dev/null 2>&1; then
+  if ! curl --version >/dev/null 2>&1; then
+    warn "curl 已损坏（常见于 Termux 依赖错位），尝试修复…"
+    if [ "$PM" = "pkg" ] || [ "$PM" = "apt-get" ]; then
+      log "执行包管理器升级同步依赖（全自动，不弹确认）…"
+      pm_upgrade "$PM" || true
+    else
+      pm_install "$PM" curl >/dev/null 2>&1 || true
+    fi
+    curl --version >/dev/null 2>&1 || CURL_OK=0
+  fi
+else
+  CURL_OK=0
+fi
+[ "$CURL_OK" = "1" ] || warn "curl 不可用，下载改用 python3 urllib 兜底"
+# dl <url> <输出文件>：curl 优先，坏了自动切 python
+dl() {
+  if [ "$CURL_OK" = "1" ]; then
+    curl -fsSL --connect-timeout 12 -o "$2" "$1" && return 0
+  fi
+  "$PY3" -c "import urllib.request,sys; urllib.request.urlretrieve(sys.argv[1], sys.argv[2])" "$1" "$2" 2>/dev/null
+}
 if [ "$TUNNEL_BACKEND" = "ssh" ]; then
   ensure_cmd ssh openssh-client openssh || die "ssh 后端需要 ssh 客户端"
   command -v autossh >/dev/null 2>&1 || ensure_cmd autossh autossh autossh || warn "没装上 autossh，将用 ssh + 保活参数代替（断线重连稍弱）"
@@ -1800,7 +1855,7 @@ if [ ! -x "$BIN" ]; then
     "https://github.com/cloudflare/cloudflared/releases/latest/download/$CF" \
     "https://ghfast.top/https://github.com/cloudflare/cloudflared/releases/latest/download/$CF" \
     "https://ghproxy.net/https://github.com/cloudflare/cloudflared/releases/latest/download/$CF" ; do
-    if curl -fsSL --connect-timeout 12 -o "$BIN" "$M"; then
+    if dl "$M" "$BIN"; then
       # 校验 1：必须是 ELF（镜像/网关出错时经常返回一个 HTML 错误页）
       if ! "$PY" -c "import sys;sys.exit(0 if open(sys.argv[1],'rb').read(4)==b'\x7fELF' else 1)" "$BIN" 2>/dev/null; then
         echo "[!] 下载物不是 ELF 可执行文件，丢弃该通道"
@@ -2048,6 +2103,13 @@ LOG="$DIR/tunnel.log"
 PIDF="$DIR/tunnel.pid"
 PY="$(command -v python3 || echo /usr/bin/python3)"
 [ -f "$DIR/.tunnel_env" ] && . "$DIR/.tunnel_env"
+# 下载兜底：curl 坏了就用 python urllib
+tunnel_dl() {
+  if command -v curl >/dev/null 2>&1 && curl --version >/dev/null 2>&1; then
+    curl -fsSL --connect-timeout 12 -o "$2" "$1" && return 0
+  fi
+  "$PY" -c "import urllib.request,sys; urllib.request.urlretrieve(sys.argv[1], sys.argv[2])" "$1" "$2" 2>/dev/null
+}
 NAME="$("$PY" -c "import json;print(json.load(open('$DIR/mcp_agent_config.json'))['name'])" 2>/dev/null || echo node)"
 
 # ---- 安全闸门：开公网隧道前必须有鉴权（与 cf 后端同逻辑） ----
@@ -2095,7 +2157,7 @@ if [ ! -x "$BIN" ]; then
     "https://github.com/fatedier/frp/releases/download/v${FRP_VER}/frp_${FRP_VER}_linux_${FRP_ARCH}.tar.gz" \
     "https://ghfast.top/https://github.com/fatedier/frp/releases/download/v${FRP_VER}/frp_${FRP_VER}_linux_${FRP_ARCH}.tar.gz" \
     "https://ghproxy.net/https://github.com/fatedier/frp/releases/download/v${FRP_VER}/frp_${FRP_VER}_linux_${FRP_ARCH}.tar.gz" ; do
-    if curl -fsSL --connect-timeout 12 -o "$TGZ" "$M"; then ok=1; break; fi
+    if tunnel_dl "$M" "$TGZ"; then ok=1; break; fi
     echo "[!] 通道失败，试下一个"
   done
   [ "$ok" = "1" ] || { echo "[x] frpc 下载失败，请手动放到 $BIN"; exit 1; }
@@ -2190,6 +2252,14 @@ PORT="$(cat "$DIR/port.txt" 2>/dev/null || echo 3100)"
 LOG="$DIR/tunnel.log"
 PIDF="$DIR/tunnel.pid"
 PY="$(command -v python3 || echo /usr/bin/python3)"
+[ -f "$DIR/.tunnel_env" ] && . "$DIR/.tunnel_env"
+# 下载兜底：curl 坏了就用 python urllib（ssh 后端暂无下载项，留作一致性）
+tunnel_dl() {
+  if command -v curl >/dev/null 2>&1 && curl --version >/dev/null 2>&1; then
+    curl -fsSL --connect-timeout 12 -o "$2" "$1" && return 0
+  fi
+  "$PY" -c "import urllib.request,sys; urllib.request.urlretrieve(sys.argv[1], sys.argv[2])" "$1" "$2" 2>/dev/null
+}
 [ -f "$DIR/.tunnel_env" ] && . "$DIR/.tunnel_env"
 NAME="$("$PY" -c "import json;print(json.load(open('$DIR/mcp_agent_config.json'))['name'])" 2>/dev/null || echo node)"
 
