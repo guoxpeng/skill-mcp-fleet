@@ -165,11 +165,24 @@ is_termux() {
 }
 if is_termux; then
   echo "[+] 检测到 Termux（Android），启用手机模式"
-  if [ -z "$DIR" ]; then DIR="${_TERMUX_PREFIX:-/data/data/com.termux/files/usr}/opt/${NAME}_mcp"; fi   # Termux 写不了 /opt
+  # root 和普通用户分目录：root 用 $PREFIX/opt（整机权限），普通用户用家目录（沙盒权限），互不打架
+  if [ -z "$DIR" ]; then
+    if [ "$(id -u 2>/dev/null || echo 999)" = "0" ]; then
+      DIR="${_TERMUX_PREFIX:-/data/data/com.termux/files/usr}/opt/${NAME}_mcp"
+    else
+      DIR="$HOME/.fleet/${NAME}_mcp"
+    fi
+  fi
   # 手机上 systemd 不存在，强制 nohup 模式
   if [ "$MODE" = "auto" ]; then MODE="nohup"; fi
 else
   if [ -z "$DIR" ]; then DIR="/opt/${NAME}_mcp"; fi
+fi
+# 目录已存在但写不进（比如之前 root 建的），给一句人话而不是 Permission denied
+if [ -e "$DIR" ] && [ ! -w "$DIR" ]; then
+  printf '\033[31m[x]\033[0m 目录 %s 已存在但当前用户写不进去（可能是之前用 root/tsu 建的）。\n' "$DIR" >&2
+  printf '    解决：用 tsu 重跑，或删掉重来：rm -rf %s\n' "$DIR" >&2
+  exit 1
 fi
 UNIT="${NAME}-mcp"
 
