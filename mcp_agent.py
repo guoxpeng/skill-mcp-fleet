@@ -62,7 +62,7 @@ for _stream in (sys.stdout, sys.stderr):
 DEFAULT_CONFIG = {
     "name": "node",             # 副端标识（显示在状态页与 serverInfo）
     "tool_prefix": "",          # 工具名前缀，如 "nas_"；留空则用裸名（exec/read/...）
-    "version": "3.2.0",
+    "version": "3.3.0",
     "sudo_password": "",        # 留空且非 root 时会尝试免密 sudo
     "work_dir": "/",            # 默认工作目录
     "command_timeout": 120,     # 秒

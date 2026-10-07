@@ -24,14 +24,25 @@
 #      --directory-token <串> 可选：地址目录的访问令牌
 #      --no-keepalive      关闭保活守护（默认开启：agent 挂了拉起、隧道断了重建、
 #                          地址持续上报）
-#      --tunnel           装完顺便起 cloudflared 快速隧道（云容器/无公网入口时用）
+#      --tunnel           装完顺便起公网隧道（云容器/无公网入口时用）
+#      --tunnel-backend <b> 隧道后端：cf（默认，cloudflared 快隧）|
+#                          frp（经你 VPS 的 frps，地址恒定）|
+#                          ssh（autossh 反向隧道经你 VPS，地址恒定）
+#      --frp-server <host> --frp-port <p> --frp-token <串> --frp-remote-port <p>
+#                          frp 后端参数（VPS 地址 / frps 端口默认 7000 /
+#                          与 frps 一致的 token / VPS 上暴露的端口默认 13100）
+#      --ssh-dest <user@host> --ssh-port <p> --ssh-remote-port <p>
+#                          ssh 后端参数（你的 VPS / SSH 端口默认 22 /
+#                          VPS 上暴露的端口默认 13100；VPS 需开 GatewayPorts yes）
+#      --print-frps        只打印 VPS 端 frps 的一键配置，不安装
 #      --require-auth      把「必须鉴权」写进配置：没有 auth_token 时副端拒绝启动
 #                          （公网/隧道场景建议加；内网也推荐）
 #      --generate-token    若还没有 auth_token，自动生成一个强随机值写进配置
 #      --uninstall         卸载（停服务 + 删单元 + 删目录）
 #
-#  依赖：python3（只用标准库，无需 pip）。
-#        systemd 有则用服务托管；没有（Docker/PAI-DSW 等容器）自动降级为
+#  依赖：python3 + curl（只用标准库，无需 pip）。脚本会自动识别
+#        apt-get/dnf/yum/apk/pacman/pkg（Termux）并安装缺失的依赖。
+#        systemd 有则用服务托管；没有（Docker/容器/Termux）自动降级为
 #        守护进程 + mcp-ctl.sh 控制脚本，功能一致，只是开机不自启。
 # ============================================================================
 set -euo pipefail
@@ -44,6 +55,15 @@ SUDO_PASS=""
 UNINSTALL="0"
 MODE="auto"
 DO_TUNNEL="0"
+TUNNEL_BACKEND="cf"       # cf | frp | ssh
+FRP_SERVER=""
+FRP_PORT="7000"
+FRP_TOKEN=""
+FRP_REMOTE_PORT="13100"
+SSH_DEST=""               # user@host（你的 VPS）
+SSH_PORT="22"
+SSH_REMOTE_PORT="13100"
+PRINT_FRPS="0"
 AUTH_TOKEN=""
 ALLOW_IPS=""
 ALLOW_IPS_JSON="[]"
@@ -62,6 +82,15 @@ while [ $# -gt 0 ]; do
     --sudo-pass)  SUDO_PASS="${2:-}"; shift 2 ;;
     --mode)       MODE="${2:-}"; shift 2 ;;
     --tunnel)     DO_TUNNEL="1"; shift ;;
+    --tunnel-backend) TUNNEL_BACKEND="${2:-cf}"; shift 2 ;;
+    --frp-server) FRP_SERVER="${2:-}"; shift 2 ;;
+    --frp-port)   FRP_PORT="${2:-7000}"; shift 2 ;;
+    --frp-token)  FRP_TOKEN="${2:-}"; shift 2 ;;
+    --frp-remote-port) FRP_REMOTE_PORT="${2:-13100}"; shift 2 ;;
+    --ssh-dest)   SSH_DEST="${2:-}"; shift 2 ;;
+    --ssh-port)   SSH_PORT="${2:-22}"; shift 2 ;;
+    --ssh-remote-port) SSH_REMOTE_PORT="${2:-13100}"; shift 2 ;;
+    --print-frps) PRINT_FRPS="1"; shift ;;
     --auth-token) AUTH_TOKEN="${2:-}"; shift 2 ;;
     --allow-ips)  ALLOW_IPS="${2:-}"; shift 2 ;;
     --directory)  DIRECTORY_URL="${2:-}"; shift 2 ;;
@@ -75,6 +104,43 @@ while [ $# -gt 0 ]; do
   esac
 done
 
+# --print-frps：只打印 VPS 端 frps 的配置与启动命令，不安装
+if [ "$PRINT_FRPS" = "1" ]; then
+  FRPS_TOK="${FRP_TOKEN:-$(python3 -c 'import secrets;print(secrets.token_hex(16))' 2>/dev/null || echo 'CHANGE_ME')}"
+  cat <<FRPS_EOF
+# ============ 在你的 VPS 上执行（一次即可） ============
+# 1) 下载 frps（按架构选其一）
+#    x86_64: curl -fsSL https://github.com/fatedier/frp/releases/download/v0.61.1/frp_0.61.1_linux_amd64.tar.gz | tar xz
+#    aarch64: curl -fsSL https://github.com/fatedier/frp/releases/download/v0.61.1/frp_0.61.1_linux_arm64.tar.gz | tar xz
+# 2) 写配置 /etc/frps.ini：
+cat > /etc/frps.ini <<'INI'
+[common]
+bind_port = ${FRP_PORT:-7000}
+token = ${FRPS_TOK}
+INI
+chmod 600 /etc/frps.ini
+# 3) 放行防火墙：${FRP_PORT:-7000}/tcp 与 ${FRP_REMOTE_PORT:-13100}/tcp
+# 4) 启动（systemd）：
+cat > /etc/systemd/system/frps.service <<'SVC'
+[Unit]
+Description=frp server
+After=network.target
+[Service]
+ExecStart=/usr/local/bin/frps -c /etc/frps.ini
+Restart=always
+[Install]
+WantedBy=multi-user.target
+SVC
+systemctl daemon-reload && systemctl enable --now frps
+# 5) 副端安装命令（token 已填好）：
+#    bash install.sh --name <名字> --port 3100 --tunnel --tunnel-backend frp \\
+#      --frp-server <VPS地址> --frp-port ${FRP_PORT:-7000} --frp-token ${FRPS_TOK} \\
+#      --frp-remote-port ${FRP_REMOTE_PORT:-13100} --generate-token --require-auth
+# ============ 结束 ============
+FRPS_EOF
+  exit 0
+fi
+
 # --allow-ips 收 "192.168.1.0/24,10.8.0.2" 这种逗号分隔串，转成 JSON 数组
 if [ -n "$ALLOW_IPS" ]; then
   ALLOW_IPS_JSON="$(printf '%s' "$ALLOW_IPS" | tr ',' '\n' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' \
@@ -87,7 +153,21 @@ if [ -z "$NAME" ]; then
   NAME="$(hostname 2>/dev/null | tr 'A-Z' 'a-z' | tr -c 'a-z0-9' '-' | sed 's/-\+$//')"
   [ -z "$NAME" ] && NAME="node"
 fi
-if [ -z "$DIR" ]; then DIR="/opt/${NAME}_mcp"; fi
+# ---------- Stage 0：平台识别 ----------
+# Termux（Android）：uname -o 返回 Android，或 $PREFIX/bin/pkg 存在
+is_termux() {
+  [ "$(uname -o 2>/dev/null || echo '')" = "Android" ] && return 0
+  [ -n "${PREFIX:-}" ] && [ -x "$PREFIX/bin/pkg" ] && return 0
+  return 1
+}
+if is_termux; then
+  echo "[+] 检测到 Termux（Android），启用手机模式"
+  if [ -z "$DIR" ]; then DIR="$PREFIX/opt/${NAME}_mcp"; fi   # Termux 写不了 /opt
+  # 手机上 systemd 不存在，强制 nohup 模式
+  if [ "$MODE" = "auto" ]; then MODE="nohup"; fi
+else
+  if [ -z "$DIR" ]; then DIR="/opt/${NAME}_mcp"; fi
+fi
 UNIT="${NAME}-mcp"
 
 log()  { printf '\033[32m[+]\033[0m %s\n' "$*"; }
@@ -96,7 +176,9 @@ die()  { printf '\033[31m[x]\033[0m %s\n' "$*" >&2; exit 1; }
 
 # ---------- 权限 ----------
 if [ "$(id -u)" -ne 0 ]; then
-  if [ -r "$0" ] && command -v sudo >/dev/null 2>&1; then
+  if is_termux; then
+    warn "当前非 root：agent 只能操作 Termux 沙盒内的文件。如需整机权限，请先 pkg install tsu 再用 tsu 运行本脚本。"
+  elif [ -r "$0" ] && command -v sudo >/dev/null 2>&1; then
     echo "[i] 需要 root，自动用 sudo 重新执行"
     exec sudo -E bash "$0" "$@"
   elif [ ! -r "$0" ]; then
@@ -160,8 +242,52 @@ if [ "$UNINSTALL" = "1" ]; then
   exit 0
 fi
 
-# ---------- 依赖检查 ----------
-command -v python3 >/dev/null 2>&1 || die "未找到 python3，请先安装：apt install -y python3（或 yum/dnf install -y python3）"
+# ---------- Stage 0：依赖自举（自动识别包管理器并安装） ----------
+detect_pm() {
+  # 输出包管理器：pkg（Termux）/ apt-get / dnf / yum / apk / pacman，或空
+  if is_termux && command -v pkg >/dev/null 2>&1; then echo pkg; return; fi
+  for _pm in apt-get dnf yum apk pacman; do
+    if command -v "$_pm" >/dev/null 2>&1; then echo "$_pm"; return; fi
+  done
+  echo ""
+}
+pm_install() {  # $1=包管理器 $2..=包名；返回 0 表示成功
+  local _pm="$1"; shift
+  case "$_pm" in
+    pkg)     pkg install -y "$@" >/dev/null 2>&1 ;;
+    apt-get) run_priv "$_pm" update -qq >/dev/null 2>&1
+             run_priv "$_pm" install -y -qq "$@" >/dev/null 2>&1 ;;
+    dnf|yum) run_priv "$_pm" install -y -q "$@" >/dev/null 2>&1 ;;
+    apk)     run_priv "$_pm" add --no-cache "$@" >/dev/null 2>&1 ;;
+    pacman)  run_priv "$_pm" -Sy --noconfirm "$@" >/dev/null 2>&1 ;;
+    *)       return 1 ;;
+  esac
+}
+# run_priv：root 直接跑，非 root 试 sudo，Termux 下 pkg 不需要提权
+run_priv() {
+  if [ "$(id -u)" = "0" ]; then "$@"
+  elif command -v sudo >/dev/null 2>&1; then sudo "$@"
+  else "$@"; fi
+}
+ensure_cmd() {  # $1=命令名 $2=包名(apt/dnf/yum/apk/pacman) $3=包名(termsux pkg)
+  local _cmd="$1" _pkg="$2" _tpkg="${3:-$2}"
+  command -v "$_cmd" >/dev/null 2>&1 && return 0
+  local _pm; _pm="$(detect_pm)"
+  [ -z "$_pm" ] && { warn "未找到 $_cmd，且识别不出包管理器，请手动安装"; return 1; }
+  log "未找到 $_cmd，用 $_pm 自动安装…"
+  if [ "$_pm" = "pkg" ]; then pm_install "$_pm" "$_tpkg" || pm_install "$_pm" "$_pkg"; else pm_install "$_pm" "$_pkg"; fi
+  command -v "$_cmd" >/dev/null 2>&1 && { log "$_cmd 安装成功"; return 0; }
+  warn "$_cmd 自动安装失败，请手动安装后重试"
+  return 1
+}
+PM="$(detect_pm)"
+log "包管理器: ${PM:-未知}"
+ensure_cmd python3 python3 python || die "没有 python3，agent 跑不起来"
+ensure_cmd curl curl curl || warn "没有 curl：隧道下载与自检会受影响"
+if [ "$TUNNEL_BACKEND" = "ssh" ]; then
+  ensure_cmd ssh openssh-client openssh || die "ssh 后端需要 ssh 客户端"
+  command -v autossh >/dev/null 2>&1 || ensure_cmd autossh autossh autossh || warn "没装上 autossh，将用 ssh + 保活参数代替（断线重连稍弱）"
+fi
 PY3="$(command -v python3)"
 PYVER="$($PY3 -c 'import sys;print("%d.%d"%sys.version_info[:2])')"
 log "python3: $PY3 (v$PYVER)"
@@ -238,7 +364,7 @@ for _stream in (sys.stdout, sys.stderr):
 DEFAULT_CONFIG = {
     "name": "node",             # 副端标识（显示在状态页与 serverInfo）
     "tool_prefix": "",          # 工具名前缀，如 "nas_"；留空则用裸名（exec/read/...）
-    "version": "3.2.0",
+    "version": "3.3.0",
     "sudo_password": "",        # 留空且非 root 时会尝试免密 sudo
     "work_dir": "/",            # 默认工作目录
     "command_timeout": 120,     # 秒
@@ -1213,7 +1339,7 @@ else
 {
   "name": "$NAME",
   "tool_prefix": "$PREFIX",
-  "version": "3.1.0",
+  "version": "3.3.0",
   "sudo_password": "$SUDO_PASS",
   "work_dir": "/",
   "command_timeout": 120,
@@ -1599,7 +1725,7 @@ esac
 CTL_SH_EOF
 
 # 公网隧道：云容器（PAI-DSW/Colab 等）没有内网可达入口，必须借隧道把端口暴露出去
-cat > "$DIR/mcp-tunnel.sh" <<'TUN_SH_EOF'
+cat > "$DIR/mcp-tunnel-cf.sh" <<'TUN_CF_EOF'
 #!/usr/bin/env bash
 # 用 cloudflared 快速隧道把本机 MCP 端口暴露到公网。
 # 注意：trycloudflare.com 地址是临时的，重启会变；每次换地址都要更新主端 mcp.json。
@@ -1883,7 +2009,306 @@ if [ "$DNS_OK" != "1" ] || { [ -n "$HTTP_CODE" ] && [ "$HTTP_CODE" != "200" ]; }
   echo "    4) 要长期稳定：换固定隧道（自有域名 + cloudflared tunnel create）或端口映射/frp。"
 fi
 echo " 停止隧道：kill \$(cat "$PIDF")      日志：$LOG"
-TUN_SH_EOF
+TUN_CF_EOF
+# ============================================================================
+# 隧道分发器 + frp/ssh 后端（v3.3）
+# ----------------------------------------------------------------------------
+# mcp-tunnel.sh 按 $DIR/.tunnel_backend 选择后端：cf | frp | ssh（默认 cf）。
+# 各后端共用约定：pid 记 tunnel.pid、日志 tunnel.log、
+# 公网地址写 .tunnel_url 与 current_url.txt（保活守护与主端 sync 都读它）。
+# ============================================================================
+cat > "$DIR/mcp-tunnel.sh" <<'TUN_DISP_EOF'
+#!/usr/bin/env bash
+# 隧道分发器：按 .tunnel_backend 选择后端（cf | frp | ssh），默认 cf。
+set -uo pipefail
+DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+BACKEND="$(cat "$DIR/.tunnel_backend" 2>/dev/null || echo cf)"
+case "$BACKEND" in
+  frp) exec bash "$DIR/mcp-tunnel-frp.sh" "$@" ;;
+  ssh) exec bash "$DIR/mcp-tunnel-ssh.sh" "$@" ;;
+  cf|"") exec bash "$DIR/mcp-tunnel-cf.sh" "$@" ;;
+  *) echo "[x] 未知隧道后端: $BACKEND（.tunnel_backend 可选 cf | frp | ssh）" >&2; exit 1 ;;
+esac
+TUN_DISP_EOF
+
+# ----------------------------------------------------------------------------
+# frp 后端：经你自己的 VPS（frps）把 agent 端口映射出去。
+# 需要安装参数：--frp-server <VPS地址> --frp-token <与frps一致> [--frp-port 7000] [--frp-remote-port 13100]
+# VPS 端一键配置：bash install.sh --print-frps
+# 地址恒定：http://<VPS>:<remote-port>，不受 cf 限流影响。
+# ----------------------------------------------------------------------------
+cat > "$DIR/mcp-tunnel-frp.sh" <<'TUN_FRP_EOF'
+#!/usr/bin/env bash
+# frp 后端：把本机 agent 端口经自建 frps（你的 VPS）暴露到公网。
+set -uo pipefail
+DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PORT="$(cat "$DIR/port.txt" 2>/dev/null || echo 3100)"
+BIN="$DIR/frpc"
+LOG="$DIR/tunnel.log"
+PIDF="$DIR/tunnel.pid"
+PY="$(command -v python3 || echo /usr/bin/python3)"
+[ -f "$DIR/.tunnel_env" ] && . "$DIR/.tunnel_env"
+NAME="$("$PY" -c "import json;print(json.load(open('$DIR/mcp_agent_config.json'))['name'])" 2>/dev/null || echo node)"
+
+# ---- 安全闸门：开公网隧道前必须有鉴权（与 cf 后端同逻辑） ----
+TOKEN="$("$PY" -c "import json;print(json.load(open('$DIR/mcp_agent_config.json')).get('auth_token',''))" 2>/dev/null || echo '')"
+if [ -z "$TOKEN" ] && [ "${FLEET_NO_AUTH:-0}" != "1" ]; then
+TOKEN="$("$PY" -c "import secrets;print(secrets.token_urlsafe(32))")"
+  "$PY" - "$DIR/mcp_agent_config.json" "$TOKEN" <<'TOK_PY_EOF'
+import json, sys
+p, tok = sys.argv[1], sys.argv[2]
+with open(p, encoding="utf-8") as f:
+    d = json.load(f)
+d["auth_token"] = tok
+with open(p, "w", encoding="utf-8") as f:
+    json.dump(d, f, ensure_ascii=False, indent=2)
+TOK_PY_EOF
+  chmod 600 "$DIR/mcp_agent_config.json" 2>/dev/null || true
+  echo "[+] 已为公网隧道生成鉴权 token，写入 mcp_agent_config.json 并重启副端 ..."
+  if [ -f "/etc/systemd/system/${NAME}-mcp.service" ] && command -v systemctl >/dev/null 2>&1; then
+    systemctl restart "${NAME}-mcp" >/dev/null 2>&1 || true
+  else
+    bash "$DIR/mcp-ctl.sh" restart >/dev/null 2>&1 || true
+  fi
+  sleep 2
+fi
+
+# ---- 参数 ----
+[ -n "${FRP_SERVER:-}" ] || { echo "[x] 缺少 frp 服务器地址。用 --frp-server 指定，或改 .tunnel_env"; exit 1; }
+[ -n "${FRP_TOKEN:-}" ] || { echo "[x] 缺少 frp token。用 --frp-token 指定（与 VPS 上 frps.ini 的 token 一致）"; exit 1; }
+FRP_PORT="${FRP_PORT:-7000}"
+FRP_REMOTE_PORT="${FRP_REMOTE_PORT:-13100}"
+
+# ---- 下载 frpc ----
+if [ ! -x "$BIN" ]; then
+  ARCH="$(uname -m)"
+  case "$ARCH" in
+    x86_64|amd64) FRP_ARCH="amd64" ;;
+    aarch64|arm64) FRP_ARCH="arm64" ;;
+    *) echo "[x] 不支持的 CPU 架构: $ARCH"; exit 1 ;;
+  esac
+  FRP_VER="0.61.1"
+  TGZ="/tmp/frp_${FRP_VER}_linux_${FRP_ARCH}.tar.gz"
+  echo "[+] 下载 frpc v$FRP_VER ($FRP_ARCH) ..."
+  ok=0
+  for M in \
+    "https://github.com/fatedier/frp/releases/download/v${FRP_VER}/frp_${FRP_VER}_linux_${FRP_ARCH}.tar.gz" \
+    "https://ghfast.top/https://github.com/fatedier/frp/releases/download/v${FRP_VER}/frp_${FRP_VER}_linux_${FRP_ARCH}.tar.gz" \
+    "https://ghproxy.net/https://github.com/fatedier/frp/releases/download/v${FRP_VER}/frp_${FRP_VER}_linux_${FRP_ARCH}.tar.gz" ; do
+    if curl -fsSL --connect-timeout 12 -o "$TGZ" "$M"; then ok=1; break; fi
+    echo "[!] 通道失败，试下一个"
+  done
+  [ "$ok" = "1" ] || { echo "[x] frpc 下载失败，请手动放到 $BIN"; exit 1; }
+  tar xzf "$TGZ" -C /tmp || { echo "[x] 解压失败"; exit 1; }
+  cp "/tmp/frp_${FRP_VER}_linux_${FRP_ARCH}/frpc" "$BIN" && chmod +x "$BIN"
+  rm -rf "$TGZ" "/tmp/frp_${FRP_VER}_linux_${FRP_ARCH}"
+fi
+
+# ---- 写 frpc.ini ----
+cat > "$DIR/frpc.ini" <<FRPC_EOF
+[common]
+server_addr = ${FRP_SERVER}
+server_port = ${FRP_PORT}
+token = ${FRP_TOKEN}
+
+[mcp-${NAME}]
+type = tcp
+local_ip = 127.0.0.1
+local_port = ${PORT}
+remote_port = ${FRP_REMOTE_PORT}
+FRPC_EOF
+chmod 600 "$DIR/frpc.ini"
+
+# ---- 启动 ----
+touch "$DIR/.want_tunnel" 2>/dev/null || true
+if [ -f "$PIDF" ] && kill -0 "$(cat "$PIDF" 2>/dev/null)" 2>/dev/null; then
+  echo "[i] frp 隧道已在运行（pid $(cat "$PIDF")），复用。"
+else
+  [ -f "$PIDF" ] && { kill "$(cat "$PIDF")" 2>/dev/null || true; rm -f "$PIDF"; }
+  : > "$LOG"
+  setsid nohup "$BIN" -c "$DIR/frpc.ini" >> "$LOG" 2>&1 < /dev/null &
+  sleep 2
+  REAL="$(pgrep -f "$BIN -c $DIR/frpc.ini" 2>/dev/null | head -1 || true)"
+  if [ -n "$REAL" ]; then echo "$REAL" > "$PIDF"; else echo $! > "$PIDF"; fi
+fi
+
+URL="http://${FRP_SERVER}:${FRP_REMOTE_PORT}"
+printf '%s' "$URL" > "$DIR/.tunnel_url" 2>/dev/null || true
+printf '%s' "$URL" > "$DIR/current_url.txt" 2>/dev/null || true
+# 同步写进 agent 配置的 tunnel_url（主端 sync 用）
+"$PY" - "$DIR/mcp_agent_config.json" "$URL" <<'URL_PY_EOF' 2>/dev/null || true
+import json, sys
+p, url = sys.argv[1], sys.argv[2]
+with open(p, encoding="utf-8") as f:
+    d = json.load(f)
+d["tunnel_url"] = url
+with open(p, "w", encoding="utf-8") as f:
+    json.dump(d, f, ensure_ascii=False, indent=2)
+URL_PY_EOF
+
+# ---- 自检 ----
+HTTP_CODE=""
+if [ -n "$TOKEN" ]; then
+  HTTP_CODE="$(curl -s -m 15 -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $TOKEN" "$URL/" 2>/dev/null || true)"
+else
+  HTTP_CODE="$(curl -s -m 15 -o /dev/null -w '%{http_code}' "$URL/" 2>/dev/null || true)"
+fi
+
+echo
+echo "============================================================"
+echo " frp 隧道地址：$URL  （经你的 VPS ${FRP_SERVER}，地址恒定）"
+echo " MCP 端点    ：$URL/mcp"
+if [ -n "$TOKEN" ]; then echo " 鉴权 token  ：$TOKEN"; else echo " 鉴权 token  ：(未设置 —— 公网裸奔，请尽快补上)"; fi
+echo "------------------------------------------------------------"
+echo " 公网访问    ：${HTTP_CODE:-未检测}$([ "$HTTP_CODE" = "200" ] && echo " (通)" || echo " (不通：检查 VPS 防火墙是否放行 ${FRP_REMOTE_PORT}/tcp，frps 是否在跑)")"
+echo "------------------------------------------------------------"
+echo " 主端 ~/.workbuddy/mcp.json 增加："
+echo
+echo "   "$NAME": {"
+echo "     "type": "http","
+echo "     "url": "$URL/mcp"$([ -n "$TOKEN" ] && printf ',')"
+if [ -n "$TOKEN" ]; then
+  echo "     "headers": { "Authorization": "Bearer $TOKEN" }"
+fi
+echo "   }"
+echo "============================================================"
+echo " 停止隧道：kill \$(cat "$PIDF")      日志：$LOG"
+TUN_FRP_EOF
+
+# ----------------------------------------------------------------------------
+# ssh 后端：autossh/ssh 反向隧道，经你的 VPS（sshd）把 agent 端口映射出去。
+# 需要安装参数：--ssh-dest <user@host> [--ssh-port 22] [--ssh-remote-port 13100]
+# 首次运行会生成专用密钥并打印公钥，按提示加到 VPS 的 authorized_keys 即可。
+# 地址恒定：http://<VPS>:<remote-port>。VPS 的 sshd 需开 GatewayPorts yes 才能被外网访问。
+# ----------------------------------------------------------------------------
+cat > "$DIR/mcp-tunnel-ssh.sh" <<'TUN_SSH_EOF'
+#!/usr/bin/env bash
+# ssh 反向隧道后端：经你的 VPS 把本机 agent 端口暴露到公网。
+set -uo pipefail
+DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PORT="$(cat "$DIR/port.txt" 2>/dev/null || echo 3100)"
+LOG="$DIR/tunnel.log"
+PIDF="$DIR/tunnel.pid"
+PY="$(command -v python3 || echo /usr/bin/python3)"
+[ -f "$DIR/.tunnel_env" ] && . "$DIR/.tunnel_env"
+NAME="$("$PY" -c "import json;print(json.load(open('$DIR/mcp_agent_config.json'))['name'])" 2>/dev/null || echo node)"
+
+# ---- 安全闸门：开公网隧道前必须有鉴权（与 cf 后端同逻辑） ----
+TOKEN="$("$PY" -c "import json;print(json.load(open('$DIR/mcp_agent_config.json')).get('auth_token',''))" 2>/dev/null || echo '')"
+if [ -z "$TOKEN" ] && [ "${FLEET_NO_AUTH:-0}" != "1" ]; then
+TOKEN="$("$PY" -c "import secrets;print(secrets.token_urlsafe(32))")"
+  "$PY" - "$DIR/mcp_agent_config.json" "$TOKEN" <<'TOK_PY_EOF'
+import json, sys
+p, tok = sys.argv[1], sys.argv[2]
+with open(p, encoding="utf-8") as f:
+    d = json.load(f)
+d["auth_token"] = tok
+with open(p, "w", encoding="utf-8") as f:
+    json.dump(d, f, ensure_ascii=False, indent=2)
+TOK_PY_EOF
+  chmod 600 "$DIR/mcp_agent_config.json" 2>/dev/null || true
+  echo "[+] 已为公网隧道生成鉴权 token，写入 mcp_agent_config.json 并重启副端 ..."
+  if [ -f "/etc/systemd/system/${NAME}-mcp.service" ] && command -v systemctl >/dev/null 2>&1; then
+    systemctl restart "${NAME}-mcp" >/dev/null 2>&1 || true
+  else
+    bash "$DIR/mcp-ctl.sh" restart >/dev/null 2>&1 || true
+  fi
+  sleep 2
+fi
+
+# ---- 参数 ----
+[ -n "${SSH_DEST:-}" ] || { echo "[x] 缺少 SSH 目标。用 --ssh-dest user@host 指定（你的 VPS）"; exit 1; }
+SSH_PORT="${SSH_PORT:-22}"
+SSH_REMOTE_PORT="${SSH_REMOTE_PORT:-13100}"
+SSH_HOST="${SSH_DEST##*@}"
+
+# ---- 密钥（专用，不碰你已有的 id_rsa） ----
+KEY="$HOME/.ssh/id_mcp_fleet"
+mkdir -p "$HOME/.ssh" && chmod 700 "$HOME/.ssh"
+if [ ! -f "$KEY" ]; then
+  echo "[+] 生成隧道专用密钥 $KEY ..."
+  ssh-keygen -t ed25519 -N "" -f "$KEY" -C "mcp-fleet-tunnel" >/dev/null 2>&1 || \
+    ssh-keygen -t rsa -b 3072 -N "" -f "$KEY" -C "mcp-fleet-tunnel" >/dev/null 2>&1
+fi
+if [ -f "${KEY}.pub" ]; then
+  echo "------------------------------------------------------------"
+  echo " 把下面这行公钥加到 VPS（$SSH_DEST）的 ~/.ssh/authorized_keys："
+  echo
+  cat "${KEY}.pub"
+  echo
+  echo " 一键追加（会提示输一次 VPS 密码）："
+  echo "   ssh-copy-id -i ${KEY}.pub -p $SSH_PORT $SSH_DEST"
+  echo "------------------------------------------------------------"
+fi
+
+# ---- 启动反向隧道 ----
+touch "$DIR/.want_tunnel" 2>/dev/null || true
+if [ -f "$PIDF" ] && kill -0 "$(cat "$PIDF" 2>/dev/null)" 2>/dev/null; then
+  echo "[i] ssh 隧道已在运行（pid $(cat "$PIDF")），复用。"
+else
+  [ -f "$PIDF" ] && { kill "$(cat "$PIDF")" 2>/dev/null || true; rm -f "$PIDF"; sleep 1; }
+  : > "$LOG"
+  SSH_OPTS="-o ServerAliveInterval=30 -o ServerAliveCountMax=3 -o ExitOnForwardFailure=yes -o StrictHostKeyChecking=accept-new -i $KEY -p $SSH_PORT"
+  # shellcheck disable=SC2086
+  if command -v autossh >/dev/null 2>&1; then
+    echo "[i] 用 autossh（断线自动重连）"
+    setsid nohup autossh -M 0 -N $SSH_OPTS -R "${SSH_REMOTE_PORT}:127.0.0.1:${PORT}" "$SSH_DEST" >> "$LOG" 2>&1 < /dev/null &
+  else
+    echo "[i] 没找到 autossh，用 ssh（建议装 autossh 获得断线重连）"
+    setsid nohup ssh $SSH_OPTS -N -R "${SSH_REMOTE_PORT}:127.0.0.1:${PORT}" "$SSH_DEST" >> "$LOG" 2>&1 < /dev/null &
+  fi
+  sleep 3
+  echo $! > "$PIDF"
+fi
+
+URL="http://${SSH_HOST}:${SSH_REMOTE_PORT}"
+printf '%s' "$URL" > "$DIR/.tunnel_url" 2>/dev/null || true
+printf '%s' "$URL" > "$DIR/current_url.txt" 2>/dev/null || true
+"$PY" - "$DIR/mcp_agent_config.json" "$URL" <<'URL_PY_EOF' 2>/dev/null || true
+import json, sys
+p, url = sys.argv[1], sys.argv[2]
+with open(p, encoding="utf-8") as f:
+    d = json.load(f)
+d["tunnel_url"] = url
+with open(p, "w", encoding="utf-8") as f:
+    json.dump(d, f, ensure_ascii=False, indent=2)
+URL_PY_EOF
+
+# ---- 自检 ----
+HTTP_CODE=""
+if [ -n "$TOKEN" ]; then
+  HTTP_CODE="$(curl -s -m 15 -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $TOKEN" "$URL/" 2>/dev/null || true)"
+else
+  HTTP_CODE="$(curl -s -m 15 -o /dev/null -w '%{http_code}' "$URL/" 2>/dev/null || true)"
+fi
+
+echo
+echo "============================================================"
+echo " ssh 隧道地址：$URL  （经你的 VPS $SSH_HOST，地址恒定）"
+echo " MCP 端点    ：$URL/mcp"
+if [ -n "$TOKEN" ]; then echo " 鉴权 token  ：$TOKEN"; else echo " 鉴权 token  ：(未设置 —— 公网裸奔，请尽快补上)"; fi
+echo "------------------------------------------------------------"
+echo " 公网访问    ：${HTTP_CODE:-未检测}$([ "$HTTP_CODE" = "200" ] && echo " (通)" || echo " (不通)")"
+if [ "$HTTP_CODE" != "200" ]; then
+  echo " 排查："
+  echo "   1) VPS 上 sshd 需开 GatewayPorts：/etc/ssh/sshd_config 加一行 GatewayPorts yes 后 systemctl reload sshd"
+  echo "   2) VPS 防火墙放行 ${SSH_REMOTE_PORT}/tcp"
+  echo "   3) 密钥是否已加入 VPS 的 ~/.ssh/authorized_keys（见上方公钥）"
+  echo "   4) 日志：tail -n 30 $LOG"
+fi
+echo "------------------------------------------------------------"
+echo " 主端 ~/.workbuddy/mcp.json 增加："
+echo
+echo "   "$NAME": {"
+echo "     "type": "http","
+echo "     "url": "$URL/mcp"$([ -n "$TOKEN" ] && printf ',')"
+if [ -n "$TOKEN" ]; then
+  echo "     "headers": { "Authorization": "Bearer $TOKEN" }"
+fi
+echo "   }"
+echo "============================================================"
+echo " 停止隧道：kill \$(cat "$PIDF")      日志：$LOG"
+TUN_SSH_EOF
 
 # ============================================================================
 # 保活守护（v3.0）：让副端「随时可连」
@@ -2018,7 +2443,7 @@ while true; do
 done
 WATCHDOG_SH_EOF
 
-chmod +x "$DIR/_supervisor.sh" "$DIR/mcp-ctl.sh" "$DIR/mcp-tunnel.sh" "$DIR/mcp-watchdog.sh" 2>/dev/null || true
+chmod +x "$DIR/_supervisor.sh" "$DIR/mcp-ctl.sh" "$DIR/mcp-tunnel.sh" "$DIR/mcp-tunnel-cf.sh" "$DIR/mcp-tunnel-frp.sh" "$DIR/mcp-tunnel-ssh.sh" "$DIR/mcp-watchdog.sh" 2>/dev/null || true
 
 $PY3 -c "import ast,sys; ast.parse(open('$DIR/mcp_agent.py',encoding='utf-8').read())" \
   || die "服务器代码语法校验失败"
@@ -2184,11 +2609,45 @@ fi
 
 # ---------- 可选隧道 ----------
 TUNNEL_URL=""
+# ---------- 隧道后端配置落盘 ----------
+# mcp-tunnel.sh 是分发器，按 .tunnel_backend 选择 cf | frp | ssh；
+# 各后端参数存在 .tunnel_env，后端脚本 source 它。
+if [ "$DO_TUNNEL" = "1" ]; then
+  case "$TUNNEL_BACKEND" in
+    cf) ;;
+    frp)
+      [ -n "$FRP_SERVER" ] || die "frp 后端需要 --frp-server（你的 VPS 地址）"
+      [ -n "$FRP_TOKEN" ] || die "frp 后端需要 --frp-token（与 VPS 上 frps.ini 的 token 一致）"
+      ;;
+    ssh)
+      [ -n "$SSH_DEST" ] || die "ssh 后端需要 --ssh-dest（user@host，你的 VPS）"
+      ;;
+    *) die "未知的 --tunnel-backend：$TUNNEL_BACKEND（可选 cf | frp | ssh）" ;;
+  esac
+  printf '%s' "$TUNNEL_BACKEND" > "$DIR/.tunnel_backend"
+  cat > "$DIR/.tunnel_env" <<TUN_ENV_EOF
+TUNNEL_BACKEND="$TUNNEL_BACKEND"
+FRP_SERVER="$FRP_SERVER"
+FRP_PORT="$FRP_PORT"
+FRP_TOKEN="$FRP_TOKEN"
+FRP_REMOTE_PORT="$FRP_REMOTE_PORT"
+SSH_DEST="$SSH_DEST"
+SSH_PORT="$SSH_PORT"
+SSH_REMOTE_PORT="$SSH_REMOTE_PORT"
+TUN_ENV_EOF
+  chmod 600 "$DIR/.tunnel_env" 2>/dev/null || true
+  log "隧道后端: $TUNNEL_BACKEND"
+fi
+
 if [ "$DO_TUNNEL" = "1" ]; then
   log "启动公网隧道 ..."
   TUN_OUT="$(bash "$DIR/mcp-tunnel.sh" 2>&1 || true)"
   echo "$TUN_OUT"
+  # cf 给 https 临时域名；frp/ssh 给 http://vps:port（固定地址）
   TUNNEL_URL="$(printf '%s' "$TUN_OUT" | grep -oE 'https://[a-z0-9][a-z0-9-]*\.trycloudflare\.com' | head -1 || true)"
+  if [ -z "$TUNNEL_URL" ]; then
+    TUNNEL_URL="$(printf '%s' "$TUN_OUT" | grep -oE 'http://[^[:space:]"]+' | grep -v '127\.0\.0\.1' | head -1 || true)"
+  fi
 fi
 
 # ---------- 输出接入信息 ----------

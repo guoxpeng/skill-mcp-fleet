@@ -68,6 +68,33 @@ sudo bash install.sh --name fnos --port 3100
 ```
 
 各通道内容一致，MD5 `ba8d4c106adc6185a22c7586f696b46e`（88743 B，v3.1）。
+
+### v3.3+：一键环境自举 + 多隧道后端
+
+安装脚本会自动识别系统并装好依赖，不用再手工 `apt install python3`：
+
+- **包管理器自动识别**：apt-get / dnf / yum / apk / pacman / pkg（Termux）
+- **Termux（Android 手机）**：自动进手机模式，安装目录改到 `$PREFIX/opt`，无 systemd 时用 nohup 守护
+- 非 root 在 Termux 下可直接装（会提示权限范围）；Linux 下自动 `sudo` 提权
+
+公网隧道不再只有 cloudflared（`--tunnel-backend` 三选一）：
+
+```bash
+# 默认：cloudflared 快隧（地址临时，重启会变）
+bash install.sh --name phone --port 3100 --tunnel --generate-token --require-auth
+
+# frp：经你自己的 VPS，地址恒定 http://<VPS>:13100（推荐长期用）
+# 先在 VPS 上：bash install.sh --print-frps   # 打印 frps 一键配置
+bash install.sh --name phone --port 3100 --tunnel --tunnel-backend frp \
+  --frp-server <VPS地址> --frp-token <与frps一致> --generate-token --require-auth
+
+# ssh：autossh 反向隧道经你 VPS，地址恒定，无需额外装服务端
+# VPS 的 sshd 需开 GatewayPorts yes；首次运行会打印公钥，按提示加入 VPS 即可
+bash install.sh --name phone --port 3100 --tunnel --tunnel-backend ssh \
+  --ssh-dest root@<VPS地址> --generate-token --require-auth
+```
+
+`bash <安装目录>/mcp-tunnel.sh` 会按配置的后端自动重建隧道；保活守护共用同一套 pid/地址文件。
 下载后建议核对一遍：`md5sum install.sh`。
 
 看到 `服务状态: active`（systemd 机型）或 `已启动`（容器机型）加 `本机自检通过` 就成了。
