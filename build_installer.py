@@ -1312,13 +1312,13 @@ SSH_PORT="${SSH_PORT:-22}"
 SSH_REMOTE_PORT="${SSH_REMOTE_PORT:-13100}"
 SSH_HOST="${SSH_DEST##*@}"
 
-# ---- 密钥（专用，不碰你已有的 id_rsa） ----
-KEY="$HOME/.ssh/id_mcp_fleet"
-mkdir -p "$HOME/.ssh" && chmod 700 "$HOME/.ssh"
+# ---- 密钥（放安装目录，不依赖 $HOME：tsu 会改 HOME 导致路径错乱） ----
+KEY="$DIR/ssh_tunnel_key"
 if [ ! -f "$KEY" ]; then
   echo "[+] 生成隧道专用密钥 $KEY ..."
   ssh-keygen -t ed25519 -N "" -f "$KEY" -C "mcp-fleet-tunnel" >/dev/null 2>&1 || \
     ssh-keygen -t rsa -b 3072 -N "" -f "$KEY" -C "mcp-fleet-tunnel" >/dev/null 2>&1
+  chmod 600 "$KEY" 2>/dev/null || true
 fi
 # ---- 密钥部署检查：测免密通不通，不通就给清晰指引（不在安装器里嵌套交互式密码） ----
 _ssh_base() {
