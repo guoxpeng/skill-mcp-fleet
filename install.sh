@@ -1796,6 +1796,13 @@ PIDF="$DIR/tunnel.pid"
 PROTOF="$DIR/.tunnel_proto"
 PY="$(command -v python3 || echo /usr/bin/python3)"
 CREATED="0"
+# 下载兜底：curl 坏了就用 python urllib
+tunnel_dl() {
+  if command -v curl >/dev/null 2>&1 && curl --version >/dev/null 2>&1; then
+    curl -fsSL --connect-timeout 12 -o "$2" "$1" && return 0
+  fi
+  "$PY" -c "import urllib.request,sys; urllib.request.urlretrieve(sys.argv[1], sys.argv[2])" "$1" "$2" 2>/dev/null
+}
 # 上次自动降级过就记住，省掉每次 12 秒的探测等待
 if [ -z "${CF_PROTO:-}" ] && [ -f "$PROTOF" ]; then
   CF_PROTO="$(cat "$PROTOF" 2>/dev/null || true)"
@@ -1858,7 +1865,7 @@ if [ ! -x "$BIN" ]; then
     "https://github.com/cloudflare/cloudflared/releases/latest/download/$CF" \
     "https://ghfast.top/https://github.com/cloudflare/cloudflared/releases/latest/download/$CF" \
     "https://ghproxy.net/https://github.com/cloudflare/cloudflared/releases/latest/download/$CF" ; do
-    if dl "$M" "$BIN"; then
+    if tunnel_dl "$M" "$BIN"; then
       # 校验 1：必须是 ELF（镜像/网关出错时经常返回一个 HTML 错误页）
       if ! "$PY" -c "import sys;sys.exit(0 if open(sys.argv[1],'rb').read(4)==b'\x7fELF' else 1)" "$BIN" 2>/dev/null; then
         echo "[!] 下载物不是 ELF 可执行文件，丢弃该通道"
