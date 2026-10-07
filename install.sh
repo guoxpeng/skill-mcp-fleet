@@ -2303,38 +2303,39 @@ if [ ! -f "$KEY" ]; then
   ssh-keygen -t ed25519 -N "" -f "$KEY" -C "mcp-fleet-tunnel" >/dev/null 2>&1 || \
     ssh-keygen -t rsa -b 3072 -N "" -f "$KEY" -C "mcp-fleet-tunnel" >/dev/null 2>&1
 fi
-# ---- 密钥自动部署：先测免密通不通，不通就 ssh-copy-id（输一次 VPS 密码） ----
-_ssh_base() {  # _ssh_base <extra-opts...> -- <remote-cmd>
+# ---- 密钥部署检查：测免密通不通，不通就给清晰指引（不在安装器里嵌套交互式密码） ----
+_ssh_base() {
   ssh -o BatchMode=yes -o ConnectTimeout=8 -o StrictHostKeyChecking=accept-new \
       -i "$KEY" -p "$SSH_PORT" "$@"
 }
 if ! _ssh_base "$SSH_DEST" true 2>/dev/null; then
-  echo "[+] 密钥尚未部署到 VPS，尝试自动追加（需要输一次 VPS 密码）…"
-  if command -v ssh-copy-id >/dev/null 2>&1; then
-    ssh-copy-id -i "${KEY}.pub" -p "$SSH_PORT" "$SSH_DEST" < /dev/tty 2>&1 | tail -2 || true
-  else
-    # 没有 ssh-copy-id 就手工拼（兼容 Termux）
-    _pub="$(cat "${KEY}.pub" 2>/dev/null || echo)"
-    if [ -n "$_pub" ]; then
-      echo "[i] 正在用密码方式把公钥写入 VPS（输一次密码）…"
-      ssh -o StrictHostKeyChecking=accept-new -p "$SSH_PORT" "$SSH_DEST" \
-        "mkdir -p ~/.ssh && chmod 700 ~/.ssh && grep -qxF '$_pub' ~/.ssh/authorized_keys 2>/dev/null || echo '$_pub' >> ~/.ssh/authorized_keys && chmod 600 ~/.ssh/authorized_keys && echo KEY_OK" < /dev/tty 2>&1 | tail -2 || true
-    fi
-  fi
-  if _ssh_base "$SSH_DEST" true 2>/dev/null; then
-    echo "[+] 免密登录已打通"
-  else
-    echo "[!] 免密仍未打通。请手工把下面这行加到 VPS 的 ~/.ssh/authorized_keys 后再跑：bash $DIR/mcp-tunnel.sh"
-    echo
-    cat "${KEY}.pub" 2>/dev/null || true
-    echo
-  fi
+  echo ""
+  echo "============================================================"
+  echo " 还差一步：把公钥部署到 VPS（只需做一次）"
+  echo "------------------------------------------------------------"
+  echo " 在**本机终端**直接跑下面这行，按提示输一次 VPS 密码："
+  echo ""
+  echo "   ssh-copy-id -i ${KEY}.pub -p $SSH_PORT $SSH_DEST"
+  echo ""
+  echo " （Termux 若无 ssh-copy-id，用这行代替，直接输密码）"
+  echo "   cat ${KEY}.pub | ssh -p $SSH_PORT $SSH_DEST \\"
+  echo "     'mkdir -p ~/.ssh && cat >> ~/.ssh/authorized_keys && chmod 600 ~/.ssh/authorized_keys'"
+  echo ""
+  echo " 搞定后跑下面这行启动隧道："
+  echo ""
+  echo "   bash $DIR/mcp-tunnel.sh"
+  echo "============================================================"
+  echo ""
 else
   echo "[+] 密钥已部署，免密登录正常"
 fi
 
 # ---- 启动反向隧道 ----
 touch "$DIR/.want_tunnel" 2>/dev/null || true
+# 密钥没打通就先不硬起隧道，等用户部署完密钥后跑 mcp-tunnel.sh
+if ! _ssh_base "$SSH_DEST" true 2>/dev/null; then
+  echo "[i] 跳过隧道启动（等密钥部署好后跑 bash $DIR/mcp-tunnel.sh 即可）"
+else
 if [ -f "$PIDF" ] && kill -0 "$(cat "$PIDF" 2>/dev/null)" 2>/dev/null; then
   echo "[i] ssh 隧道已在运行（pid $(cat "$PIDF")），复用。"
 else
@@ -2354,6 +2355,8 @@ else
 fi
 
 URL="http://${SSH_HOST}:${SSH_REMOTE_PORT}"
+# 只有隧道真正启动了才落盘地址；密钥没打通时不写，免得主端 sync 到死地址
+if _ssh_base "$SSH_DEST" true 2>/dev/null; then
 printf '%s' "$URL" > "$DIR/.tunnel_url" 2>/dev/null || true
 printf '%s' "$URL" > "$DIR/current_url.txt" 2>/dev/null || true
 "$PY" - "$DIR/mcp_agent_config.json" "$URL" <<'URL_PY_EOF' 2>/dev/null || true
@@ -2365,6 +2368,8 @@ d["tunnel_url"] = url
 with open(p, "w", encoding="utf-8") as f:
     json.dump(d, f, ensure_ascii=False, indent=2)
 URL_PY_EOF
+fi
+fi
 
 # ---- 自检 ----
 HTTP_CODE=""
