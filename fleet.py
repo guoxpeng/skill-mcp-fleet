@@ -198,14 +198,26 @@ class MCPClient:
         return text, bool(res.get("isError"))
 
 
-def http_probe(base_url, timeout=8, token=""):
-    """GET 副端根路径，拿 {status, server, version, tools, ...}。"""
+def http_probe(base_url, timeout=8, token="", retries=3):
+    """GET 副端根路径，拿 {status, server, version, tools, ...}。
+
+    隧道刚起来 / 网络抖动时首次请求可能超时，默认重试 3 次（指数退避
+    1s / 2s / 4s），都失败才抛异常。retries=0 可关闭重试。
+    """
     base = base_url[:-4] if base_url.endswith("/mcp") else base_url.rstrip("/")
     req = urllib.request.Request(base + "/", headers={"Accept": "application/json"})
     if token:
         req.add_header("Authorization", "Bearer " + token)
-    with urllib.request.urlopen(req, timeout=timeout) as r:
-        return json.loads(r.read().decode("utf-8", "ignore") or "{}")
+    last_err = None
+    for attempt in range(max(1, retries + 1)):
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as r:
+                return json.loads(r.read().decode("utf-8", "ignore") or "{}")
+        except Exception as e:
+            last_err = e
+            if attempt < retries:
+                time.sleep(2 ** attempt)  # 1s, 2s, 4s ...
+    raise last_err
 
 
 def normalize_url(host_or_url, port=3100):
@@ -841,6 +853,73 @@ def cmd_call(a):
     return 1 if iserr else 0
 
 
+def _mcp_client(a):
+    url, meta = resolve_target(a.target, a.agent, a.port)
+    c = MCPClient(url, max(a.timeout, 120), token=meta.get("token", ""))
+    c.handshake()
+    return c
+
+
+def cmd_exec_async(a):
+    c = _mcp_client(a)
+    cmd = " ".join(a.command).strip()
+    if not cmd:
+        return die("命令为空")
+    args = {"command": cmd}
+    if a.sudo:
+        args["sudo"] = True
+    if a.workdir:
+        args["workDir"] = a.workdir
+    try:
+        text, iserr = c.call("exec_async", args, timeout=max(a.timeout, 30))
+    except MCPError as e:
+        return die("调用失败：%s" % e)
+    sys.stdout.write(text if text.endswith("\n") else text + "\n")
+    return 1 if iserr else 0
+
+
+def cmd_exec_poll(a):
+    c = _mcp_client(a)
+    args = {"job_id": a.job_id, "offset": a.offset}
+    try:
+        text, iserr = c.call("exec_poll", args, timeout=max(a.timeout, 30))
+    except MCPError as e:
+        return die("调用失败：%s" % e)
+    sys.stdout.write(text if text.endswith("\n") else text + "\n")
+    return 1 if iserr else 0
+
+
+def cmd_exec_result(a):
+    c = _mcp_client(a)
+    args = {"job_id": a.job_id, "timeoutMs": int(a.wait * 1000)}
+    try:
+        text, iserr = c.call("exec_result", args, timeout=max(a.timeout, int(a.wait) + 30))
+    except MCPError as e:
+        return die("调用失败：%s" % e)
+    sys.stdout.write(text if text.endswith("\n") else text + "\n")
+    return 1 if iserr else 0
+
+
+def cmd_exec_kill(a):
+    c = _mcp_client(a)
+    try:
+        text, iserr = c.call("exec_kill", {"job_id": a.job_id}, timeout=max(a.timeout, 30))
+    except MCPError as e:
+        return die("调用失败：%s" % e)
+    sys.stdout.write(text if text.endswith("\n") else text + "\n")
+    return 1 if iserr else 0
+
+
+def cmd_exec_jobs(a):
+    c = _mcp_client(a)
+    try:
+        text, iserr = c.call("exec_jobs", {}, timeout=max(a.timeout, 30))
+    except MCPError as e:
+        return die("调用失败：%s" % e)
+    sys.stdout.write(text if text.endswith("\n") else text + "\n")
+    return 1 if iserr else 0
+
+
 def cmd_health(a):
     nodes = discover_nodes(a.agent)
     if not nodes:
@@ -1431,6 +1510,29 @@ def build_parser():
     sp.add_argument("--arg", action="append", metavar="k=v",
                     help="参数简写，可重复，值按 JSON 解析")
     sp.set_defaults(func=cmd_call)
+
+    sp = common(sub.add_parser("exec-async", help="后台启动命令，立即返回 job_id"))
+    sp.add_argument("command", nargs=argparse.REMAINDER, help="要执行的命令")
+    sp.add_argument("--sudo", action="store_true", help="用 sudo 执行")
+    sp.add_argument("--workdir", help="工作目录")
+    sp.set_defaults(func=cmd_exec_async)
+
+    sp = common(sub.add_parser("exec-poll", help="取后台任务的增量输出"))
+    sp.add_argument("job_id", help="exec-async 返回的 job_id")
+    sp.add_argument("--offset", type=int, default=0, help="从第几个字节开始取（默认 0）")
+    sp.set_defaults(func=cmd_exec_poll)
+
+    sp = common(sub.add_parser("exec-result", help="等待后台任务完成并取全量输出"))
+    sp.add_argument("job_id", help="exec-async 返回的 job_id")
+    sp.add_argument("--wait", type=int, default=120, help="最长等待秒数（默认 120）")
+    sp.set_defaults(func=cmd_exec_result)
+
+    sp = common(sub.add_parser("exec-kill", help="终止一个后台任务"))
+    sp.add_argument("job_id", help="exec-async 返回的 job_id")
+    sp.set_defaults(func=cmd_exec_kill)
+
+    sp = common(sub.add_parser("exec-jobs", help="列出副端所有后台任务"))
+    sp.set_defaults(func=cmd_exec_jobs)
 
     sp = sub.add_parser("health", help="批量体检所有副端")
     sp.add_argument("--agent", default="auto")

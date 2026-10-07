@@ -19,6 +19,7 @@
 | 工具 | 作用 |
 |---|---|
 | `exec` | 执行 shell 命令，`sudo:true` 可提权 |
+| `exec_async` / `exec_poll` / `exec_result` / `exec_kill` / `exec_jobs` | 后台任务：启动→取增量输出→等待完成→终止→列表（长任务不阻塞，v3.2+） |
 | `read` / `write` / `edit` | 读文件（可按行）、写/追加、文本块替换 |
 | `list_dir` | 列目录 |
 | `docker_ps` / `docker_logs` / `docker_restart` | 容器列表 / 日志 / 重启 |
@@ -159,13 +160,18 @@ bash /opt/<name>_mcp/mcp-tunnel.sh
 python fleet.py add --name fnos --ip 192.168.1.11 --port 3100          # 内网
 python fleet.py add --name cloud --url https://xxx.trycloudflare.com/mcp --token <令牌>   # 公网隧道
 python fleet.py list                    # 列已注册副端
-python fleet.py probe fnos              # 握手 + 列工具 + 真调一次 exec
+python fleet.py probe fnos              # 握手 + 列工具 + 真调一次 exec（探活失败自动重试 3 次）
 python fleet.py health                  # 全部节点健康总览
 python fleet.py exec fnos "uptime"      # 在副端执行命令
+python fleet.py exec-async fnos "apt upgrade -y"   # 后台启动，立即返回 job_id
+python fleet.py exec-poll fnos <job_id>             # 取增量输出（--offset 续取）
+python fleet.py exec-result fnos <job_id> --wait 120 # 等待完成取全量输出
+python fleet.py exec-kill fnos <job_id>              # 终止后台任务
+python fleet.py exec-jobs fnos                       # 列后台任务
 python fleet.py sync                    # 按地址目录刷新（隧道换域名后自动跟随）
 ```
 
-`python fleet.py --help` 看全部 15 个子命令。
+`python fleet.py --help` 看全部子命令。
 
 ### 或者用 `add_fleet_node.py`（只负责写 mcp.json）
 

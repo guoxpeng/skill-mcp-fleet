@@ -238,7 +238,7 @@ for _stream in (sys.stdout, sys.stderr):
 DEFAULT_CONFIG = {
     "name": "node",             # 副端标识（显示在状态页与 serverInfo）
     "tool_prefix": "",          # 工具名前缀，如 "nas_"；留空则用裸名（exec/read/...）
-    "version": "3.1.0",
+    "version": "3.2.0",
     "sudo_password": "",        # 留空且非 root 时会尝试免密 sudo
     "work_dir": "/",            # 默认工作目录
     "command_timeout": 120,     # 秒
@@ -493,6 +493,174 @@ def fmt_result(code, out, err):
 
 
 # ---------------------------------------------------------------------------
+# 异步命令（v3.2）：exec_async 启动后台任务，exec_poll 取增量输出，
+# exec_result 等待完成，exec_kill 终止。主端不用吊死在长任务上。
+# ---------------------------------------------------------------------------
+JOBS = {}
+JOBS_LOCK = threading.Lock()
+JOB_BUF_MAX = 1048576      # 单任务输出上限 1MB，超了丢弃最老内容
+JOB_TTL = 3600             # 已完成任务保留 1 小时
+
+
+def _job_sweep():
+    now = time.time()
+    with JOBS_LOCK:
+        for jid in [k for k, j in JOBS.items()
+                    if j.get("end") and now - j["end"] > JOB_TTL]:
+            JOBS.pop(jid, None)
+
+
+def _job_reader(job):
+    """后台线程：持续读子进程输出，结束时记录 exit code。
+
+    用非阻塞读 + 短轮询，保证输出增量可见（read(65536) 在管道上会
+    一直阻塞到攒够 64KB 或 EOF，不适合做增量）。
+    """
+    import os as _os
+    fd = job["proc"].stdout.fileno()
+    try:
+        _os.set_blocking(fd, False)
+    except Exception:
+        pass
+    try:
+        while True:
+            try:
+                chunk = job["proc"].stdout.read(65536)
+            except (BlockingIOError, InterruptedError):
+                chunk = None
+            except Exception:
+                chunk = b""
+            if chunk:
+                with job["lock"]:
+                    job["buf"] += chunk
+                    if len(job["buf"]) > JOB_BUF_MAX:
+                        job["buf"] = job["buf"][-JOB_BUF_MAX:]
+                        job["dropped"] = True
+                continue
+            if chunk == b"" or job["proc"].poll() is not None:
+                # EOF 或进程已结束：把剩余的一次读完
+                try:
+                    rest = job["proc"].stdout.read()
+                    if rest:
+                        with job["lock"]:
+                            job["buf"] += rest
+                except Exception:
+                    pass
+                break
+            time.sleep(0.05)
+    except Exception:
+        pass
+    finally:
+        try:
+            job["proc"].wait()
+        except Exception:
+            pass
+        with job["lock"]:
+            job["exit"] = job["proc"].returncode
+            job["end"] = time.time()
+
+
+def t_exec_async(a):
+    _job_sweep()
+    cmd = a.get("command", "")
+    full = _wrap(cmd, sudo=bool(a.get("sudo")))
+    wd = a.get("workDir") or CFG.get("work_dir") or "/"
+    try:
+        proc = subprocess.Popen(
+            ["bash", "-c", full],
+            cwd=wd if os.path.isdir(wd) else None,
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    except FileNotFoundError:
+        return "错误: 找不到 bash", True
+    except Exception as e:
+        return "错误: 启动失败 %r" % (e,), True
+    jid = uuid.uuid4().hex[:12]
+    job = {"id": jid, "proc": proc, "buf": bytearray(), "lock": threading.Lock(),
+           "start": time.time(), "end": None, "exit": None, "dropped": False,
+           "cmd": cmd[:120]}
+    with JOBS_LOCK:
+        JOBS[jid] = job
+    th = threading.Thread(target=_job_reader, args=(job,), daemon=True)
+    th.start()
+    return ("job_id=%s\n用 exec_poll %s 取输出，exec_result %s 等待完成，exec_kill %s 终止。"
+            % (jid, jid, jid, jid)), False
+
+
+def _job_get(jid):
+    with JOBS_LOCK:
+        job = JOBS.get(jid)
+    if not job:
+        return None
+    return job
+
+
+def t_exec_poll(a):
+    job = _job_get(a.get("job_id", ""))
+    if not job:
+        return "未知 job_id（可能已过期清理）", True
+    try:
+        offset = max(0, int(a.get("offset", 0)))
+    except (TypeError, ValueError):
+        offset = 0
+    with job["lock"]:
+        data = bytes(job["buf"])
+        running = job["exit"] is None
+        exit_code = job["exit"]
+        dropped = job["dropped"]
+    text = data[offset:].decode("utf-8", "ignore")
+    head = "[job %s] %s" % (job["id"], "运行中" if running else "已结束 exit=%s" % exit_code)
+    if dropped and offset == 0:
+        head += "（早期输出因超 1MB 被丢弃）"
+    return "%s\n--- offset %d -> %d ---\n%s" % (head, offset, len(data), text), False
+
+
+def t_exec_result(a):
+    job = _job_get(a.get("job_id", ""))
+    if not job:
+        return "未知 job_id（可能已过期清理）", True
+    try:
+        timeout = float(a.get("timeoutMs", 120000)) / 1000.0
+    except (TypeError, ValueError):
+        timeout = 120.0
+    try:
+        job["proc"].wait(timeout=max(0.1, timeout))
+    except subprocess.TimeoutExpired:
+        pass
+    # 复用 poll 逻辑返回全量输出
+    return t_exec_poll({"job_id": job["id"], "offset": 0})
+
+
+def t_exec_kill(a):
+    job = _job_get(a.get("job_id", ""))
+    if not job:
+        return "未知 job_id（可能已过期清理）", True
+    try:
+        job["proc"].terminate()
+        try:
+            job["proc"].wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            job["proc"].kill()
+        return "[job %s] 已终止" % job["id"], False
+    except Exception as e:
+        return "终止失败: %r" % (e,), True
+
+
+def t_exec_jobs(a):
+    _job_sweep()
+    with JOBS_LOCK:
+        jobs = list(JOBS.values())
+    if not jobs:
+        return "当前无后台任务", False
+    lines = []
+    for j in sorted(jobs, key=lambda x: x["start"]):
+        with j["lock"]:
+            st = "运行中" if j["exit"] is None else "已结束 exit=%s" % j["exit"]
+            sz = len(j["buf"])
+        lines.append("%s  %s  %d字节  %s" % (j["id"], st, sz, j["cmd"]))
+    return "\n".join(lines), False
+
+
+# ---------------------------------------------------------------------------
 # 工具实现
 # ---------------------------------------------------------------------------
 def t_exec(a):
@@ -686,6 +854,25 @@ BASE_TOOLS = [
     ("http_get", "在设备本机发起 HTTP GET（用于测本机服务，如 http://127.0.0.1:8000/v1/models）。",
      {"type": "object", "properties": {"url": {"type": "string"}, "timeout": {"type": "number"}},
       "required": ["url"]}),
+    ("exec_async", "后台启动一个 shell 命令，立即返回 job_id（长任务不阻塞）。",
+     {"type": "object", "properties": {
+         "command": {"type": "string", "description": "要执行的命令"},
+         "sudo": {"type": "boolean", "description": "是否用 sudo 执行"},
+         "workDir": {"type": "string"}}, "required": ["command"]}),
+    ("exec_poll", "取后台任务的增量输出（offset=上次返回的字节数）。",
+     {"type": "object", "properties": {
+         "job_id": {"type": "string"},
+         "offset": {"type": "number", "description": "从第几个字节开始取，默认 0"}},
+      "required": ["job_id"]}),
+    ("exec_result", "等待后台任务完成（最多 timeoutMs），返回全量输出。",
+     {"type": "object", "properties": {
+         "job_id": {"type": "string"},
+         "timeoutMs": {"type": "number", "description": "最长等待毫秒，默认 120000"}},
+      "required": ["job_id"]}),
+    ("exec_kill", "终止一个后台任务。",
+     {"type": "object", "properties": {"job_id": {"type": "string"}}, "required": ["job_id"]}),
+    ("exec_jobs", "列出当前所有后台任务（job_id / 状态 / 输出大小）。",
+     {"type": "object", "properties": {}}),
 ]
 
 BASE_FUNCS = {
@@ -693,6 +880,9 @@ BASE_FUNCS = {
     "list_dir": t_list_dir, "docker_ps": t_docker_ps, "docker_logs": t_docker_logs,
     "docker_restart": t_docker_restart, "systemctl": t_systemctl,
     "service_logs": t_service_logs, "sysinfo": t_sysinfo, "http_get": t_http_get,
+    "exec_async": t_exec_async, "exec_poll": t_exec_poll,
+    "exec_result": t_exec_result, "exec_kill": t_exec_kill,
+    "exec_jobs": t_exec_jobs,
 }
 
 # 对外暴露的工具（含前缀）
