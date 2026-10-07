@@ -81,6 +81,9 @@ TEMPLATE = r'''#!/usr/bin/env bash
 # ============================================================================
 set -euo pipefail
 
+# Termux 的环境变量 $PREFIX 会被下面的 PREFIX=""（工具名前缀参数）清掉，先存下来
+_TERMUX_PREFIX="${PREFIX:-}"
+
 NAME=""
 PORT="3100"
 DIR=""
@@ -191,12 +194,12 @@ fi
 # Termux（Android）：uname -o 返回 Android，或 $PREFIX/bin/pkg 存在
 is_termux() {
   [ "$(uname -o 2>/dev/null || echo '')" = "Android" ] && return 0
-  [ -n "${PREFIX:-}" ] && [ -x "$PREFIX/bin/pkg" ] && return 0
+  [ -n "${_TERMUX_PREFIX:-}" ] && [ -x "$_TERMUX_PREFIX/bin/pkg" ] && return 0
   return 1
 }
 if is_termux; then
   echo "[+] 检测到 Termux（Android），启用手机模式"
-  if [ -z "$DIR" ]; then DIR="$PREFIX/opt/${NAME}_mcp"; fi   # Termux 写不了 /opt
+  if [ -z "$DIR" ]; then DIR="${_TERMUX_PREFIX:-/data/data/com.termux/files/usr}/opt/${NAME}_mcp"; fi   # Termux 写不了 /opt
   # 手机上 systemd 不存在，强制 nohup 模式
   if [ "$MODE" = "auto" ]; then MODE="nohup"; fi
 else
