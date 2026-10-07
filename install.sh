@@ -2353,6 +2353,7 @@ fi
 # ---- 启动反向隧道 ----
 touch "$DIR/.want_tunnel" 2>/dev/null || true
 # 密钥没打通就先不硬起隧道，等用户部署完密钥后跑 mcp-tunnel.sh
+URL=""
 if ! _ssh_base "$SSH_DEST" true 2>/dev/null; then
   echo "[i] 跳过隧道启动（等密钥部署好后跑 bash $DIR/mcp-tunnel.sh 即可）"
 else
@@ -2391,7 +2392,10 @@ URL_PY_EOF
 fi
 fi
 
-# ---- 自检 ----
+# ---- 自检（隧道没起来就跳过） ----
+if [ -z "$URL" ]; then
+  echo "[i] 隧道未启动，自检跳过。密钥部署好后跑 bash $DIR/mcp-tunnel.sh"
+else
 HTTP_CODE=""
 if [ -n "$TOKEN" ]; then
   HTTP_CODE="$(curl -s -m 15 -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $TOKEN" "$URL/" 2>/dev/null || true)"
@@ -2425,6 +2429,7 @@ fi
 echo "   }"
 echo "============================================================"
 echo " 停止隧道：kill \$(cat "$PIDF")      日志：$LOG"
+fi
 TUN_SSH_EOF
 
 # ============================================================================
