@@ -39,6 +39,7 @@ import os
 import re
 import hmac
 import ipaddress
+import locale
 import shlex
 import subprocess
 import sys
@@ -270,6 +271,30 @@ def _which(cmd):
 # ---------------------------------------------------------------------------
 # 命令执行
 # ---------------------------------------------------------------------------
+def _is_windows():
+    return os.name == "nt"
+
+
+def _decode_output(b):
+    """解码子进程字节输出：先试 UTF-8，失败再试系统编码。
+
+    中文 Windows 上 cmd 默认输出 GBK，直接 decode("utf-8", "ignore")
+    会把中文吞成乱码。这里按 utf-8 -> 系统编码 -> utf-8(ignore) 顺序试。
+    """
+    if isinstance(b, str):
+        return b
+    b = bytes(b or b"")
+    try:
+        return b.decode("utf-8")
+    except UnicodeDecodeError:
+        pass
+    try:
+        enc = locale.getpreferredencoding(False) or "gbk"
+        return b.decode(enc)
+    except Exception:
+        return b.decode("utf-8", "ignore")
+
+
 def _wrap(cmd, sudo=False):
     """把命令包成最终交给 bash 执行的字符串。全部用字符串拼接，避免 % 吃掉花括号。"""
     flag = "-lc" if CFG.get("login_shell", True) else "-c"
@@ -285,24 +310,29 @@ def _wrap(cmd, sudo=False):
 
 def run_local(command, sudo=False, timeout=None, work_dir=None, stdin=None):
     """在设备本机执行命令，返回 (exit_code, stdout, stderr)。"""
-    full = _wrap(command, sudo=sudo)
     t = timeout or CFG.get("command_timeout", 120)
     wd = work_dir or CFG.get("work_dir") or "/"
+    if _is_windows():
+        # Windows 没有 bash（System32 下的 bash.exe 是 WSL 桩，调它只会吐 wsl 帮助），
+        # 直接走 cmd /c；sudo 在 Windows 下无意义，忽略。
+        argv = ["cmd", "/c", command]
+    else:
+        argv = ["bash", "-c", _wrap(command, sudo=sudo)]
     try:
         p = subprocess.run(
-            ["bash", "-c", full],
+            argv,
             cwd=wd if os.path.isdir(wd) else None,
             input=stdin.encode("utf-8") if stdin is not None else None,
             stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             timeout=t,
         )
         return (p.returncode,
-                p.stdout.decode("utf-8", "ignore"),
-                p.stderr.decode("utf-8", "ignore"))
+                _decode_output(p.stdout),
+                _decode_output(p.stderr))
     except subprocess.TimeoutExpired:
         return -1, "", "[超时 %ss 被终止]" % t
     except FileNotFoundError:
-        return -1, "", "[执行失败] 找不到 bash，请确认设备已安装 bash"
+        return -1, "", "[执行失败] 找不到 shell（Windows 需 cmd，POSIX 需 bash）"
     except Exception as e:
         return -1, "", "[执行异常] %r" % (e,)
 
@@ -387,15 +417,18 @@ def _job_reader(job):
 def t_exec_async(a):
     _job_sweep()
     cmd = a.get("command", "")
-    full = _wrap(cmd, sudo=bool(a.get("sudo")))
     wd = a.get("workDir") or CFG.get("work_dir") or "/"
+    if _is_windows():
+        argv = ["cmd", "/c", cmd]
+    else:
+        argv = ["bash", "-c", _wrap(cmd, sudo=bool(a.get("sudo")))]
     try:
         proc = subprocess.Popen(
-            ["bash", "-c", full],
+            argv,
             cwd=wd if os.path.isdir(wd) else None,
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
     except FileNotFoundError:
-        return "错误: 找不到 bash", True
+        return "错误: 找不到 shell（Windows 需 cmd，POSIX 需 bash）", True
     except Exception as e:
         return "错误: 启动失败 %r" % (e,), True
     jid = uuid.uuid4().hex[:12]
@@ -431,7 +464,7 @@ def t_exec_poll(a):
         running = job["exit"] is None
         exit_code = job["exit"]
         dropped = job["dropped"]
-    text = data[offset:].decode("utf-8", "ignore")
+    text = _decode_output(data[offset:])
     head = "[job %s] %s" % (job["id"], "运行中" if running else "已结束 exit=%s" % exit_code)
     if dropped and offset == 0:
         head += "（早期输出因超 1MB 被丢弃）"
@@ -501,6 +534,20 @@ def t_exec(a):
 def t_read(a):
     p = _check_path(a["filePath"])
     start, end = a.get("startLine"), a.get("endLine")
+    if _is_windows():
+        # Windows 无 sed/cat，直接用 Python 读（行号与 sed 一致：1 起始）
+        try:
+            with open(p, encoding="utf-8", errors="replace") as f:
+                lines = f.readlines()
+            if start and end:
+                sel = lines[start - 1:end]
+            elif start:
+                sel = lines[start - 1:]
+            else:
+                sel = lines
+            return "[exit 0]\n" + "".join(sel), False
+        except Exception as e:
+            return "[exit 1]\n[读取失败] %r" % (e,), True
     if start and end:
         cmd = "sed -n '%d,%dp' %s" % (start, end, shlex.quote(p))
     elif start:
@@ -513,6 +560,15 @@ def t_read(a):
 
 def t_write(a):
     p = _check_path(a["filePath"])
+    if _is_windows():
+        # Windows 无 cat 重定向，直接用 Python 写；sudo 忽略
+        try:
+            mode = "a" if a.get("mode", "overwrite") == "append" else "w"
+            with open(p, mode, encoding="utf-8") as f:
+                f.write(a.get("content", ""))
+            return "[exit 0] 写入成功: " + p, False
+        except Exception as e:
+            return "[exit 1]\n[写入失败] %r" % (e,), True
     op = ">>" if a.get("mode", "overwrite") == "append" else ">"
     cmd = "cat " + op + " " + shlex.quote(p)
     code, out, err = run_local(cmd, sudo=bool(a.get("sudo")), stdin=a.get("content", ""))
@@ -523,6 +579,17 @@ def t_write(a):
 
 def t_edit(a):
     p = _check_path(a["filePath"])
+    if _is_windows():
+        # Windows 不支持 heredoc，直接用 Python 做替换
+        try:
+            s = open(p, encoding="utf-8").read()
+        except Exception as e:
+            return "[exit 2]\nREAD_FAIL %r" % (e,), True
+        old, new = a.get("oldText", ""), a.get("newText", "")
+        if old not in s:
+            return "[exit 3]\nNOT_FOUND", True
+        open(p, "w", encoding="utf-8").write(s.replace(old, new, 1))
+        return "[exit 0]\nOK", False
     b_old = base64.b64encode(a.get("oldText", "").encode()).decode()
     b_new = base64.b64encode(a.get("newText", "").encode()).decode()
     script = (
@@ -547,6 +614,19 @@ def t_edit(a):
 
 def t_list_dir(a):
     p = _check_path(a.get("path", "/"))
+    if _is_windows():
+        # Windows 无 ls，直接用 os.scandir
+        try:
+            rows = []
+            for e in os.scandir(p):
+                try:
+                    sz = e.stat(follow_symlinks=False).st_size
+                except OSError:
+                    sz = -1
+                rows.append("%s %12d %s" % ("d" if e.is_dir(follow_symlinks=False) else "-", sz, e.name))
+            return "[exit 0]\n" + "\n".join(sorted(rows)), False
+        except Exception as e:
+            return "[exit 1]\n[列目录失败] %r" % (e,), True
     code, out, err = run_local("ls -la --color=never " + shlex.quote(p))
     return fmt_result(code, out, err), code != 0
 
