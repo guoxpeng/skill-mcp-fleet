@@ -3,6 +3,13 @@
 
 邮箱放在双方都能访问的节点（如十堰 http://100.91.169.103:3100/mcp）。
 
+直连模式（不经第三台服务器）：每个节点的 fleet-agent 自带邮箱。
+  把对方登记为 peer 后，send 会直接投递到对方自己的 fleet-agent，
+  对方在本机 wait/recv（默认连 127.0.0.1）即可收到；回信同理投到你的节点。
+  python3 fleet_chat.py peer add hark http://100.109.181.108:3100/mcp <对方token>
+  python3 fleet_chat.py peer list | peer del hark
+  peers 保存在 ~/.fleet_chat_peers.json（权限 0600）。未登记的收件人仍发往 --url。
+
 用法：
   python3 fleet_chat.py send  --me muse --to hark "消息内容"     # 也可用 - 从 stdin 读
   python3 fleet_chat.py recv  --me muse                          # 取新消息，立即返回
@@ -39,6 +46,25 @@ def _find_token():
             except (OSError, ValueError):
                 pass
     return ""
+
+
+PEERS_PATH = os.path.expanduser("~/.fleet_chat_peers.json")
+
+
+def _peers():
+    try:
+        with open(PEERS_PATH) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {}
+
+
+def _save_peers(d):
+    tmp = PEERS_PATH + ".tmp"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f:
+        json.dump(d, f, indent=1)
+    os.replace(tmp, PEERS_PATH)
 
 
 def _opener(url):
@@ -98,7 +124,7 @@ class Client(object):
 
 def main():
     ap = argparse.ArgumentParser(description="AI 之间通过 fleet 节点邮箱对话")
-    ap.add_argument("cmd", choices=["send", "recv", "wait", "history"])
+    ap.add_argument("cmd", choices=["send", "recv", "wait", "history", "peer"])
     ap.add_argument("text", nargs="*")
     ap.add_argument("--me", default=os.environ.get("FLEET_CHAT_ME", ""))
     ap.add_argument("--to", default="")
@@ -111,7 +137,27 @@ def main():
     if bad:
         ap.error("未知参数: %s" % " ".join(bad))
     a.text = list(a.text) + extra  # 兼容 Python 3.6：选项之后的正文
+    if a.cmd == "peer":
+        d = _peers()
+        sub = a.text[0] if a.text else "list"
+        if sub == "add" and len(a.text) >= 3:
+            d[a.text[1]] = {"url": a.text[2], "token": a.text[3] if len(a.text) > 3 else ""}
+            _save_peers(d)
+            print("已登记 peer %s -> %s" % (a.text[1], a.text[2]))
+        elif sub == "del" and len(a.text) >= 2:
+            d.pop(a.text[1], None)
+            _save_peers(d)
+            print("已删除 peer %s" % a.text[1])
+        else:
+            for k, v in sorted(d.items()):
+                print("%-16s %s" % (k, v.get("url")))
+            if not d:
+                print("（没有 peer）用法: peer add <名字> <url> [token]")
+        return
     c = Client(a.url, a.token)
+    if a.cmd == "send" and a.to in _peers():
+        pe = _peers()[a.to]
+        c = Client(pe["url"], pe.get("token", ""))
 
     if a.cmd == "send":
         text = sys.stdin.read() if a.text in ([], ["-"]) else " ".join(a.text)
