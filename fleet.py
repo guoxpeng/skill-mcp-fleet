@@ -52,6 +52,7 @@ target 写法
   python fleet.py sync cloud
 """
 import argparse
+import io
 import ipaddress
 import json
 import os
@@ -68,16 +69,24 @@ import urllib.request
 
 # ---------------------------------------------------------------- 基础
 
-VERSION = "1.1.0"
+VERSION = "1.1.1"
 REGISTRY = os.path.join(os.path.expanduser("~"), ".mcp-fleet", "nodes.json")
 PROTOCOL = "2024-11-05"
 HERE = os.path.dirname(os.path.abspath(__file__))
 
-try:                                  # Windows 控制台默认 GBK，中文会炸
-    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
-    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
-except Exception:
-    pass
+for _name in ("stdout", "stderr"):    # Windows 控制台默认 GBK / Linux C locale 是 ascii，中文会炸
+    _stream = getattr(sys, _name)
+    if hasattr(_stream, "reconfigure"):
+        try:
+            _stream.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
+    else:                             # Python 3.6 没有 reconfigure
+        try:
+            setattr(sys, _name, io.TextIOWrapper(_stream.buffer, encoding="utf-8",
+                                                 errors="replace", line_buffering=True))
+        except Exception:
+            pass
 
 C_OK, C_ERR, C_WARN, C_DIM, C_OFF = "\033[32m", "\033[31m", "\033[33m", "\033[2m", "\033[0m"
 if os.environ.get("NO_COLOR") or not sys.stdout.isatty():
@@ -109,14 +118,26 @@ def die(msg, code=1):
     return code
 
 
-# ---------------------------------------------------------------- 传输：Tailscale 内网走隧道代理
+# ---------------------------------------------------------------- 传输：按目标地址选代理
+# Tailscale 给节点分配的是 CGNAT 段 100.64.0.0/10（RFC 6598）。Python 的
+# ipaddress.is_private 对它返回 False，于是配了 HTTP(S)_PROXY 的机器会把 tailnet
+# 节点也丢给代理 —— 代理那头根本到不了 100.x，回个 404/502/超时。
+# 规则（v3.4.1）：
+#   1. tailnet 地址（100.64/10、fd7a:115c:a1e0::/48、*.ts.net）：
+#      有「tailnet 隧道代理」（FLEET_TAILNET_PROXY，或托管沙盒的 hatch-egress-proxy:3130）
+#      就走它；没有就直连（忽略 http_proxy）。
+#   2. 其他内网 / 本机地址：直连（忽略 http_proxy）。
+#   3. 公网：照常走系统代理。
+_TAILNET_V4 = ipaddress.ip_network("100.64.0.0/10")
+_TAILNET_V6 = ipaddress.ip_network("fd7a:115c:a1e0::/48")   # Tailscale ULA（is_private 本来就 True，写明意图）
+
 
 def _tailnet_proxy_url():
-    """Tailscale 内网地址要走的隧道代理。
+    """Tailscale 内网地址要走的隧道代理；没有返回 None（= 直连）。
 
-    沙盒直连被运行时网络策略拦截，tailnet 流量必须经托管隧道代理
-    （与 HTTPS_PROXY 同主机、端口 3130）。显式设置 FLEET_TAILNET_PROXY
-    可覆盖；找不到代理时返回 None（保持直连旧行为）。
+    托管沙盒里直连被运行时网络策略拦截，tailnet 流量必须经隧道代理
+    （与 HTTPS_PROXY 同主机、端口 3130）。显式设置 FLEET_TAILNET_PROXY 可覆盖。
+    普通机器上的 HTTP(S)_PROXY（Clash 之类）到不了 tailnet，不会被当成隧道代理。
     """
     explicit = os.environ.get("FLEET_TAILNET_PROXY", "").strip()
     if explicit:
@@ -131,25 +152,61 @@ def _tailnet_proxy_url():
 
 
 def _is_tailnet_host(host):
+    """tailnet IP（100.64/10 或 fd7a:115c:a1e0::/48）？只认 IP，不认主机名。"""
     try:
         ip = ipaddress.ip_address((host or "").strip("[]"))
     except ValueError:
         return False
-    return (ip in ipaddress.ip_network("100.64.0.0/10")
-            or ip in ipaddress.ip_network("fd7a:115c:a1e0::/48"))
+    if ip.version == 4:
+        return ip in _TAILNET_V4
+    return ip in _TAILNET_V6
 
 
-def _urlopen(req, timeout=None):
-    """urlopen 的封装：Tailscale 内网地址自动走隧道代理，其余直连。"""
-    host = urllib.parse.urlparse(req.full_url).hostname or ""
-    proxy = _tailnet_proxy_url() if _is_tailnet_host(host) else None
-    if proxy:
-        opener = urllib.request.build_opener(
-            urllib.request.ProxyHandler({"http": proxy, "https": proxy}))
-        return opener.open(req, timeout=timeout) if timeout is not None else opener.open(req)
-    if timeout is not None:
-        return urllib.request.urlopen(req, timeout=timeout)
-    return urllib.request.urlopen(req)
+def _is_direct_host(host):
+    """内网 / 本机 / tailnet 地址：不走 http_proxy。"""
+    host = (host or "").strip("[]").lower().rstrip(".")
+    if not host:
+        return False
+    if host == "localhost" or host.endswith(".localhost") or host.endswith(".local"):
+        return True
+    if host.endswith(".ts.net"):          # MagicDNS 全名：<机器>.<tailnet>.ts.net
+        return True
+    if _is_tailnet_host(host):
+        return True
+    try:
+        ip = ipaddress.ip_address(host)
+    except ValueError:
+        return False
+    return ip.is_private or ip.is_loopback or ip.is_link_local
+
+
+_DIRECT_OPENER = None
+_DEFAULT_OPENER = None
+_TUNNEL_OPENERS = {}
+
+
+def _opener_for(url):
+    """按目标地址选 opener（规则见上）。所有 HTTP 请求都经这里，不要裸调 urlopen。"""
+    global _DIRECT_OPENER, _DEFAULT_OPENER
+    try:
+        host = (urllib.parse.urlsplit(url).hostname or "").lower().rstrip(".")
+    except ValueError:
+        host = ""
+    if _is_tailnet_host(host) or host.endswith(".ts.net"):
+        proxy = _tailnet_proxy_url()
+        if proxy:
+            op = _TUNNEL_OPENERS.get(proxy)
+            if op is None:
+                op = _TUNNEL_OPENERS[proxy] = urllib.request.build_opener(
+                    urllib.request.ProxyHandler({"http": proxy, "https": proxy}))
+            return op
+    if _is_direct_host(host):
+        if _DIRECT_OPENER is None:
+            _DIRECT_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        return _DIRECT_OPENER
+    if _DEFAULT_OPENER is None:
+        _DEFAULT_OPENER = urllib.request.build_opener()
+    return _DEFAULT_OPENER
 
 
 # ---------------------------------------------------------------- MCP 客户端
@@ -187,7 +244,7 @@ class MCPClient:
             if self.sid:
                 req.add_header("Mcp-Session-Id", self.sid)
             try:
-                with _urlopen(req, timeout=timeout or self.timeout) as r:
+                with _opener_for(req.full_url).open(req, timeout=timeout or self.timeout) as r:
                     if r.headers.get("Mcp-Session-Id"):
                         self.sid = r.headers["Mcp-Session-Id"]
                     return r.read().decode("utf-8", "ignore")
@@ -280,7 +337,7 @@ def http_probe(base_url, timeout=8, token="", retries=3):
     last_err = None
     for attempt in range(max(1, retries + 1)):
         try:
-            with _urlopen(req, timeout=timeout) as r:
+            with _opener_for(req.full_url).open(req, timeout=timeout) as r:
                 return json.loads(r.read().decode("utf-8", "ignore") or "{}")
         except Exception as e:
             last_err = e
@@ -369,7 +426,7 @@ def probe_anonymous(url, timeout=6):
         req = urllib.request.Request(
             url, method="POST", data=json.dumps(payload).encode("utf-8"),
             headers={"Content-Type": "application/json", "Accept": "application/json"})
-        with _urlopen(req, timeout=timeout) as r:
+        with _opener_for(req.full_url).open(req, timeout=timeout) as r:
             body = r.read(8192).decode("utf-8", "ignore")
         return ("jsonrpc" in body) or ("serverInfo" in body)
     except urllib.error.HTTPError as e:
@@ -556,7 +613,7 @@ def fetch_directory(url=None, token=None, timeout=6):
     req = urllib.request.Request(url + "/nodes", method="GET")
     if token:
         req.add_header("X-Fleet-Token", token)
-    with _urlopen(req, timeout=timeout) as r:
+    with _opener_for(req.full_url).open(req, timeout=timeout) as r:
         data = json.loads(r.read().decode("utf-8", "ignore") or "{}")
     return data.get("nodes") or {}
 
@@ -666,7 +723,7 @@ def tailscale_device_ips(timeout=10):
     req = urllib.request.Request(
         "https://api.tailscale.com/api/v2/tailnet/-/devices?fields=all",
         headers={"Authorization": "Bearer " + key})
-    with _urlopen(req, timeout=timeout) as r:
+    with _opener_for(req.full_url).open(req, timeout=timeout) as r:
         devs = json.loads(r.read().decode("utf-8", "ignore") or "{}").get("devices") or []
     out = {}
     for dv in devs:
@@ -1348,7 +1405,7 @@ def cmd_bootstrap(a):
     print("== bootstrap %s ==" % dest)
     try:
         r = subprocess.run(ssh_base + ["echo SSH_OK; id -u; uname -srm"],
-                           capture_output=True, text=True, timeout=a.timeout + 20)
+                           stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True, timeout=a.timeout + 20)
     except subprocess.TimeoutExpired:
         return die("SSH 连接超时")
     if r.returncode != 0:
@@ -1359,7 +1416,7 @@ def cmd_bootstrap(a):
     if use_local:
         print("[.] 上传本地 install.sh（离线，不依赖副设备外网）…")
         r = subprocess.run(scp_base + [local, "%s:%s" % (dest, tmp)],
-                           capture_output=True, text=True, timeout=a.timeout + 60)
+                           stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True, timeout=a.timeout + 60)
         if r.returncode != 0:
             return die("上传失败：%s" % r.stderr.strip()[:300])
         remote = "sudo bash %s %s" % (tmp, opts)
@@ -1376,7 +1433,7 @@ def cmd_bootstrap(a):
         return 0
 
     print("[.] 远程安装中（可能要 1-2 分钟）…")
-    r = subprocess.run(ssh_base + [remote], capture_output=True, text=True, timeout=a.timeout + 300)
+    r = subprocess.run(ssh_base + [remote], stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True, timeout=a.timeout + 300)
     out = (r.stdout or "") + (r.stderr or "")
     tail = [l for l in out.splitlines() if l.strip()][-18:]
     for l in tail:

@@ -21,6 +21,22 @@ import sys
 import urllib.error
 import urllib.request
 
+
+def _open(req, timeout):
+    """内网/本机/tailnet(100.64.0.0/10、*.ts.net) 地址绕过 http_proxy 直连。"""
+    import ipaddress
+    import urllib.parse
+    host = (urllib.parse.urlsplit(req.full_url).hostname or "").lower().rstrip(".")
+    direct = host == "localhost" or host.endswith((".local", ".ts.net"))
+    try:
+        ip = ipaddress.ip_address(host)
+        direct = direct or ip in ipaddress.ip_network("100.64.0.0/10") or \
+            ip.is_private or ip.is_loopback or ip.is_link_local
+    except ValueError:
+        pass
+    handlers = [urllib.request.ProxyHandler({})] if direct else []
+    return urllib.request.build_opener(*handlers).open(req, timeout=timeout)
+
 DEFAULT_MCP = os.path.join(os.path.expanduser("~"), ".workbuddy", "mcp.json")
 
 _HDR = {"Content-Type": "application/json",
@@ -34,7 +50,7 @@ def http_json(url, payload=None, timeout=10, session=None):
         hdr["Mcp-Session-Id"] = session["id"]
     req = urllib.request.Request(url, data=data, headers=hdr,
                                  method="POST" if data else "GET")
-    with urllib.request.urlopen(req, timeout=timeout) as r:
+    with _open(req, timeout=timeout) as r:
         if session is not None and r.headers.get("Mcp-Session-Id"):
             session["id"] = r.headers["Mcp-Session-Id"]
         body = r.read().decode("utf-8", "ignore")

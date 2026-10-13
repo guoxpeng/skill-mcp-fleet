@@ -53,22 +53,38 @@ trycloudflare 就给一个新域名。主端 mcp.json 里写死的地址立刻�
 
 import argparse
 import hmac
+import io
 import json
 import os
 import re
 import sys
 import threading
 import time
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from http.server import BaseHTTPRequestHandler, HTTPServer
+try:
+    from http.server import ThreadingHTTPServer  # novermin（3.7+，下面有 3.6 兜底）
+except ImportError:  # Python 3.6（如 CentOS 7 自带 3.6.8）没有 ThreadingHTTPServer，自己拼一个
+    from socketserver import ThreadingMixIn
+
+    class ThreadingHTTPServer(ThreadingMixIn, HTTPServer):
+        daemon_threads = True
 from urllib.parse import urlparse, parse_qs
 
-try:
-    sys.stdout.reconfigure(line_buffering=True)
-    sys.stderr.reconfigure(line_buffering=True)
-except Exception:
-    pass
+for _name in ("stdout", "stderr"):
+    _stream = getattr(sys, _name)
+    if hasattr(_stream, "reconfigure"):
+        try:
+            _stream.reconfigure(line_buffering=True)
+        except Exception:
+            pass
+    else:  # Python 3.6：无 reconfigure，C locale 下是 ascii，中文会炸
+        try:
+            setattr(sys, _name, io.TextIOWrapper(_stream.buffer, encoding="utf-8",
+                                                 errors="replace", line_buffering=True))
+        except Exception:
+            pass
 
-VERSION = "1.1.0"
+VERSION = "1.1.1"
 HOME_DIR = os.path.join(os.path.expanduser("~"), ".mcp-fleet")
 STORE = os.path.join(HOME_DIR, "directory.json")
 

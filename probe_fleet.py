@@ -4,6 +4,22 @@ import json
 import sys
 import urllib.request
 
+
+def _open(req, timeout):
+    """内网/本机/tailnet(100.64.0.0/10、*.ts.net) 地址绕过 http_proxy 直连。"""
+    import ipaddress
+    import urllib.parse
+    host = (urllib.parse.urlsplit(req.full_url).hostname or "").lower().rstrip(".")
+    direct = host == "localhost" or host.endswith((".local", ".ts.net"))
+    try:
+        ip = ipaddress.ip_address(host)
+        direct = direct or ip in ipaddress.ip_network("100.64.0.0/10") or \
+            ip.is_private or ip.is_loopback or ip.is_link_local
+    except ValueError:
+        pass
+    handlers = [urllib.request.ProxyHandler({})] if direct else []
+    return urllib.request.build_opener(*handlers).open(req, timeout=timeout)
+
 URL = sys.argv[1] if len(sys.argv) > 1 else "http://192.168.1.10:3199/mcp"
 HDR = {"Content-Type": "application/json",
        "Accept": "application/json, text/event-stream"}
@@ -15,7 +31,7 @@ def post(payload):
                                  headers=HDR, method="POST")
     if SID["v"]:
         req.add_header("Mcp-Session-Id", SID["v"])
-    with urllib.request.urlopen(req, timeout=25) as r:
+    with _open(req, timeout=25) as r:
         if r.headers.get("Mcp-Session-Id"):
             SID["v"] = r.headers["Mcp-Session-Id"]
         body = r.read().decode("utf-8", "ignore")

@@ -47,6 +47,7 @@ import hashlib
 import os
 import sys
 import gzip
+import io
 import zlib
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -202,7 +203,14 @@ rm -f "$FLEET_TMP/mcp-install.b64"
 
 def _paste_payload(raw):
     """gzip(mtime=0) 保证同一份 install.sh 每次生成的结果一致。"""
-    return base64.b64encode(gzip.compress(raw, 9, mtime=0)).decode("ascii")
+    try:
+        gz = gzip.compress(raw, 9, mtime=0)  # novermin（3.8+，下面有兜底）
+    except TypeError:                 # Python < 3.8：gzip.compress 不认 mtime，改用 GzipFile
+        buf = io.BytesIO()
+        with gzip.GzipFile(fileobj=buf, mode="wb", compresslevel=9, mtime=0) as g:
+            g.write(raw)
+        gz = buf.getvalue()
+    return base64.b64encode(gz).decode("ascii")
 
 
 def _version_of(raw):
