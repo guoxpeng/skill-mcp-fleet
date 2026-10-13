@@ -67,7 +67,47 @@ curl -fsSL https://api.github.com/repos/guoxpeng/skill-mcp-fleet/contents/instal
 sudo bash install.sh --name fnos --port 3100
 ```
 
-各通道内容一致，MD5 `ba8d4c106adc6185a22c7586f696b46e`（88743 B，v3.1）。
+各通道内容一致，MD5 `0cb12b52c8279ed4d44b9b8c2ec11e61`（133808 B，v3.4）。
+
+### 方式 C：完全离线 · 粘贴即装（副设备连不上网 / 下载不到时）
+
+用仓库里的 [`install-offline.paste.txt`](install-offline.paste.txt)：它是一整段文本，里面用二进制编码（base64）内嵌了完整的 `install.sh`。
+
+1. 打开 `install-offline.paste.txt`，**从第一行到最后一行全部复制**（约 58 KB）
+2. 粘贴到副设备终端里，回车
+3. 它会自动：解码 → 校验 md5 → 安装（root 直接装，非 root 自动 `sudo`，Termux 直接装）
+
+默认名字 = 主机名、端口 = 3100。要改有两种办法：
+
+```bash
+# 办法一：粘贴前先执行这一行，再粘贴
+export FLEET_NAME=nas FLEET_PORT=3100
+# 办法二：粘贴前把文件第 3 行里的默认值改掉
+```
+
+要点：
+
+- **不需要网络**，也不需要往副设备传文件；有 `base64` + `gzip`（coreutils）就能解，没有时自动改用 python3
+- 校验不过会打印「校验失败 …… 请整段重新复制」并停下，**不会装半截**（通常是没复制全）
+- 全程不用 `exit`，粘贴进交互终端也不会把窗口关掉
+- 需要带隧道 / 令牌等更多参数时，用方式 A 或下面的 `install-offline.sh`：
+  `sudo bash install-offline.sh --name nas --port 3100 --tunnel --generate-token --require-auth`
+- 其他离线形态（单文件自解压、纯 base64、分片）的用法见 [`install-offline.README.txt`](install-offline.README.txt)
+
+### 从旧版本升级到 v3.4（修复副端掉线）
+
+**在每台副端上把原来的安装命令（方式 A / B / C 任一）重新跑一遍即可**，配置文件、令牌、隧道设置都会保留，不会被覆盖。重跑后会自动重启服务换成新代码。
+
+v3.4 修了这些导致「副端掉线 / 假在线」的问题：
+
+- **保活改成真实探活**：以前只看进程在不在，进程卡死也算「活着」。现在每轮真的 HTTP 请求 `/health`：agent 连续 2 轮不通就重启；公网地址连续 3 轮不通就重建隧道；本机都不通时只修 agent，不误重建隧道
+- **连接空闲超时**（默认 300 秒）+ TCP keepalive：半开的死连接不再永久占线
+- `exec` 超时 / `exec_kill` **杀整个进程组**，不再留孤儿进程
+- SSE 长连接发完即清队列，避免内存越积越多
+- 主循环异常以非零状态退出，交给 systemd / 守护壳自动重启
+- `GET /mcp` 改回规范的 405（以前 404 会让部分客户端误判服务不存在）
+- 非 root 自动 `sudo` 重新执行时，`--name`、`--port` 等参数不再丢失
+- Termux 启动时自动 `termux-wake-lock`，减少手机息屏后掉线
 
 ### v3.3+：一键环境自举 + 多隧道后端
 
@@ -397,6 +437,7 @@ bash /opt/fnos_mcp/mcp-ctl.sh restart
 |---|---|
 | `install.sh` | **一键安装脚本**（自包含，已内嵌服务器代码）——拷这一个文件就够了 |
 | `fleet.py` | **主端统一 CLI**（零依赖）：列节点 / 体检 / 执行命令 / 调工具 / 注册 / 地址跟随。**改完配置立即可用，不必重启 agent** |
+| `install-offline.paste.txt` | **粘贴即装**：整段复制进副设备终端回车，自动解码 + 校验 md5 + 安装（内嵌 `base64(gzip(install.sh))`） |
 | `install-offline.sh` | **自解压安装脚本**，内嵌了 install.sh，只需传这一个文件 |
 | `install-offline.b64` | 离线载荷 = `base64(zlib(install.sh))`，**纯 base64 无注释行**（**不是 tar 包**，只需 python3） |
 | `install-offline.partNN.txt` | 同一载荷的分片（默认每片 4000 字符），**纯 base64**，`cat` 拼即可 |
@@ -436,8 +477,8 @@ bash /opt/fnos_mcp/mcp-ctl.sh restart
 
 副端可能因为 OOM、容器重启、隧道进程掉线而失联。保活守护每 60 秒做三件事：
 
-1. **agent 挂了 → 拉起来**（systemd 机型走 `systemctl restart`，容器机型走 `mcp-ctl.sh start`）
-2. **隧道进程没了 → 重建**（*只在进程真的没了时* —— 能复用就绝不重建，避免撞 trycloudflare 限流）
+1. **agent 不通 → 拉起来**（v3.4 起是真实 HTTP 探活 `/health`，不只看进程在不在；连续 2 轮不通才重启。systemd 机型走 `systemctl restart`，容器机型走 `mcp-ctl.sh start`）
+2. **隧道不通 → 重建**（进程没了立刻重建；进程还在但公网地址连续 3 轮探活失败也重建；本机 agent 都不通时不动隧道，避免撞 trycloudflare 限流）
 3. **把当前地址写进 `current_url.txt`，并上报「地址目录」**
 
 systemd 机型用 oneshot service + timer，不占常驻进程：
@@ -483,6 +524,13 @@ python3 fleet.py exec cloud "uptime"   # 地址失效时自动纠正后重试
 `DELETE /nodes?name=<n>`。零依赖，落盘 `~/.mcp-fleet/directory.json`。
 
 ## 九、已踩过的坑（别重犯）
+
+### v3.4 新增踩过的坑
+
+1. **「进程还在」≠「服务可用」**——agent 卡死、端口半开时 `pgrep` 照样有结果，旧保活永远不触发，表现就是副端「掉线」。保活必须真的发 HTTP 请求去探活。
+2. **没有空闲超时的 HTTP 服务会被死连接拖死**——客户端断网后连接半开，线程一直挂着。现在默认 300 秒空闲断开 + TCP keepalive。
+3. **参数解析会把 `$@` shift 空**——非 root 自动 `sudo bash "$0" "$@"` 重执行时 `--name`/`--port` 因此全丢，装出来的是默认名字。要在解析前先存一份 `ORIG_ARGS=("$@")`。
+4. **离线包是生成物**——改了 `install.sh` 必须 `python3 make-offline.py`（含 `install-offline.paste.txt`），再 `--check`。
 
 1. **别用 `pkill -f xxx` 杀自己的服务**——命令行里含关键字会把执行该命令的 shell 一起杀掉。脚本改用「按端口 scan `/proc/net/tcp` 找 pid」的 `_portkill.py`（不依赖 `fuser`，容器里常没装 psmisc）。
 2. **Python 拼命令不要用 `%` 格式化**——`docker ps --format '{{.Names}}'` 里的 `{{...}}` 会被 `%` 吃掉。代码里已全部改成字符串拼接。
