@@ -424,7 +424,7 @@ else
 {
   "name": "$NAME",
   "tool_prefix": "$PREFIX",
-  "version": "3.4.0",
+  "version": "3.4.1",
   "sudo_password": "$SUDO_PASS",
   "work_dir": "/",
   "command_timeout": 120,
@@ -1722,9 +1722,44 @@ if [ "$UNINSTALL" != "1" ]; then
   sleep 1
 fi
 
+# ---------- firewalld：信任 tailscale0（CentOS/RHEL 常见坑）----------
+# firewalld 默认把新网卡丢进 public 区，tailnet 进来的 3100 端口会被静默丢包：
+# tailscale ping 通、curl 却一直超时。这里只把 tailscale0 放进 trusted 区，公网口不动。
+# 不想让安装器碰防火墙：FLEET_NO_FIREWALLD=1 sudo bash install.sh ...
+if [ "$UNINSTALL" != "1" ] && [ "${FLEET_NO_FIREWALLD:-0}" != "1" ] && [ "$(id -u)" = "0" ] \
+   && [ -e /sys/class/net/tailscale0 ] && command -v firewall-cmd >/dev/null 2>&1 \
+   && firewall-cmd --state >/dev/null 2>&1; then
+  TS_ZONE="$(firewall-cmd --get-zone-of-interface=tailscale0 2>/dev/null || true)"
+  if [ "$TS_ZONE" = "trusted" ]; then
+    log "firewalld: tailscale0 已在 trusted 区"
+  else
+    if [ -n "$TS_ZONE" ]; then
+      FW_ACT="--change-interface=tailscale0"
+    else
+      FW_ACT="--add-interface=tailscale0"
+    fi
+    if firewall-cmd --permanent --zone=trusted "$FW_ACT" >/dev/null 2>&1 \
+       && firewall-cmd --reload >/dev/null 2>&1; then
+      log "firewalld: 已把 tailscale0 加入 trusted 区（只动 tailscale0，公网口规则不变）"
+    else
+      warn "firewalld: 自动信任 tailscale0 失败，请手动执行： firewall-cmd --permanent --zone=trusted --add-interface=tailscale0 && firewall-cmd --reload"
+    fi
+  fi
+fi
+
 # ---------- 安装 / 启动 ----------
 if [ "$MODE" = "systemd" ]; then
-  log "写入 systemd 单元: /etc/systemd/system/${UNIT}.service"
+  # StandardOutput=append: 要 systemd >= 240；CentOS 7 是 219，不认识会忽略，
+  # agent.log 就一直是空的。老 systemd 改用 sh 重定向。
+  SYSTEMD_VER="$(systemctl --version 2>/dev/null | awk 'NR==1{print $2+0}')"
+  if [ "${SYSTEMD_VER:-0}" -ge 240 ] 2>/dev/null; then
+    UNIT_EXEC="ExecStart=$PY3 -u $DIR/mcp_agent.py --host 0.0.0.0 --port $PORT
+StandardOutput=append:$DIR/agent.log
+StandardError=append:$DIR/agent.log"
+  else
+    UNIT_EXEC="ExecStart=/bin/sh -c 'exec $PY3 -u $DIR/mcp_agent.py --host 0.0.0.0 --port $PORT >>$DIR/agent.log 2>&1'"
+  fi
+  log "写入 systemd 单元: /etc/systemd/system/${UNIT}.service（systemd ${SYSTEMD_VER:-?}）"
   cat > "/etc/systemd/system/${UNIT}.service" <<UNIT_EOF
 [Unit]
 Description=MCP Agent ($NAME) - 副端远程操控服务
@@ -1734,11 +1769,11 @@ Wants=network-online.target
 [Service]
 Type=simple
 WorkingDirectory=$DIR
-ExecStart=$PY3 -u $DIR/mcp_agent.py --host 0.0.0.0 --port $PORT
+# Python 3.6 在 C/POSIX locale 下 stdout 是 ascii，打中文会崩；3.7+ 无影响
+Environment=PYTHONIOENCODING=utf-8
+$UNIT_EXEC
 Restart=always
 RestartSec=3
-StandardOutput=append:$DIR/agent.log
-StandardError=append:$DIR/agent.log
 
 [Install]
 WantedBy=multi-user.target

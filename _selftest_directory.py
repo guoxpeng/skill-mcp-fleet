@@ -90,7 +90,7 @@ def main():
 
     # ---- 1. 无 token + 非本机监听 → 拒绝启动 ----
     r = subprocess.run([PY, SRC, "--host", "0.0.0.0", "--port", str(free_port())],
-                       capture_output=True, timeout=20, env=dict(os.environ, HOME=home))
+                       stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=20, env=dict(os.environ, HOME=home))
     out = (r.stdout + r.stderr).decode("utf-8", "replace")
     rec("1 无 token+非本机 → 拒绝启动(exit 2)", r.returncode == 2, r.returncode)
     rec("1b 提示含投毒风险说明", "FATAL" in out and "token" in out)

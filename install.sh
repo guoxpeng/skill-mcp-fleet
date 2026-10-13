@@ -415,6 +415,7 @@ import json
 import os
 import re
 import hmac
+import io
 import ipaddress
 import locale
 import shlex
@@ -425,7 +426,14 @@ import sys
 import threading
 import time
 import uuid
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from http.server import BaseHTTPRequestHandler, HTTPServer
+try:
+    from http.server import ThreadingHTTPServer  # novermin（3.7+，下面有 3.6 兜底）
+except ImportError:  # Python 3.6（如 CentOS 7 自带 3.6.8）没有 ThreadingHTTPServer，自己拼一个
+    from socketserver import ThreadingMixIn
+
+    class ThreadingHTTPServer(ThreadingMixIn, HTTPServer):
+        daemon_threads = True
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 CONFIG_PATH = os.path.join(HERE, "mcp_agent_config.json")
@@ -433,16 +441,26 @@ CONFIG_PATH = os.path.join(HERE, "mcp_agent_config.json")
 # 日志行缓冲：副端是被 nohup/systemd 拉起的常驻进程，stdout 重定向到文件时
 # 默认是块缓冲，启动横幅和诊断信息会一直卡在缓冲区里；进程被 kill 时直接丢失，
 # 表现为 agent.log 一直是空的。这里强制行缓冲。
-for _stream in (sys.stdout, sys.stderr):
-    try:
-        _stream.reconfigure(line_buffering=True)
-    except Exception:
-        pass
+# Python 3.6 没有 reconfigure，而且在 C/POSIX locale（systemd 下常见）里默认是 ascii，
+# 打印中文直接 UnicodeEncodeError 把进程打崩 —— 这时重新包一层 utf-8 + 行缓冲。
+for _name in ("stdout", "stderr"):
+    _stream = getattr(sys, _name)
+    if hasattr(_stream, "reconfigure"):
+        try:
+            _stream.reconfigure(line_buffering=True)
+        except Exception:
+            pass
+    else:
+        try:
+            setattr(sys, _name, io.TextIOWrapper(_stream.buffer, encoding="utf-8",
+                                                 errors="replace", line_buffering=True))
+        except Exception:
+            pass
 
 DEFAULT_CONFIG = {
     "name": "node",             # 副端标识（显示在状态页与 serverInfo）
     "tool_prefix": "",          # 工具名前缀，如 "nas_"；留空则用裸名（exec/read/...）
-    "version": "3.4.0",
+    "version": "3.4.1",
     "sudo_password": "",        # 留空且非 root 时会尝试免密 sudo
     "work_dir": "/",            # 默认工作目录
     "command_timeout": 120,     # 秒
@@ -486,6 +504,28 @@ def load_config():
         except Exception as e:
             print("[warn] 读配置失败，用默认值: %s" % e, file=sys.stderr)
     return cfg
+
+
+# ---- 本机 Tailscale IP 探测（v3.4：供主端诊断「登记 IP vs 实际 IP」）----
+_TS_IP_CACHE = {"ts": 0, "ip": ""}
+def tailscale_ip():
+    """本机 tailscale IPv4（100.64/10），60 秒缓存；没有/失败返回 ""。"""
+    now = time.time()
+    if now - _TS_IP_CACHE["ts"] < 60:
+        return _TS_IP_CACHE["ip"]
+    ip = ""
+    try:
+        p = subprocess.run(["tailscale", "ip", "-4"], stdout=subprocess.PIPE,
+                           stderr=subprocess.PIPE, universal_newlines=True, timeout=3)
+        for line in (p.stdout or "").splitlines():
+            line = line.strip()
+            if line.startswith("100."):
+                ip = line
+                break
+    except Exception:
+        ip = ""
+    _TS_IP_CACHE.update(ts=now, ip=ip)
+    return ip
 
 
 def save_config(cfg):
@@ -1452,6 +1492,7 @@ class Handler(BaseHTTPRequestHandler):
                     "auth": bool(CFG.get("auth_token") or ""),
                     "allow_ips": CFG.get("allow_ips") or [],
                     "transports": ["POST /mcp (streamable-http)", "GET /sse (sse)"],
+                    "tailscale_ip": tailscale_ip(),
                 })
             self._json(200, body)
             return
@@ -1588,7 +1629,7 @@ else
 {
   "name": "$NAME",
   "tool_prefix": "$PREFIX",
-  "version": "3.4.0",
+  "version": "3.4.1",
   "sudo_password": "$SUDO_PASS",
   "work_dir": "/",
   "command_timeout": 120,
@@ -2886,9 +2927,44 @@ if [ "$UNINSTALL" != "1" ]; then
   sleep 1
 fi
 
+# ---------- firewalld：信任 tailscale0（CentOS/RHEL 常见坑）----------
+# firewalld 默认把新网卡丢进 public 区，tailnet 进来的 3100 端口会被静默丢包：
+# tailscale ping 通、curl 却一直超时。这里只把 tailscale0 放进 trusted 区，公网口不动。
+# 不想让安装器碰防火墙：FLEET_NO_FIREWALLD=1 sudo bash install.sh ...
+if [ "$UNINSTALL" != "1" ] && [ "${FLEET_NO_FIREWALLD:-0}" != "1" ] && [ "$(id -u)" = "0" ] \
+   && [ -e /sys/class/net/tailscale0 ] && command -v firewall-cmd >/dev/null 2>&1 \
+   && firewall-cmd --state >/dev/null 2>&1; then
+  TS_ZONE="$(firewall-cmd --get-zone-of-interface=tailscale0 2>/dev/null || true)"
+  if [ "$TS_ZONE" = "trusted" ]; then
+    log "firewalld: tailscale0 已在 trusted 区"
+  else
+    if [ -n "$TS_ZONE" ]; then
+      FW_ACT="--change-interface=tailscale0"
+    else
+      FW_ACT="--add-interface=tailscale0"
+    fi
+    if firewall-cmd --permanent --zone=trusted "$FW_ACT" >/dev/null 2>&1 \
+       && firewall-cmd --reload >/dev/null 2>&1; then
+      log "firewalld: 已把 tailscale0 加入 trusted 区（只动 tailscale0，公网口规则不变）"
+    else
+      warn "firewalld: 自动信任 tailscale0 失败，请手动执行： firewall-cmd --permanent --zone=trusted --add-interface=tailscale0 && firewall-cmd --reload"
+    fi
+  fi
+fi
+
 # ---------- 安装 / 启动 ----------
 if [ "$MODE" = "systemd" ]; then
-  log "写入 systemd 单元: /etc/systemd/system/${UNIT}.service"
+  # StandardOutput=append: 要 systemd >= 240；CentOS 7 是 219，不认识会忽略，
+  # agent.log 就一直是空的。老 systemd 改用 sh 重定向。
+  SYSTEMD_VER="$(systemctl --version 2>/dev/null | awk 'NR==1{print $2+0}')"
+  if [ "${SYSTEMD_VER:-0}" -ge 240 ] 2>/dev/null; then
+    UNIT_EXEC="ExecStart=$PY3 -u $DIR/mcp_agent.py --host 0.0.0.0 --port $PORT
+StandardOutput=append:$DIR/agent.log
+StandardError=append:$DIR/agent.log"
+  else
+    UNIT_EXEC="ExecStart=/bin/sh -c 'exec $PY3 -u $DIR/mcp_agent.py --host 0.0.0.0 --port $PORT >>$DIR/agent.log 2>&1'"
+  fi
+  log "写入 systemd 单元: /etc/systemd/system/${UNIT}.service（systemd ${SYSTEMD_VER:-?}）"
   cat > "/etc/systemd/system/${UNIT}.service" <<UNIT_EOF
 [Unit]
 Description=MCP Agent ($NAME) - 副端远程操控服务
@@ -2898,11 +2974,11 @@ Wants=network-online.target
 [Service]
 Type=simple
 WorkingDirectory=$DIR
-ExecStart=$PY3 -u $DIR/mcp_agent.py --host 0.0.0.0 --port $PORT
+# Python 3.6 在 C/POSIX locale 下 stdout 是 ascii，打中文会崩；3.7+ 无影响
+Environment=PYTHONIOENCODING=utf-8
+$UNIT_EXEC
 Restart=always
 RestartSec=3
-StandardOutput=append:$DIR/agent.log
-StandardError=append:$DIR/agent.log
 
 [Install]
 WantedBy=multi-user.target

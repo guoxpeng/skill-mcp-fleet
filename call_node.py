@@ -11,6 +11,22 @@ import sys
 import urllib.request
 
 
+def _open(req, timeout):
+    """内网/本机/tailnet(100.64.0.0/10、*.ts.net) 地址绕过 http_proxy 直连。"""
+    import ipaddress
+    import urllib.parse
+    host = (urllib.parse.urlsplit(req.full_url).hostname or "").lower().rstrip(".")
+    direct = host == "localhost" or host.endswith((".local", ".ts.net"))
+    try:
+        ip = ipaddress.ip_address(host)
+        direct = direct or ip in ipaddress.ip_network("100.64.0.0/10") or \
+            ip.is_private or ip.is_loopback or ip.is_link_local
+    except ValueError:
+        pass
+    handlers = [urllib.request.ProxyHandler({})] if direct else []
+    return urllib.request.build_opener(*handlers).open(req, timeout=timeout)
+
+
 def make_client(url):
     sid = {"v": None}
 
@@ -22,7 +38,7 @@ def make_client(url):
             method="POST")
         if sid["v"]:
             req.add_header("Mcp-Session-Id", sid["v"])
-        with urllib.request.urlopen(req, timeout=timeout) as r:
+        with _open(req, timeout=timeout) as r:
             if r.headers.get("Mcp-Session-Id"):
                 sid["v"] = r.headers["Mcp-Session-Id"]
             body = r.read().decode("utf-8", "ignore")

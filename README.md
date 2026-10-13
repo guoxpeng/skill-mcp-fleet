@@ -70,7 +70,7 @@ curl -fsSL https://api.github.com/repos/guoxpeng/skill-mcp-fleet/contents/instal
 sudo bash install.sh --name fnos --port 3100
 ```
 
-各通道内容一致，MD5 `0cb12b52c8279ed4d44b9b8c2ec11e61`（133808 B，v3.4）。
+各通道内容一致，MD5 `fdd9c6e2b311f244f4451f574b1434a0`（137461 B，v3.4.1）。
 
 ### 方式 C：完全离线 · 粘贴即装（副设备连不上网 / 下载不到时）
 
@@ -96,6 +96,18 @@ export FLEET_NAME=nas FLEET_PORT=3100
 - 需要带隧道 / 令牌等更多参数时，用方式 A 或下面的 `install-offline.sh`：
   `sudo bash install-offline.sh --name nas --port 3100 --tunnel --generate-token --require-auth`
 - 其他离线形态（单文件自解压、纯 base64、分片）的用法见 [`install-offline.README.txt`](install-offline.README.txt)
+
+### v3.4.1：兼容 Python 3.6（CentOS 7）+ tailnet 直连
+
+**CentOS 7 等只有 Python 3.6 的机器请升级到 v3.4.1**（重跑安装命令即可，配置保留）：
+
+- 副端 / 目录服务在 Python 3.6 上能跑了：以前一启动就 `ImportError: cannot import name 'ThreadingHTTPServer'`，被 systemd 无限拉起
+- C/POSIX locale 下打印中文不再崩；老 systemd（< 240，如 CentOS 7 的 219）也能写 `agent.log`
+- 安装器发现 firewalld 在跑且有 `tailscale0` 时，自动把 **tailscale0（仅此一张网卡）** 加入 trusted 区；不想让它动防火墙就 `FLEET_NO_FIREWALLD=1`
+- 主端 `fleet.py`：Tailscale 地址（`100.64.0.0/10`、`*.ts.net`）和内网地址一律绕过 `http_proxy` 直连；若设了 tailnet 隧道代理（`FLEET_TAILNET_PROXY`，托管沙盒里自动识别 `hatch-egress-proxy:3130`）则 tailnet 流量走该隧道
+- 主端 `fleet.py`：tailnet 节点 IP 漂移自动纠正——`fleet.py add ... --tailnet <MagicDNS主机名>` 登记后，配好 `TAILSCALE_API_KEY`（devices:read）就会在解析节点时用 Tailscale API 查最新 IP（双重探活后才回写），也可手动 `python fleet.py tailscale-sync`；`FLEET_NO_TAILNET_SYNC=1` 关闭。同一 tailnet 内的 IP→IP 变更不再被 `domain_ok` 拒绝
+- 主端 `fleet.py`：initialize / tools/list 遇到「连不上 / 超时」自动重试一次（exec 等写操作不重试）；`fleet_watch.py` 对 tailnet 节点以 GET 探活（HTTP 可达即在线）
+- 副端 `/health` 新增 `tailscale_ip` 字段，方便核对「登记 IP vs 实际 IP」
 
 ### 从旧版本升级到 v3.4（修复副端掉线）
 
@@ -542,6 +554,16 @@ python3 fleet.py exec cloud "uptime"   # 地址失效时自动纠正后重试
 `DELETE /nodes?name=<n>`。零依赖，落盘 `~/.mcp-fleet/directory.json`。
 
 ## 九、已踩过的坑（别重犯）
+
+### v3.4.1 新增踩过的坑
+
+1. **CentOS 7 自带 Python 3.6.8，副端一启动就崩、systemd 里死循环重启**——日志是 `ImportError: cannot import name 'ThreadingHTTPServer'`。`ThreadingHTTPServer`、`subprocess.run(capture_output=, text=)`、`sys.stdout.reconfigure()` 都是 3.7+ 才有。现在全部有 3.6 兜底：`ThreadingMixIn + HTTPServer` 自己拼、改用 `stdout=PIPE, stderr=PIPE, universal_newlines=True`、没有 `reconfigure` 就重新包一层 utf-8。改代码后用 `vermin -t=3.6- *.py` 扫一遍，再用真 3.6 跑三个 `_selftest_*.py`。
+2. **Python 3.6 不做 C locale 强制转换**——systemd 下 `LANG` 常为空，stdout 是 ascii，打印一行中文就 `UnicodeEncodeError`。代码里兜底包 utf-8，单元里也加了 `Environment=PYTHONIOENCODING=utf-8`。
+3. **firewalld 要信任 tailscale0**——CentOS/RHEL 的 firewalld 默认把 `tailscale0` 当 public 区，`tailscale ping` 通、访问 3100 端口却一直超时。手动修：
+   `firewall-cmd --permanent --zone=trusted --add-interface=tailscale0 && firewall-cmd --reload`
+   （v3.4.1 安装器检测到 firewalld 在跑且有 tailscale0 时会自动做；只动 tailscale0，公网口规则不变。）
+4. **Tailscale 的 100.x 在 Python 里不算内网**——`ipaddress.ip_address("100.91.x.x").is_private` 是 `False`（100.64.0.0/10 是 CGNAT 段）。主端机器配了 `HTTP_PROXY` 时，tailnet 节点的请求会被丢给代理，回 404/超时。`fleet.py` 的所有请求现在都走 `_opener_for()`：`100.64.0.0/10`、`*.ts.net`、内网、本机一律直连（tailnet 若配了隧道代理 `FLEET_TAILNET_PROXY` 则走隧道）。别再裸调 `urllib.request.urlopen`。
+5. **`StandardOutput=append:` 要 systemd ≥ 240**——CentOS 7 是 219，不认识就静默忽略，`agent.log` 永远是空的。安装器按 systemd 版本自动改用 `sh -c 'exec ... >> agent.log 2>&1'`。
 
 ### v3.4 新增踩过的坑
 

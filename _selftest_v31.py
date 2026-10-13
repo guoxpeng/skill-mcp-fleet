@@ -189,7 +189,7 @@ def main():
     # ---------- 阶段 C：require_auth 硬失败 ----------
     dC = make_inst("reqauth", {"name": "t-req", "auth_token": "", "require_auth": True})
     r = subprocess.run([PY, "mcp_agent.py", "--host", "127.0.0.1", "--port", str(free_port())],
-                       cwd=dC, capture_output=True, timeout=20)
+                       cwd=dC, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=20)
     out = (r.stdout + r.stderr).decode("utf-8", "replace")
     rec("C1 require_auth 且空 token → 拒绝启动(exit 2)", r.returncode == 2, r.returncode)
     rec("C2 给出修正命令提示", "FATAL" in out and "--generate-token" in out, out.strip().splitlines()[:1])

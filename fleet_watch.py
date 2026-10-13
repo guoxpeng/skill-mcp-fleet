@@ -32,7 +32,7 @@ def save_state(s):
 
 def list_nodes(agent):
     r = subprocess.run([sys.executable, FLEET, "list", "--agent", agent, "--json"],
-                       capture_output=True, text=True, timeout=30)
+                       stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True, timeout=30)
     try:
         return json.loads(r.stdout or "{}")
     except Exception:
@@ -56,7 +56,7 @@ def probe_node(name, url, agent):
     """返回 (ok: bool, detail: str)"""
     r = subprocess.run([sys.executable, FLEET, "probe", name,
                         "--agent", agent, "--no-sync"],
-                       capture_output=True, text=True, timeout=60)
+                       stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True, timeout=60)
     out = (r.stdout or "") + (r.stderr or "")
     # Tailscale 内网节点：后台任务的 POST 会被运行时网络策略拦截，
     # 只能做 GET 探活——"[+] HTTP 可达"（副端返回了 server/version 信息）即视为在线。

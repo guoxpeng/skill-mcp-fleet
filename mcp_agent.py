@@ -38,6 +38,7 @@ import json
 import os
 import re
 import hmac
+import io
 import ipaddress
 import locale
 import shlex
@@ -50,11 +51,11 @@ import time
 import uuid
 from http.server import BaseHTTPRequestHandler, HTTPServer
 try:
-    from http.server import ThreadingHTTPServer
-except ImportError:
-    # Python 3.6 兼容：ThreadingHTTPServer 是 3.7+ 才有的
-    import socketserver
-    class ThreadingHTTPServer(socketserver.ThreadingMixIn, HTTPServer):
+    from http.server import ThreadingHTTPServer  # novermin（3.7+，下面有 3.6 兜底）
+except ImportError:  # Python 3.6（如 CentOS 7 自带 3.6.8）没有 ThreadingHTTPServer，自己拼一个
+    from socketserver import ThreadingMixIn
+
+    class ThreadingHTTPServer(ThreadingMixIn, HTTPServer):
         daemon_threads = True
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -63,16 +64,26 @@ CONFIG_PATH = os.path.join(HERE, "mcp_agent_config.json")
 # 日志行缓冲：副端是被 nohup/systemd 拉起的常驻进程，stdout 重定向到文件时
 # 默认是块缓冲，启动横幅和诊断信息会一直卡在缓冲区里；进程被 kill 时直接丢失，
 # 表现为 agent.log 一直是空的。这里强制行缓冲。
-for _stream in (sys.stdout, sys.stderr):
-    try:
-        _stream.reconfigure(line_buffering=True)
-    except Exception:
-        pass
+# Python 3.6 没有 reconfigure，而且在 C/POSIX locale（systemd 下常见）里默认是 ascii，
+# 打印中文直接 UnicodeEncodeError 把进程打崩 —— 这时重新包一层 utf-8 + 行缓冲。
+for _name in ("stdout", "stderr"):
+    _stream = getattr(sys, _name)
+    if hasattr(_stream, "reconfigure"):
+        try:
+            _stream.reconfigure(line_buffering=True)
+        except Exception:
+            pass
+    else:
+        try:
+            setattr(sys, _name, io.TextIOWrapper(_stream.buffer, encoding="utf-8",
+                                                 errors="replace", line_buffering=True))
+        except Exception:
+            pass
 
 DEFAULT_CONFIG = {
     "name": "node",             # 副端标识（显示在状态页与 serverInfo）
     "tool_prefix": "",          # 工具名前缀，如 "nas_"；留空则用裸名（exec/read/...）
-    "version": "3.4.0",
+    "version": "3.4.1",
     "sudo_password": "",        # 留空且非 root 时会尝试免密 sudo
     "work_dir": "/",            # 默认工作目录
     "command_timeout": 120,     # 秒
@@ -127,8 +138,8 @@ def tailscale_ip():
         return _TS_IP_CACHE["ip"]
     ip = ""
     try:
-        p = subprocess.run(["tailscale", "ip", "-4"], capture_output=True,
-                           text=True, timeout=3)
+        p = subprocess.run(["tailscale", "ip", "-4"], stdout=subprocess.PIPE,
+                           stderr=subprocess.PIPE, universal_newlines=True, timeout=3)
         for line in (p.stdout or "").splitlines():
             line = line.strip()
             if line.startswith("100."):

@@ -15,7 +15,14 @@ import re
 import socket
 import sys
 import threading
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from http.server import BaseHTTPRequestHandler, HTTPServer
+try:
+    from http.server import ThreadingHTTPServer  # novermin（3.7+，下面有 3.6 兜底）
+except ImportError:  # Python 3.6（如 CentOS 7 自带 3.6.8）没有 ThreadingHTTPServer，自己拼一个
+    from socketserver import ThreadingMixIn
+
+    class ThreadingHTTPServer(ThreadingMixIn, HTTPServer):
+        daemon_threads = True
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 SRC = os.path.join(HERE, "fleet.py")
@@ -134,6 +141,84 @@ def main():
         "if not domain_ok(cur, new)" in src_txt)
     rec("17 sync_from_directory 先匿名探活再发令牌",
         src_txt.index("probe_anonymous(new_mcp") < src_txt.index("http_probe(new_mcp, timeout=min(timeout, 6), token=token)"))
+
+    # ---- v3.4.1：tailnet / 内网地址绕过 http_proxy ----
+    direct = ["100.91.169.103", "100.64.0.1", "100.127.255.254", "node.tailabc.ts.net",
+              "NODE.tailabc.ts.net.", "127.0.0.1", "localhost", "192.168.1.4", "10.0.0.2",
+              "fd7a:115c:a1e0::1", "nas.local"]
+    proxied = ["100.63.255.255", "100.128.0.1", "8.8.8.8", "example.com", "ts.net.evil.com"]
+    bad = [h for h in direct if not mod._is_direct_host(h)] + \
+          [h for h in proxied if mod._is_direct_host(h)]
+    rec("18 100.64.0.0/10、*.ts.net、内网直连；公网照常走代理", not bad, bad)
+    rec("19 fleet.py 里不再有裸 urllib.request.urlopen（全部走 _opener_for）",
+        "urllib.request.urlopen(" not in src_txt and src_txt.count("_opener_for(req.full_url).open(") >= 4)
+
+    # 行为验证：起一个假代理（谁来都回 404 并计数），配上 HTTP_PROXY 看请求去了哪
+    class FakeProxy(_Base):
+        HITS = []
+
+        def do_GET(self):
+            FakeProxy.HITS.append(self.path)
+            self._reply(404, {"error": "proxy says no"})
+    sp, purl = serve(FakeProxy)
+    old_env = {k: os.environ.get(k) for k in ("http_proxy", "HTTP_PROXY", "no_proxy", "NO_PROXY",
+                                              "https_proxy", "HTTPS_PROXY", "FLEET_TAILNET_PROXY")}
+    try:
+        proxy = purl.rsplit("/mcp", 1)[0]
+        os.environ["http_proxy"] = os.environ["HTTP_PROXY"] = proxy
+        for k in ("no_proxy", "NO_PROXY", "https_proxy", "HTTPS_PROXY", "FLEET_TAILNET_PROXY"):
+            os.environ.pop(k, None)
+        mod._DEFAULT_OPENER = None
+        mod._DIRECT_OPENER = None
+        import urllib.request as _ur
+        try:
+            mod._opener_for("http://public.example.invalid/").open(
+                _ur.Request("http://public.example.invalid/"), timeout=3)
+        except Exception:
+            pass
+        went_proxy = len(FakeProxy.HITS) == 1
+        try:
+            mod._opener_for("http://100.100.100.100:9/").open(
+                _ur.Request("http://100.100.100.100:9/"), timeout=1)
+        except Exception:
+            pass
+        rec("20 配了 HTTP_PROXY：公网走代理、tailnet 100.x 不进代理",
+            went_proxy and len(FakeProxy.HITS) == 1, FakeProxy.HITS)
+
+        # 21：显式 FLEET_TAILNET_PROXY（隧道代理）时 tailnet 走隧道，普通内网仍直连
+        os.environ["FLEET_TAILNET_PROXY"] = proxy
+        del FakeProxy.HITS[:]
+        for u in ("http://100.100.100.100:9/", "http://node.tailabc.ts.net:9/"):
+            try:
+                mod._opener_for(u).open(_ur.Request(u), timeout=3)
+            except Exception:
+                pass
+        n_tunnel = len(FakeProxy.HITS)
+        try:
+            mod._opener_for("http://127.0.0.1:9/").open(_ur.Request("http://127.0.0.1:9/"), timeout=1)
+        except Exception:
+            pass
+        rec("21 FLEET_TAILNET_PROXY：tailnet(100.x/*.ts.net) 走隧道代理、本机仍直连",
+            n_tunnel == 2 and len(FakeProxy.HITS) == 2, FakeProxy.HITS)
+        os.environ.pop("FLEET_TAILNET_PROXY", None)
+    finally:
+        for k, v in old_env.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+        mod._DEFAULT_OPENER = None
+        sp.shutdown()
+
+    # 22：domain_ok 放行同一 tailnet 内的 IP 漂移，但 tailnet → 公网仍拒绝
+    _allow = os.environ.pop("FLEET_ALLOW_DOMAIN_CHANGE", None)
+    try:
+        rec("22 domain_ok：tailnet IP 漂移放行、跳公网拒绝",
+            mod.domain_ok("http://100.103.118.7:3100/mcp", "http://100.81.253.35:3100/mcp")
+            and not mod.domain_ok("http://100.103.118.7:3100/mcp", "http://evil.example.com/mcp"))
+    finally:
+        if _allow is not None:
+            os.environ["FLEET_ALLOW_DOMAIN_CHANGE"] = _allow
 
     ok = sum(1 for _, c in RESULTS if c)
     print("\n==== %d/%d 通过 ====" % (ok, len(RESULTS)))
