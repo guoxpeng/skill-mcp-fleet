@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-mcp-fleet 统一命令行 —— 主端操作副端集群
+mcp-fleet 统一命令行 —— 节点之间互相操控（不分主副，谁发起谁就是控制方）
 =========================================
 零依赖（只用 Python 3 标准库），可在任何 agent / 任何操作系统上运行。
 
@@ -26,6 +26,7 @@ mcp-fleet 统一命令行 —— 主端操作副端集群
   sync [名字...]                按地址目录刷新副端地址（隧道换域名后自动跟随）
   directory                     查看/设置地址目录（副端上报地址、主端自动跟随）
   targets                       列出所有可作为 target 的名字与地址
+  pair <对方地址|名字>          双向配对（v3.5）：互相登记，之后两边都能控制对方
 
 target 写法
 -----------
@@ -66,10 +67,20 @@ import urllib.request
 
 # ---------------------------------------------------------------- 基础
 
-VERSION = "1.1.0"
-REGISTRY = os.path.join(os.path.expanduser("~"), ".mcp-fleet", "nodes.json")
+VERSION = "1.2.0"
 PROTOCOL = "2024-11-05"
 HERE = os.path.dirname(os.path.abspath(__file__))
+# 登记表位置：
+#   * 本脚本装在节点目录里（同目录有 mcp_agent_config.json，v3.5 安装器会这么放）
+#     → 用 <节点目录>/peers.json，与本节点 agent 的 peers / peer_call 工具共用一份对等节点表；
+#   * 否则（如只当控制端的 Windows 电脑）→ ~/.mcp-fleet/nodes.json。
+#   FLEET_REGISTRY 环境变量可强制指定。
+if os.environ.get("FLEET_REGISTRY"):
+    REGISTRY = os.environ["FLEET_REGISTRY"]
+elif os.path.isfile(os.path.join(HERE, "mcp_agent_config.json")):
+    REGISTRY = os.path.join(HERE, "peers.json")
+else:
+    REGISTRY = os.path.join(os.path.expanduser("~"), ".mcp-fleet", "nodes.json")
 
 try:                                  # Windows 控制台默认 GBK，中文会炸
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -110,6 +121,22 @@ def die(msg, code=1):
 # ---------------------------------------------------------------- MCP 客户端
 
 
+def _opener_for(url):
+    """内网/本机地址不走 http_proxy：机器上配了代理时，局域网节点会被代理成 404/超时。"""
+    import ipaddress
+    import urllib.parse
+    host = urllib.parse.urlsplit(url).hostname or ""
+    direct = host == "localhost" or host.endswith(".local")
+    try:
+        ip = ipaddress.ip_address(host)
+        direct = direct or ip.is_private or ip.is_loopback or ip.is_link_local
+    except ValueError:
+        pass
+    if direct:
+        return urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    return urllib.request.build_opener()
+
+
 class MCPError(Exception):
     pass
 
@@ -136,7 +163,7 @@ class MCPClient:
         if self.sid:
             req.add_header("Mcp-Session-Id", self.sid)
         try:
-            with urllib.request.urlopen(req, timeout=timeout or self.timeout) as r:
+            with _opener_for(self.url).open(req, timeout=timeout or self.timeout) as r:
                 if r.headers.get("Mcp-Session-Id"):
                     self.sid = r.headers["Mcp-Session-Id"]
                 body = r.read().decode("utf-8", "ignore")
@@ -1457,6 +1484,104 @@ def cmd_directory(a):
     return 0
 
 
+# ---------------------------------------------------------------- 对等配对（v3.5）
+
+def _lan_ip():
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        s.connect(("10.255.255.255", 1))
+        return s.getsockname()[0]
+    except Exception:
+        return "127.0.0.1"
+    finally:
+        s.close()
+
+
+def local_node(self_url=None):
+    """本机如果也装了节点 agent，返回它的 {name,url,token,dir}；否则 None。"""
+    d = os.environ.get("FLEET_NODE_DIR") or \
+        (HERE if os.path.isfile(os.path.join(HERE, "mcp_agent_config.json")) else "")
+    if not d or not os.path.isfile(os.path.join(d, "mcp_agent_config.json")):
+        return None
+    try:
+        cfg = load_json_config(os.path.join(d, "mcp_agent_config.json"))
+    except Exception:
+        return None
+
+    def _read(fn):
+        try:
+            return open(os.path.join(d, fn), encoding="utf-8").read().strip()
+        except Exception:
+            return ""
+    url = (self_url or cfg.get("self_url") or _read("current_url.txt") or "").strip()
+    if not url:
+        url = "http://%s:%s" % (_lan_ip(), _read("port.txt") or "3100")
+    url = url.rstrip("/")
+    if not re.search(r"/(mcp|sse)$", url):
+        url += "/mcp"
+    return {"name": cfg.get("name") or socket.gethostname(), "url": url,
+            "token": cfg.get("auth_token") or "", "dir": d}
+
+
+def cmd_pair(a):
+    """双向配对：把对方登记到本机，再让对方把本机登记过去，最后从对方回连本机验证。"""
+    url, meta = resolve_target(a.target, port=a.port)
+    token = (a.token or meta.get("token") or "").strip()
+    c = MCPClient(url, a.timeout, token=token)
+    try:
+        info = c.handshake()
+    except MCPError as e:
+        return die("连不上对方：%s" % e)
+    rname = a.name or info.get("name") or host_of(url)
+    print(ok("[+] ") + "对方在线：%s v%s  %s" % (rname, info.get("version", "?"), url))
+
+    reg = load_registry()
+    reg.setdefault("nodes", {})[rname] = {"url": url, "token": token, "description": "对等节点"}
+    save_registry(reg)
+    print(ok("[+] ") + "本机 → %s：已登记（%s）" % (rname, REGISTRY))
+
+    me = local_node(a.self_url)
+    if a.one_way:
+        print(dim("    --one-way：只登记单向。"))
+        return 0
+    if not me:
+        print(warn("[i] ") + "本机没有装节点 agent，所以对方没法反过来控制本机（单向）。")
+        print("    要双向：先在本机装节点（install.sh / install-offline.paste.txt），再用节点自带的 fleet 跑一次 pair。")
+        return 0
+    if me["name"] == rname:
+        print(warn("[!] ") + "两边名字都叫 %s，会互相覆盖。用 --name 给对方换个名字，或改一边的 name。" % rname)
+        return 2
+
+    try:
+        text, is_err = c.call("peer_add", {"name": me["name"], "url": me["url"], "token": me["token"]},
+                              timeout=a.timeout)
+    except MCPError as e:
+        text, is_err = str(e), True
+    if is_err:
+        print(err("[x] ") + "对方登记本机失败：%s" % text.strip()[:300])
+        if "未知工具" in text:
+            print("    对方节点版本太旧（< v3.5），先在对方重跑一次安装命令升级。")
+        return 2
+    print(ok("[+] ") + "%s → 本机：%s" % (rname, text.strip()))
+
+    # 回连验证：让对方用刚登记的地址调本机一次
+    try:
+        text, is_err = c.call("peer_call", {"peer": me["name"], "tool": "peer_info"},
+                              timeout=max(a.timeout, 40))
+    except MCPError as e:
+        text, is_err = str(e), True
+    if is_err:
+        print(warn("[!] ") + "对方回连本机失败：%s" % text.strip()[:300])
+        print("    对方够不着本机的 %s。常见原因：本机在 NAT/容器里。" % me["url"])
+        print("    办法：本机开隧道（bash %s/mcp-tunnel.sh），或用 --self-url 指定对方能访问的地址后重跑 pair。"
+              % me["dir"])
+        return 3
+    print(ok("[+] ") + "双向验证通过：%s 能控制本机，本机也能控制 %s" % (rname, rname))
+    print(dim("    本机控制对方： fleet exec %s 'uptime'" % rname))
+    print(dim("    对方控制本机： 在 %s 上 fleet exec %s 'uptime'，或经 MCP 调 peer_call" % (rname, me["name"])))
+    return 0
+
+
 # ---------------------------------------------------------------- 入口
 
 def build_parser():
@@ -1622,6 +1747,16 @@ def build_parser():
     sp.add_argument("--agent", default="auto")
     sp.add_argument("--timeout", type=int, default=10)
     sp.set_defaults(func=cmd_sync)
+
+    sp = sub.add_parser("pair", help="双向配对：互相登记，之后两边都能控制对方（v3.5）")
+    sp.add_argument("target", help="对方地址 http(s)://ip:3100/mcp，或已登记的名字")
+    sp.add_argument("--token", help="对方的 auth_token（对方开了鉴权必填）")
+    sp.add_argument("--name", help="给对方起的名字（默认用对方自报的 name）")
+    sp.add_argument("--self-url", help="对方回连本机用的地址（默认：本机隧道地址 > 内网 IP:端口）")
+    sp.add_argument("--one-way", action="store_true", help="只把对方登记到本机，不让对方反向登记")
+    sp.add_argument("--port", type=int, default=3100)
+    sp.add_argument("--timeout", type=int, default=20)
+    sp.set_defaults(func=cmd_pair)
 
     sp = sub.add_parser("directory", help="查看/设置地址目录（副端上报地址、主端自动跟随）")
     sp.add_argument("--url", help="地址目录服务地址，如 http://192.168.1.10:8790")
