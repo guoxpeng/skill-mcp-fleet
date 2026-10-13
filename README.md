@@ -1,20 +1,23 @@
 # MCP 副端 Agent · 安装包
 
-给你的设备集群（NAS / 飞牛 OS / 树莓派 / 云主机 / 容器…）装一个「副端」，即可被 WorkBuddy 主端远程操控。
+给你的设备集群（NAS / 飞牛 OS / 树莓派 / 云主机 / 容器…）装一个「副端」，即可被**任意支持 MCP 的 AI agent / 客户端**（主端）远程操控 —— WorkBuddy、Claude Desktop、Claude Code、Cursor、Cline、Cherry Studio、Codex 或你自己写的 agent 都行，不绑定某一家。
 
 ## 一、这是什么
 
 ```
-主端（你的 Windows 电脑，装 WorkBuddy）
-  └── ~/.workbuddy/mcp.json
+主端（任意 MCP 客户端 / agent，任意系统）
+  └── 该客户端自己的 MCP 配置（例：WorkBuddy 的 ~/.workbuddy/mcp.json、
+      Claude Desktop 的 claude_desktop_config.json、Cursor 的 .cursor/mcp.json …）
         ├── nas      → http://192.168.1.10:3100/mcp   副端·远程
         └── fnos     → http://192.168.1.11:3100/mcp   副端·远程（待装）
               │
-副端（各台 Linux 设备，各跑一个 mcp_agent.py，开机自启）
+副端（各台 Linux / Termux / Windows 设备，各跑一个 mcp_agent.py，开机自启）
   └── 命令在设备本机执行，不经 SSH —— 更快、更稳
 ```
 
-**副端 12 个工具**（主端看到的工具名 = `<服务名>__<工具名>`，如 `nas__exec`）：
+副端就是一个**标准的 MCP 服务器**（Streamable HTTP，端点 `/mcp`，可选 `Authorization: Bearer <token>` 鉴权），不依赖任何特定客户端。主端是谁都行，只要它能连 HTTP 类型的 MCP 服务器；只支持 stdio 的客户端可以用 `npx mcp-remote <url>` 桥接一下。下文的示例以 WorkBuddy 为主，换成别的客户端只是**配置文件位置不同**，内容一样。
+
+**副端 17 个工具**（主端看到的工具名 = `<服务名>__<工具名>`，如 `nas__exec`）：
 
 | 工具 | 作用 |
 |---|---|
@@ -204,7 +207,7 @@ bash /opt/<name>_mcp/mcp-tunnel.sh
 
 注意事项：
 
-- 地址是**临时的**，隧道重启就变，换了要同步改主端 `mcp.json` 再重启 WorkBuddy。脚本默认**复用已在运行的隧道**（地址不变，也避免撞限流）；要强制重建用 `CF_FORCE=1 bash mcp-tunnel.sh`。
+- 地址是**临时的**，隧道重启就变，换了要同步改主端的 MCP 配置再重启主端客户端。脚本默认**复用已在运行的隧道**（地址不变，也避免撞限流）；要强制重建用 `CF_FORCE=1 bash mcp-tunnel.sh`。
 - 隧道脚本末尾的「公网访问：xxx」是**从副端本机发起**的 curl，只作参考。**容器里常出现 `000`，但隧道其实是通的**——云容器出网多有限制，本机连不上 Cloudflare 边缘，而 cloudflared 走的 UDP 7844 不受影响。判定以主端为准：
 
   ```bash
@@ -247,7 +250,7 @@ python add_fleet_node.py --name fnos --ip 192.168.1.11 --port 3100          # �
 python add_fleet_node.py --name cloud --url https://xxx.trycloudflare.com/mcp   # 公网隧道
 ```
 
-脚本会探测连通性、按 MCP 规范握手后真实调一次 `exec`，然后自动写进 `~/.workbuddy/mcp.json`。
+脚本会探测连通性、按 MCP 规范握手后真实调一次 `exec`，然后自动写进 `~/.workbuddy/mcp.json`（WorkBuddy 的配置位置；用别的客户端时，照下面的 JSON 手动加到它自己的配置里即可）。
 
 其它用法：
 
@@ -258,17 +261,32 @@ python probe_fleet.py http://192.168.1.11:3100/mcp           # 纯诊断：握�
 python call_node.py  http://192.168.1.11:3100/mcp 'uname -a' # 免重启直接调一次工具
 ```
 
-也可以手改 `mcp.json`：
+也可以手改配置。大多数客户端都是同一种 `mcpServers` 写法，只是文件位置不同：
 
 ```json
 {
   "mcpServers": {
-    "fnos": { "type": "http", "url": "http://192.168.1.11:3100/mcp" }
+    "fnos": {
+      "type": "http",
+      "url": "http://192.168.1.11:3100/mcp",
+      "headers": { "Authorization": "Bearer <你的令牌，未开鉴权可删掉这行>" }
+    }
   }
 }
 ```
 
-**最后一步：重启 WorkBuddy**（或重载 MCP 配置）。MCP 配置改完不会自动生效。
+| 主端客户端 | 配置位置（常见） |
+|---|---|
+| WorkBuddy | `~/.workbuddy/mcp.json` |
+| Claude Desktop | 设置 → 开发者 → 编辑配置（`claude_desktop_config.json`） |
+| Claude Code | `claude mcp add --transport http fnos http://192.168.1.11:3100/mcp` |
+| Cursor | `~/.cursor/mcp.json` 或项目内 `.cursor/mcp.json` |
+| Cline / Cherry Studio 等 | 各自的「MCP 服务器」设置里添加 HTTP 类型服务器 |
+| 只支持 stdio 的客户端 | `"command": "npx", "args": ["mcp-remote", "http://192.168.1.11:3100/mcp"]` |
+
+各客户端的字段名可能略有差异（如 `type` 写成 `streamableHttp` / `transport`），以该客户端文档为准。
+
+**最后一步：重启主端客户端**（或重载 MCP 配置）。MCP 配置改完通常不会自动生效。
 
 ## 四、自建内网分发（可选，设备多时省事）
 
@@ -451,7 +469,7 @@ bash /opt/fnos_mcp/mcp-ctl.sh restart
 | `fleet-http.service` | 内网静态分发服务的 systemd 单元 |
 | `mcp_agent_config.example.json` | 配置样例 |
 | `probe_fleet.py` | 纯诊断脚本（握手 + 列工具 + 调工具），连不上时先用它定位 |
-| `call_node.py` | 直接调用副端工具（不必重启 WorkBuddy），`--list` 列工具、`--tool` 调任意工具 |
+| `call_node.py` | 直接调用副端工具（不必重启主端客户端），`--list` 列工具、`--tool` 调任意工具 |
 | `.gitattributes` | 强制全仓库 LF 换行，防止 Windows 上 clone 后 shell 脚本被转成 CRLF |
 
 > 改了 `mcp_agent.py` 要按顺序重新生成：`python3 build_installer.py && python3 make-offline.py`。
@@ -536,7 +554,7 @@ python3 fleet.py exec cloud "uptime"   # 地址失效时自动纠正后重试
 2. **Python 拼命令不要用 `%` 格式化**——`docker ps --format '{{.Names}}'` 里的 `{{...}}` 会被 `%` 吃掉。代码里已全部改成字符串拼接。
 3. **`sudo -S` 要预喂密码**——`printf '%s\n' <密码> | sudo -S bash -lc <命令>`，否则卡住等输入。
 4. **配置改动不重启不生效**——`systemctl restart <name>-mcp` 或 `mcp-ctl.sh restart`。
-5. **主端 mcp.json 改完必须重启 WorkBuddy**。
+5. **主端 MCP 配置改完必须重启主端客户端**（WorkBuddy、Claude Desktop、Cursor 等都一样）。
 6. **`curl | bash` 时 `$0` 不是文件**——脚本内的 `exec sudo bash "$0"` 会失效，已在 v1.0 修正为检测并提示正确用法。
 7. **别用 `command -v systemctl` 判断有没有 systemd**（v2.0 修复）——容器里这个二进制通常存在，但 PID 1 不是 systemd，`systemctl daemon-reload` 必炸；且 `set -e` 会让整个安装脚本在那里静默中止，前面写的文件全白装。
 8. **不要用 `$!` 记 `setsid nohup ... &` 的 pid**——`setsid` 在「调用者已是进程组长」时会 fork，`$!` 拿到的是马上退出的中间进程，pidfile 直接失效（表现为卸载后隧道/agent 进程残留）。正确做法是让被守护的进程自己写 pidfile，或用 `pgrep -f` 事后回查真实 pid。
