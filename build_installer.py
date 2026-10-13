@@ -110,6 +110,8 @@ KEEPALIVE="1"
 REQUIRE_AUTH="0"
 GEN_TOKEN="0"
 
+# 先存一份原始参数：下面的解析会把 $@ shift 光，非 root 自动 sudo 重执行时要用
+ORIG_ARGS=("$@")
 while [ $# -gt 0 ]; do
   case "$1" in
     --name)       NAME="${2:-}"; shift 2 ;;
@@ -248,7 +250,9 @@ if [ "$(id -u)" -ne 0 ]; then
     warn "当前非 root：agent 只能操作 Termux 沙盒内的文件。如需整机权限，请先 pkg install tsu 再用 tsu 运行本脚本。"
   elif [ -r "$0" ] && command -v sudo >/dev/null 2>&1; then
     echo "[i] 需要 root，自动用 sudo 重新执行"
-    exec sudo -E bash "$0" "$@"
+    # 原来这里用 "$@"，但参数早已被 shift 空 → sudo 重执行后 --name/--port 全丢，
+    # 装成了默认名、默认端口（3100），和主端配置对不上，表现为「连不上/掉线」
+    exec sudo -E bash "$0" ${ORIG_ARGS[@]+"${ORIG_ARGS[@]}"}
   elif [ ! -r "$0" ]; then
     die "检测到管道方式执行（curl | bash）且当前非 root。
     请改用：curl -fsSL <URL> | sudo bash -s -- --name <名字> --port 3100
@@ -420,7 +424,7 @@ else
 {
   "name": "$NAME",
   "tool_prefix": "$PREFIX",
-  "version": "3.3.0",
+  "version": "3.4.0",
   "sudo_password": "$SUDO_PASS",
   "work_dir": "/",
   "command_timeout": 120,
@@ -674,6 +678,10 @@ start() {
   "$PY" "$DIR/_portkill.py" "$PORT" >/dev/null 2>&1 || true
   rm -f "$PIDF"
   cd "$DIR"
+  # Termux：申请唤醒锁，防止 Android 息屏/省电时冻结或杀掉后台进程（手机副端掉线主因）
+  if command -v termux-wake-lock >/dev/null 2>&1; then
+    termux-wake-lock >/dev/null 2>&1 || true
+  fi
   setsid nohup "$DIR/_supervisor.sh" >> "$LOG" 2>&1 < /dev/null &
   for _ in $(seq 1 20); do
     running && break
@@ -1482,6 +1490,99 @@ cfg() { "$PY" -c "import json;print(json.load(open('$CFG')).get('$1',''))" 2>/de
 alive_agent()  { pgrep -f "$DIR/mcp_agent.py" >/dev/null 2>&1; }
 alive_tunnel() { [ -f "$DIR/tunnel.pid" ] && kill -0 "$(cat "$DIR/tunnel.pid" 2>/dev/null)" 2>/dev/null; }
 
+# ---- v3.4 真实探活 ----------------------------------------------------------
+# 原来只看「进程在不在」：agent 线程被半开连接占满/卡死、cloudflared 进程还在但
+# 隧道早已断开时，守护都认为一切正常，主端那头却一直连不上。
+# 现在对 agent 本机端口、隧道公网地址各发一次真实 HTTP 请求，连续失败才处置，
+# 避免网络抖动一次就重启。
+AGENT_FAIL_MAX="${WATCHDOG_AGENT_FAILS:-2}"
+TUNNEL_FAIL_MAX="${WATCHDOG_TUNNEL_FAILS:-3}"
+
+# 输出 HTTP 状态码（连不上为 000）
+http_code() {
+  local url="$1" tok c
+  tok="$(cfg auth_token)"
+  if command -v curl >/dev/null 2>&1 && curl --version >/dev/null 2>&1; then
+    if [ -n "$tok" ]; then
+      c="$(curl -s -m 10 -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $tok" "$url" 2>/dev/null || true)"
+    else
+      c="$(curl -s -m 10 -o /dev/null -w '%{http_code}' "$url" 2>/dev/null || true)"
+    fi
+    echo "${c:-000}"
+    return 0
+  fi
+  "$PY" - "$url" "$tok" <<'CODE_PY_EOF' 2>/dev/null || echo 000
+import sys, urllib.request, urllib.error
+url, tok = sys.argv[1], sys.argv[2]
+req = urllib.request.Request(url)
+if tok:
+    req.add_header("Authorization", "Bearer " + tok)
+try:
+    with urllib.request.urlopen(req, timeout=10) as r:
+        print(r.status)
+except urllib.error.HTTPError as e:
+    print(e.code)
+except Exception:
+    print("000")
+CODE_PY_EOF
+}
+
+# 失败计数（落盘，--once 模式每轮是新进程也能累计）
+fails_get() { cat "$DIR/.wd_$1_fails" 2>/dev/null || echo 0; }
+fails_set() { echo "$2" > "$DIR/.wd_$1_fails" 2>/dev/null || true; }
+
+restart_agent() {
+  if [ -f "/etc/systemd/system/${UNIT}.service" ] && command -v systemctl >/dev/null 2>&1; then
+    systemctl restart "$UNIT" >> "$LOG" 2>&1 || log "systemctl restart 失败"
+  else
+    bash "$DIR/mcp-ctl.sh" restart >> "$LOG" 2>&1 || log "mcp-ctl.sh restart 失败"
+  fi
+  sleep 3
+}
+
+# 进程在但不响应 → 连续 AGENT_FAIL_MAX 轮后重启
+check_agent_health() {
+  local code n
+  code="$(http_code "http://127.0.0.1:$PORT/health")"
+  case "$code" in
+    2*|401|403) fails_set agent 0; return 0 ;;
+  esac
+  n=$(( $(fails_get agent) + 1 ))
+  fails_set agent "$n"
+  log "agent 探活失败 (HTTP $code，第 $n 次)"
+  if [ "$n" -ge "$AGENT_FAIL_MAX" ]; then
+    log "agent 无响应 → 重启"
+    restart_agent
+    fails_set agent 0
+  fi
+}
+
+# 隧道进程在但公网不通 → 连续 TUNNEL_FAIL_MAX 轮后重建
+check_tunnel_health() {
+  local url="$1" code n
+  [ -z "$url" ] && return 0
+  code="$(http_code "${url%/}/health")"
+  case "$code" in
+    2*|401|403) fails_set tunnel 0; return 0 ;;
+  esac
+  n=$(( $(fails_get tunnel) + 1 ))
+  fails_set tunnel "$n"
+  log "隧道公网探活失败 (HTTP $code，第 $n 次) $url"
+  if [ "$n" -ge "$TUNNEL_FAIL_MAX" ]; then
+    # agent 本机都不通时别急着重建隧道（问题在 agent，不在隧道）
+    case "$(http_code "http://127.0.0.1:$PORT/health")" in
+      2*|401|403) ;;
+      *) log "本机 agent 也不通，先不重建隧道"; return 0 ;;
+    esac
+    log "隧道已断 → 重建"
+    [ -f "$DIR/tunnel.pid" ] && kill "$(cat "$DIR/tunnel.pid" 2>/dev/null)" 2>/dev/null || true
+    rm -f "$DIR/tunnel.pid"
+    CF_NO_FALLBACK=0 bash "$DIR/mcp-tunnel.sh" >> "$LOG" 2>&1 || log "隧道重建失败"
+    fails_set tunnel 0
+    sleep 3
+  fi
+}
+
 # 把当前地址上报到「地址目录」，主端据此自动更新，不必手工改 mcp.json
 report() {
   local url="$1" durl dtok name
@@ -1509,7 +1610,7 @@ REPORT_PY_EOF
 
 # 拉起 agent：systemd 环境交给 systemctl（避免和 Restart=always 抢），否则用 mcp-ctl.sh
 ensure_agent() {
-  if alive_agent; then return 0; fi
+  if alive_agent; then check_agent_health; return 0; fi
   if [ -f "/etc/systemd/system/${UNIT}.service" ] && command -v systemctl >/dev/null 2>&1; then
     log "agent 未运行 → systemctl restart $UNIT"
     systemctl restart "$UNIT" >> "$LOG" 2>&1 || log "systemctl restart 失败"
@@ -1528,9 +1629,12 @@ round() {
   if [ ! -f "$DIR/.want_tunnel" ]; then
     return 0
   fi
+  local rebuilt=0
   if ! alive_tunnel; then
     log "隧道进程不在 → 重建（地址会变）"
     CF_NO_FALLBACK=0 bash "$DIR/mcp-tunnel.sh" >> "$LOG" 2>&1 || log "隧道重建失败"
+    fails_set tunnel 0
+    rebuilt=1
     sleep 3
   fi
 
@@ -1543,6 +1647,9 @@ round() {
     url="$(grep -oE 'https://[a-z0-9][a-z0-9-]*\.trycloudflare\.com' "$DIR/tunnel.log" 2>/dev/null | tail -1)"
   fi
   [ -z "$url" ] && { log "还没拿到隧道地址"; return 0; }
+  [ "$rebuilt" = "0" ] && check_tunnel_health "$url"
+  # 重建后地址可能变了，重新读一次
+  [ -f "$DIR/.tunnel_url" ] && url="$(cat "$DIR/.tunnel_url" 2>/dev/null || echo "$url")"
 
   if [ "$(cat "$CUR" 2>/dev/null)" != "$url" ]; then
     echo "$url" > "$CUR"
