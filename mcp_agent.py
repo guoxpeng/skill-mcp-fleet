@@ -795,6 +795,102 @@ def t_http_get(a):
 
 
 # ---------------------------------------------------------------------------
+# 节点间对话邮箱（msg_send / msg_recv）：AI 之间通过一个都能访问的节点互发消息
+# ---------------------------------------------------------------------------
+MAIL_PATH = os.path.join(HERE, "mailbox.jsonl")
+MAIL_CUR = os.path.join(HERE, "mailbox.cursor.json")
+_MAIL_COND = threading.Condition()
+_MAIL = {"msgs": None, "cur": None}
+_MAIL_MAX_TEXT = 64000
+_NAME_RE = re.compile(r"^[A-Za-z0-9_.\-]{1,32}$")
+
+
+def _mail_load():
+    if _MAIL["msgs"] is None:
+        msgs = []
+        if os.path.exists(MAIL_PATH):
+            with io.open(MAIL_PATH, encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if line:
+                        try:
+                            msgs.append(json.loads(line))
+                        except ValueError:
+                            pass
+        _MAIL["msgs"] = msgs[-5000:]
+        cur = {}
+        if os.path.exists(MAIL_CUR):
+            try:
+                with io.open(MAIL_CUR, encoding="utf-8") as f:
+                    cur = json.load(f)
+            except ValueError:
+                cur = {}
+        _MAIL["cur"] = cur
+
+
+def _mail_name(v, field):
+    v = (v or "").strip()
+    if not _NAME_RE.match(v):
+        raise ValueError("%s 只能是 1-32 位字母/数字/_.-" % field)
+    return v
+
+
+def t_msg_send(a):
+    frm = _mail_name(a.get("from"), "from")
+    to = _mail_name(a.get("to"), "to")
+    text = a.get("text") or ""
+    if not text.strip():
+        return "text 不能为空", True
+    if len(text) > _MAIL_MAX_TEXT:
+        return "text 过长（上限 %d 字符）" % _MAIL_MAX_TEXT, True
+    with _MAIL_COND:
+        _mail_load()
+        mid = (_MAIL["msgs"][-1]["id"] + 1) if _MAIL["msgs"] else 1
+        m = {"id": mid, "ts": time.strftime("%Y-%m-%d %H:%M:%S"), "from": frm, "to": to, "text": text}
+        _MAIL["msgs"].append(m)
+        with io.open(MAIL_PATH, "a", encoding="utf-8") as f:
+            f.write(json.dumps(m, ensure_ascii=False) + "\n")
+        _MAIL_COND.notify_all()
+    return "已发送 #%d -> %s" % (mid, to), False
+
+
+def t_msg_recv(a):
+    me = _mail_name(a.get("me"), "me")
+    wait = max(0, min(int(a.get("wait", 0) or 0), 300))
+    peek = bool(a.get("peek"))
+    deadline = time.time() + wait
+    with _MAIL_COND:
+        _mail_load()
+        while True:
+            after = a.get("after_id")
+            after = int(after) if after is not None else int(_MAIL["cur"].get(me, 0))
+            got = [m for m in _MAIL["msgs"] if m["id"] > after and m["to"] in (me, "*") and m["from"] != me]
+            left = deadline - time.time()
+            if got or left <= 0:
+                break
+            _MAIL_COND.wait(min(left, 30))
+        if got and not peek and a.get("after_id") is None:
+            _MAIL["cur"][me] = got[-1]["id"]
+            tmp = MAIL_CUR + ".tmp"
+            with io.open(tmp, "w", encoding="utf-8") as f:
+                f.write(json.dumps(_MAIL["cur"]))
+            os.replace(tmp, MAIL_CUR)
+    if not got:
+        return "（没有新消息）", False
+    return "\n\n".join("#%d [%s] %s -> %s:\n%s" % (m["id"], m["ts"], m["from"], m["to"], m["text"]) for m in got), False
+
+
+def t_msg_history(a):
+    n = max(1, min(int(a.get("lines", 20) or 20), 200))
+    with _MAIL_COND:
+        _mail_load()
+        got = _MAIL["msgs"][-n:]
+    if not got:
+        return "（邮箱为空）", False
+    return "\n".join("#%d [%s] %s -> %s: %s" % (m["id"], m["ts"], m["from"], m["to"], _truncate(m["text"])[:300]) for m in got), False
+
+
+# ---------------------------------------------------------------------------
 # 工具清单（base 名，暴露时按 tool_prefix 加前缀）
 # ---------------------------------------------------------------------------
 BASE_TOOLS = [
@@ -859,6 +955,18 @@ BASE_TOOLS = [
      {"type": "object", "properties": {"job_id": {"type": "string"}}, "required": ["job_id"]}),
     ("exec_jobs", "列出当前所有后台任务（job_id / 状态 / 输出大小）。",
      {"type": "object", "properties": {}}),
+    ("msg_send", "节点间对话：给另一个 AI 发消息（存进本节点邮箱）。from=你的名字, to=对方名字或 *。",
+     {"type": "object", "properties": {
+         "from": {"type": "string"}, "to": {"type": "string"}, "text": {"type": "string"}},
+      "required": ["from", "to", "text"]}),
+    ("msg_recv", "节点间对话：收发给我的新消息；wait=秒（最多300）没有新消息时阻塞等待。默认读后标记已读。",
+     {"type": "object", "properties": {
+         "me": {"type": "string"}, "wait": {"type": "number"},
+         "after_id": {"type": "number", "description": "只取 id 大于它的消息（不改已读位置）"},
+         "peek": {"type": "boolean", "description": "只看不标记已读"}},
+      "required": ["me"]}),
+    ("msg_history", "节点间对话：查看邮箱最近 N 条（所有人）。",
+     {"type": "object", "properties": {"lines": {"type": "number"}}}),
 ]
 
 BASE_FUNCS = {
@@ -869,6 +977,7 @@ BASE_FUNCS = {
     "exec_async": t_exec_async, "exec_poll": t_exec_poll,
     "exec_result": t_exec_result, "exec_kill": t_exec_kill,
     "exec_jobs": t_exec_jobs,
+    "msg_send": t_msg_send, "msg_recv": t_msg_recv, "msg_history": t_msg_history,
 }
 
 # 对外暴露的工具（含前缀）
