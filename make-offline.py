@@ -46,6 +46,7 @@ import base64
 import hashlib
 import os
 import sys
+import gzip
 import zlib
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -55,6 +56,7 @@ OUT_SH = os.path.join(HERE, "install-offline.sh")
 OUT_SUM = os.path.join(HERE, "install-offline.sha256")
 OUT_README = os.path.join(HERE, "install-offline.README.txt")
 PART_FMT = os.path.join(HERE, "install-offline.part%02d.txt")
+OUT_PASTE = os.path.join(HERE, "install-offline.paste.txt")
 
 # base64 字母表 —— 载荷文件里出现这之外的字符就说明混进了说明文字。
 B64_CHARS = set("ABCDEFGHIJKLMNOPQRSTUVWXYZ"
@@ -164,6 +166,51 @@ FLEET_PAYLOAD_END
 """
 
 # 给人看的说明文件。**不要**把这些文字塞进 .b64 / .partNN.txt —— 见文件头「约定」。
+# 粘贴即装（v3.4）：整段复制进副设备终端回车即可，无需传文件、无需网络。
+# 载荷用 gzip（不是 zlib）：这样只靠 coreutils 的 base64 + gzip 就能解，没有 python 也行。
+# 全程不用 exit / set -e（粘贴进的是交互 shell，exit 会把终端关掉）。
+PASTE_TPL = r"""# ===== MCP 副端 v{version} 离线安装：从这一行到最后一行整段复制，粘贴进副设备终端 =====
+# 想改名字/端口：先改下面一行再粘贴（默认名字=主机名，端口=3100）
+FLEET_NAME="${{FLEET_NAME:-$(hostname 2>/dev/null || echo node)}}"; FLEET_PORT="${{FLEET_PORT:-3100}}"
+FLEET_TMP="${{TMPDIR:-/tmp}}"; mkdir -p "$FLEET_TMP" 2>/dev/null
+cat > "$FLEET_TMP/mcp-install.b64" <<'FLEET_B64_EOF'
+{payload}
+FLEET_B64_EOF
+echo "[i] 解码中 ..."
+if command -v base64 >/dev/null 2>&1 && command -v gzip >/dev/null 2>&1 \
+   && base64 -d "$FLEET_TMP/mcp-install.b64" 2>/dev/null | gzip -dc > "$FLEET_TMP/mcp-install.sh" 2>/dev/null \
+   && [ -s "$FLEET_TMP/mcp-install.sh" ]; then :
+else
+  "$(command -v python3 || echo python)" -c "import base64,gzip,sys;open(sys.argv[2],'wb').write(gzip.decompress(base64.b64decode(open(sys.argv[1],'rb').read())))" \
+    "$FLEET_TMP/mcp-install.b64" "$FLEET_TMP/mcp-install.sh"
+fi
+FLEET_SUM="$( (md5sum "$FLEET_TMP/mcp-install.sh" 2>/dev/null || python3 -c "import hashlib,sys;print(hashlib.md5(open(sys.argv[1],'rb').read()).hexdigest())" "$FLEET_TMP/mcp-install.sh" 2>/dev/null) | awk '{{print $1}}')"
+if [ "$FLEET_SUM" = "{md5}" ]; then
+  echo "[ok] 校验通过（md5 {md5}），开始安装：name=$FLEET_NAME port=$FLEET_PORT"
+  if [ "$(id -u)" = "0" ] || ! command -v sudo >/dev/null 2>&1; then
+    bash "$FLEET_TMP/mcp-install.sh" --name "$FLEET_NAME" --port "$FLEET_PORT"
+  else
+    sudo bash "$FLEET_TMP/mcp-install.sh" --name "$FLEET_NAME" --port "$FLEET_PORT"
+  fi
+else
+  echo "[x] 校验失败（得到 ${{FLEET_SUM:-空}}，应为 {md5}）：粘贴不完整或被改动，请整段重新复制"
+fi
+rm -f "$FLEET_TMP/mcp-install.b64"
+# ===== 粘贴到此结束 =====
+"""
+
+
+def _paste_payload(raw):
+    """gzip(mtime=0) 保证同一份 install.sh 每次生成的结果一致。"""
+    return base64.b64encode(gzip.compress(raw, 9, mtime=0)).decode("ascii")
+
+
+def _version_of(raw):
+    import re as _re
+    m = _re.search(rb'"version": "([0-9.]+)"', raw)
+    return m.group(1).decode() if m else "?"
+
+
 OFFLINE_README = """MCP 副端 · 全离线安装包说明
 ============================================================
 内嵌的是 install.sh：{size} 字节，md5 {md5}
@@ -190,6 +237,15 @@ OFFLINE_README = """MCP 副端 · 全离线安装包说明
     python3 -c "import base64,zlib;open('/tmp/mcp-install.sh','wb').write(zlib.decompress(base64.b64decode(open('install-offline.b64','rb').read())))"
     md5sum /tmp/mcp-install.sh      # 应为 {md5}
     sudo bash /tmp/mcp-install.sh --name <名字> --port 3100
+
+------------------------------------------------------------
+【0】install-offline.paste.txt —— 最省事：整段复制，粘贴进终端回车
+------------------------------------------------------------
+打开这个文件，从第一行到最后一行**全部复制**，粘贴到副设备终端里回车即可：
+自动解码 → 校验 md5 → 安装（非 root 自动 sudo）。不用传文件，也不用网络。
+默认名字=主机名、端口=3100；要改就先改文件第 3 行，或粘贴前先执行：
+    export FLEET_NAME=nas FLEET_PORT=3100
+没有 python 也能解（用 base64 + gzip）；校验不过会提示重新复制，不会乱装。
 
 ------------------------------------------------------------
 【3】install-offline.partNN.txt —— 单条消息有长度限制时用
@@ -261,13 +317,17 @@ def do_build(chunk):
     for i, p in enumerate(parts, 1):
         write_lf(PART_FMT % i, p + "\n")
 
+    # 3.2) 粘贴即装：一整段文本，复制进终端回车即可
+    write_lf(OUT_PASTE, PASTE_TPL.format(payload=wrap(_paste_payload(raw)),
+                                         md5=digest, version=_version_of(raw)))
+
     # 3.5) 给人看的说明（命令、校验值）—— 单独一个文件，永远不会被拼进载荷
     write_lf(OUT_README, OFFLINE_README.format(
         size=len(raw), md5=digest, total=total, chunk=chunk))
 
     # 4) 校验和
     lines = []
-    for p in [SRC, OUT_B64, OUT_SH, OUT_README] + [PART_FMT % i for i in range(1, total + 1)]:
+    for p in [SRC, OUT_B64, OUT_SH, OUT_PASTE, OUT_README] + [PART_FMT % i for i in range(1, total + 1)]:
         if os.path.isfile(p):
             lines.append("%s  %s" % (md5_of(p), os.path.basename(p)))
     write_lf(OUT_SUM, "\n".join(lines) + "\n")
@@ -276,6 +336,7 @@ def do_build(chunk):
     print("[+] install-offline.b64   %6d 字节（纯 base64，可直接粘贴）" % os.path.getsize(OUT_B64))
     print("[+] install-offline.sh    %6d 字节（自解压，只需这一个文件）" % os.path.getsize(OUT_SH))
     print("[+] 分片 %d 片，每片 %d 字符 → %s" % (total, chunk, os.path.basename(PART_FMT % 1)))
+    print("[+] install-offline.paste.txt %6d 字节（整段复制进终端即装）" % os.path.getsize(OUT_PASTE))
     print("[+] 说明 %s" % os.path.basename(OUT_README))
     print("[+] 校验和 %s" % os.path.basename(OUT_SUM))
     print()
@@ -381,8 +442,30 @@ def do_check():
         print("[x] 没有分片文件")
         ok = False
 
+    # 粘贴即装：按用户实际会做的方式（bash 执行解码段）不好在这里跑，
+    # 所以等价地切出 heredoc 载荷 → base64 → gunzip → 与 install.sh 比对
+    if os.path.isfile(OUT_PASTE):
+        txt = open(OUT_PASTE, encoding="utf-8").read()
+        try:
+            body = txt.split("<<'FLEET_B64_EOF'\n", 1)[1].split("\nFLEET_B64_EOF\n", 1)[0]
+            got = gzip.decompress(base64.b64decode(body))
+            if got == raw:
+                print("[+] install-offline.paste.txt 解出与 install.sh 一致")
+            else:
+                print("[x] install-offline.paste.txt 解出内容与 install.sh 不一致")
+                ok = False
+            if hashlib.md5(raw).hexdigest() not in txt:
+                print("[x] install-offline.paste.txt 里的 md5 过期")
+                ok = False
+        except Exception as e:
+            print("[x] install-offline.paste.txt 解不开: %r" % (e,))
+            ok = False
+    else:
+        print("[x] 缺 %s" % os.path.basename(OUT_PASTE))
+        ok = False
+
     # 自解压脚本必须是 LF（CRLF 会让 bash 报错）
-    for p in (OUT_SH, SRC):
+    for p in (OUT_SH, OUT_PASTE, SRC):
         if os.path.isfile(p):
             n = open(p, "rb").read().count(b"\r\n")
             if n:
