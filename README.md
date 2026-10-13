@@ -1,23 +1,26 @@
-# MCP 副端 Agent · 安装包
+# MCP Fleet · 节点互控安装包
 
-给你的设备集群（NAS / 飞牛 OS / 树莓派 / 云主机 / 容器…）装一个「副端」，即可被**任意支持 MCP 的 AI agent / 客户端**（主端）远程操控 —— WorkBuddy、Claude Desktop、Claude Code、Cursor、Cline、Cherry Studio、Codex 或你自己写的 agent 都行，不绑定某一家。
+给你的设备集群（NAS / 飞牛 OS / 树莓派 / 云主机 / 容器 / 手机…）每台装一个「节点」，即可被**任意支持 MCP 的 AI agent / 客户端**远程操控 —— WorkBuddy、Claude Desktop、Claude Code、Cursor、Cline、Cherry Studio、Codex 或你自己写的 agent 都行，不绑定某一家。
+
+**v3.5 起不分主端副端**：每个节点既能被控制，也能去控制别的节点（自带 `fleet` 命令和 `peer_call` 工具）。谁发起连接，谁就是这一次的控制方；两台节点 `fleet pair` 一下就能**双向互控**。下文沿用的「主端 / 副端」只是指**这一次连接里的控制方 / 被控方**，不是固定身份。
 
 ## 一、这是什么
 
 ```
-主端（任意 MCP 客户端 / agent，任意系统）
+控制方（任意 MCP 客户端 / agent，或任意一个节点自带的 fleet）
   └── 该客户端自己的 MCP 配置（例：WorkBuddy 的 ~/.workbuddy/mcp.json、
       Claude Desktop 的 claude_desktop_config.json、Cursor 的 .cursor/mcp.json …）
         ├── nas      → http://192.168.1.10:3100/mcp   副端·远程
         └── fnos     → http://192.168.1.11:3100/mcp   副端·远程（待装）
               │
-副端（各台 Linux / Termux / Windows 设备，各跑一个 mcp_agent.py，开机自启）
-  └── 命令在设备本机执行，不经 SSH —— 更快、更稳
+节点（各台 Linux / Termux / Windows 设备，各跑一个 mcp_agent.py，开机自启）
+  ├── 命令在设备本机执行，不经 SSH —— 更快、更稳
+  └── 节点之间可互相调用（peer_call），A ⇄ B 双向，也能 A → B → C 多跳进内网
 ```
 
 副端就是一个**标准的 MCP 服务器**（Streamable HTTP，端点 `/mcp`，可选 `Authorization: Bearer <token>` 鉴权），不依赖任何特定客户端。主端是谁都行，只要它能连 HTTP 类型的 MCP 服务器；只支持 stdio 的客户端可以用 `npx mcp-remote <url>` 桥接一下。下文的示例以 WorkBuddy 为主，换成别的客户端只是**配置文件位置不同**，内容一样。
 
-**副端 17 个工具**（主端看到的工具名 = `<服务名>__<工具名>`，如 `nas__exec`）：
+**每个节点 22 个工具**（主端看到的工具名 = `<服务名>__<工具名>`，如 `nas__exec`）：
 
 | 工具 | 作用 |
 |---|---|
@@ -29,6 +32,9 @@
 | `systemctl` / `service_logs` | 服务启停状态 / 服务日志（journalctl） |
 | `sysinfo` | 主机/负载/内存/磁盘/CPU TOP5 |
 | `http_get` | 在设备本机发 HTTP（测本机服务） |
+| `peers` / `peer_info` | 列出本节点认识的对等节点（`check:true` 顺带探活）/ 本节点名字与回连地址（v3.5） |
+| `peer_call` | 经本节点调用另一个节点的任意工具，可多跳转发（v3.5） |
+| `peer_add` / `peer_remove` | 增删对等节点（名字 + 地址 + 令牌）（v3.5） |
 
 ## 二、下载并安装（在**副设备**上）
 
@@ -70,7 +76,7 @@ curl -fsSL https://api.github.com/repos/guoxpeng/skill-mcp-fleet/contents/instal
 sudo bash install.sh --name fnos --port 3100
 ```
 
-各通道内容一致，MD5 `0cb12b52c8279ed4d44b9b8c2ec11e61`（133808 B，v3.4）。
+各通道内容一致，MD5 `e741f3b82ca100acddd161639e8645d5`（227169 B，v3.5）。
 
 ### 方式 C：完全离线 · 粘贴即装（副设备连不上网 / 下载不到时）
 
@@ -96,6 +102,36 @@ export FLEET_NAME=nas FLEET_PORT=3100
 - 需要带隧道 / 令牌等更多参数时，用方式 A 或下面的 `install-offline.sh`：
   `sudo bash install-offline.sh --name nas --port 3100 --tunnel --generate-token --require-auth`
 - 其他离线形态（单文件自解压、纯 base64、分片）的用法见 [`install-offline.README.txt`](install-offline.README.txt)
+
+### 节点双向互控（v3.5，不分主副）
+
+装完的每个节点都自带控制端 `fleet` 命令（Termux 装在 `$PREFIX/bin`，Linux 装在 `/usr/local/bin`），以及 `peers` / `peer_call` 等 MCP 工具。两台节点**配对一次**，之后谁都能控制谁：
+
+```bash
+# 在节点 A 上执行（B 的地址和令牌在 B 安装完成时会打印）
+fleet pair http://<B的IP>:3100/mcp --token <B的令牌>
+```
+
+`pair` 会依次：把 B 登记到 A → 让 B 把 A 登记过去（用 A 的地址和令牌）→ 让 B 回连 A 验证。看到「双向验证通过」就好了：
+
+```bash
+fleet exec nas 'uptime'          # 在 A 上控制 B
+fleet exec phone 'uptime'        # 在 B 上控制 A
+fleet list                       # 看本节点认识谁
+```
+
+AI 那边同样适用：MCP 客户端只要连上**任意一个**节点，就能用 `peer_call` 控制它认识的其他节点，例如
+`peer_call {peer: "nas", tool: "exec", arguments: {command: "docker ps"}}`；还能多跳（A → B → C）进入 A 直接够不着的内网。
+
+要点：
+
+- **对等节点表**存在各节点的 `<安装目录>/peers.json`（权限 0600），`fleet` 命令和 `peer_*` 工具共用这一份；重装不会丢
+- **回连地址**：默认用本机隧道地址（`current_url.txt`），没有隧道就用内网 IP:端口；对方够不着时用 `fleet pair … --self-url <对方能访问的地址>`，或在配置里写 `self_url`
+- **防成环**：转发经过的跳数由请求头 `X-Fleet-Hops` 计数，超过 `peer_max_hops`（默认 3）直接拒绝
+- 内网 / 本机地址的对等调用**不走 http_proxy**，避免设备上配了代理时局域网节点连不上
+- 只想单向（例如对方不该反过来控制你）：`fleet pair … --one-way`；整个关掉对等功能：配置里 `"peer_tools": false`
+- 安全提醒：持有某节点令牌的人，能经它的 `peer_call` 使用它保存的其他节点令牌。**互相配对的节点等于同一个信任域**，令牌要保管好，公网节点务必开 `--require-auth`
+- 没装节点的纯控制端（比如只装了 WorkBuddy 的 Windows 电脑）照旧用仓库里的 `fleet.py`，`pair` 会自动降级为单向登记
 
 ### 从旧版本升级到 v3.4（修复副端掉线）
 
@@ -454,7 +490,8 @@ bash /opt/fnos_mcp/mcp-ctl.sh restart
 | 文件 | 用途 |
 |---|---|
 | `install.sh` | **一键安装脚本**（自包含，已内嵌服务器代码）——拷这一个文件就够了 |
-| `fleet.py` | **主端统一 CLI**（零依赖）：列节点 / 体检 / 执行命令 / 调工具 / 注册 / 地址跟随。**改完配置立即可用，不必重启 agent** |
+| `fleet.py` | **统一控制端 CLI**（零依赖）：列节点 / 体检 / 执行命令 / 调工具 / 注册 / 地址跟随 / `pair` 双向配对。v3.5 起每个节点都自带一份（`fleet` 命令）；纯控制端电脑直接用仓库里这份 |
+| `peers.json`（安装后生成） | 本节点的对等节点表（名字 / 地址 / 令牌），`fleet` 命令与 `peer_*` 工具共用，0600 |
 | `install-offline.paste.txt` | **粘贴即装**：整段复制进副设备终端回车，自动解码 + 校验 md5 + 安装（内嵌 `base64(gzip(install.sh))`） |
 | `install-offline.sh` | **自解压安装脚本**，内嵌了 install.sh，只需传这一个文件 |
 | `install-offline.b64` | 离线载荷 = `base64(zlib(install.sh))`，**纯 base64 无注释行**（**不是 tar 包**，只需 python3） |
@@ -542,6 +579,12 @@ python3 fleet.py exec cloud "uptime"   # 地址失效时自动纠正后重试
 `DELETE /nodes?name=<n>`。零依赖，落盘 `~/.mcp-fleet/directory.json`。
 
 ## 九、已踩过的坑（别重犯）
+
+### v3.5 新增踩过的坑
+
+1. **配置文件里的 `version` 不能当真实版本**——配置重装时不覆盖，旧值会一直留着，状态页显示成老版本，让人以为没升级。现在版本号以代码为准。
+2. **对等调用要绕开代理**——设备上设了 `http_proxy` 时，`urllib` 会把 `http://192.168.x.x` 也丢给代理，返回莫名其妙的 404。内网/本机地址一律直连。
+3. **互相转发必须限跳数**——A 的 `peer_call` 调 B 的 `peer_call` 再调回 A……没有上限就会把两边线程耗光。
 
 ### v3.4 新增踩过的坑
 
