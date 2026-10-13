@@ -39,13 +39,28 @@ def list_nodes(agent):
         return {}
 
 
-def probe_node(name, agent):
+def _is_tailnet_url(url):
+    """Tailscale 内网地址（100.64.0.0/10 / fd7a:115c:a1e0::/48）？"""
+    import ipaddress
+    import urllib.parse
+    try:
+        host = urllib.parse.urlparse(url or "").hostname or ""
+        ip = ipaddress.ip_address(host.strip("[]"))
+    except ValueError:
+        return False
+    return (ip in ipaddress.ip_network("100.64.0.0/10")
+            or ip in ipaddress.ip_network("fd7a:115c:a1e0::/48"))
+
+
+def probe_node(name, url, agent):
     """返回 (ok: bool, detail: str)"""
     r = subprocess.run([sys.executable, FLEET, "probe", name,
                         "--agent", agent, "--no-sync"],
                        capture_output=True, text=True, timeout=60)
     out = (r.stdout or "") + (r.stderr or "")
-    ok = "[+] MCP 握手成功" in out
+    # Tailscale 内网节点：后台任务的 POST 会被运行时网络策略拦截，
+    # 只能做 GET 探活——"[+] HTTP 可达"（副端返回了 server/version 信息）即视为在线。
+    ok = ("[+] HTTP 可达" in out) if _is_tailnet_url(url) else ("[+] MCP 握手成功" in out)
     # 提炼一行摘要
     detail = ""
     for line in out.splitlines():
@@ -66,7 +81,9 @@ def main():
     prev = load_state()
     cur, changes = {}, []
     for name in sorted(nodes):
-        ok, detail = probe_node(name, agent)
+        info = nodes[name] or {}
+        url = info.get("url") if isinstance(info, dict) else info
+        ok, detail = probe_node(name, url, agent)
         cur[name] = {"ok": ok, "detail": detail}
         was = prev.get(name, {}).get("ok")
         if was is None:

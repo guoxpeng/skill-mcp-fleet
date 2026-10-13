@@ -52,6 +52,7 @@ target 写法
   python fleet.py sync cloud
 """
 import argparse
+import ipaddress
 import json
 import os
 import re
@@ -62,6 +63,7 @@ import subprocess
 import sys
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 
 # ---------------------------------------------------------------- 基础
@@ -107,6 +109,49 @@ def die(msg, code=1):
     return code
 
 
+# ---------------------------------------------------------------- 传输：Tailscale 内网走隧道代理
+
+def _tailnet_proxy_url():
+    """Tailscale 内网地址要走的隧道代理。
+
+    沙盒直连被运行时网络策略拦截，tailnet 流量必须经托管隧道代理
+    （与 HTTPS_PROXY 同主机、端口 3130）。显式设置 FLEET_TAILNET_PROXY
+    可覆盖；找不到代理时返回 None（保持直连旧行为）。
+    """
+    explicit = os.environ.get("FLEET_TAILNET_PROXY", "").strip()
+    if explicit:
+        return explicit
+    for var in ("HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy"):
+        v = os.environ.get(var, "")
+        if v and "hatch-egress-proxy" in v:
+            head, sep, _port = v.rpartition(":")
+            if sep:
+                return head + ":3130"
+    return None
+
+
+def _is_tailnet_host(host):
+    try:
+        ip = ipaddress.ip_address((host or "").strip("[]"))
+    except ValueError:
+        return False
+    return (ip in ipaddress.ip_network("100.64.0.0/10")
+            or ip in ipaddress.ip_network("fd7a:115c:a1e0::/48"))
+
+
+def _urlopen(req, timeout=None):
+    """urlopen 的封装：Tailscale 内网地址自动走隧道代理，其余直连。"""
+    host = urllib.parse.urlparse(req.full_url).hostname or ""
+    proxy = _tailnet_proxy_url() if _is_tailnet_host(host) else None
+    if proxy:
+        opener = urllib.request.build_opener(
+            urllib.request.ProxyHandler({"http": proxy, "https": proxy}))
+        return opener.open(req, timeout=timeout) if timeout is not None else opener.open(req)
+    if timeout is not None:
+        return urllib.request.urlopen(req, timeout=timeout)
+    return urllib.request.urlopen(req)
+
+
 # ---------------------------------------------------------------- MCP 客户端
 
 
@@ -125,35 +170,58 @@ class MCPClient:
         self.token = (token or "").strip()
 
     # -- 传输层 --------------------------------------------------
-    def _post(self, payload, timeout=None):
+    def _post(self, payload, timeout=None, retry=False):
+        """retry=True 时，对连接类错误（URLError/超时）重试一次（1s 退避）。
+
+        只用于 initialize / tools/list 这类幂等只读调用 —— exec 等写操作
+        绝不能自动重试（会执行两次）。"""
         data = json.dumps(payload).encode("utf-8")
-        req = urllib.request.Request(
-            self.url, data=data, method="POST",
-            headers={"Content-Type": "application/json",
-                     "Accept": "application/json, text/event-stream"})
-        if self.token:
-            req.add_header("Authorization", "Bearer " + self.token)
-        if self.sid:
-            req.add_header("Mcp-Session-Id", self.sid)
-        try:
-            with urllib.request.urlopen(req, timeout=timeout or self.timeout) as r:
-                if r.headers.get("Mcp-Session-Id"):
-                    self.sid = r.headers["Mcp-Session-Id"]
-                body = r.read().decode("utf-8", "ignore")
-        except urllib.error.HTTPError as e:
-            if e.code in (401, 403):
-                hint = ("副端开了鉴权，但本地没有它的 token。\n"
-                        "     补一个： python fleet.py add --name <名字> --url %s --token <令牌>\n"
-                        "     （令牌在副端 /opt/<名字>_mcp/mcp_agent_config.json 的 auth_token，"
-                        "或跑 `bash mcp-ctl.sh` 时打印过）" % self.url) if not self.token else \
-                       ("副端拒绝了令牌（HTTP %d）。确认 auth_token 与主端填的一致，"
-                        "或本机 IP 不在 allow_ips 白名单里。" % e.code)
-                raise MCPError("HTTP %s %s\n     %s" % (e.code, e.reason, hint))
-            raise MCPError("HTTP %s %s" % (e.code, e.reason))
-        except urllib.error.URLError as e:
-            raise MCPError("连不上 %s（%s）" % (self.url, e.reason))
-        except socket.timeout:
-            raise MCPError("超时（%ss）" % (timeout or self.timeout))
+
+        def _once():
+            req = urllib.request.Request(
+                self.url, data=data, method="POST",
+                headers={"Content-Type": "application/json",
+                         "Accept": "application/json, text/event-stream"})
+            if self.token:
+                req.add_header("Authorization", "Bearer " + self.token)
+            if self.sid:
+                req.add_header("Mcp-Session-Id", self.sid)
+            try:
+                with _urlopen(req, timeout=timeout or self.timeout) as r:
+                    if r.headers.get("Mcp-Session-Id"):
+                        self.sid = r.headers["Mcp-Session-Id"]
+                    return r.read().decode("utf-8", "ignore")
+            except urllib.error.HTTPError as e:
+                if e.code in (401, 403):
+                    hint = ("副端开了鉴权，但本地没有它的 token。\n"
+                            "     补一个： python fleet.py add --name <名字> --url %s --token <令牌>\n"
+                            "     （令牌在副端 mcp_agent_config.json 的 auth_token，"
+                            "或跑 `bash mcp-ctl.sh` 时打印过）" % self.url) if not self.token else \
+                           ("副端拒绝了令牌（HTTP %d）。确认 auth_token 与主端填的一致，"
+                            "或本机 IP 不在 allow_ips 白名单里。" % e.code)
+                    raise MCPError("HTTP %s %s\n     %s" % (e.code, e.reason, hint))
+                raise MCPError("HTTP %s %s" % (e.code, e.reason))
+            except urllib.error.URLError as e:
+                raise MCPError("连不上 %s（%s）" % (self.url, e.reason))
+            except socket.timeout:
+                raise MCPError("超时（%ss）" % (timeout or self.timeout))
+
+        attempts = 2 if retry else 1
+        last = None
+        for i in range(attempts):
+            try:
+                body = _once()
+                break
+            except MCPError as e:
+                # 只重试「连不上/超时」这类传输层失败；401/403、HTTP 错误不重试
+                msg = str(e)
+                if retry and ("连不上" in msg or "超时" in msg) and i < attempts - 1:
+                    last = e
+                    time.sleep(1)
+                    continue
+                raise
+        else:
+            raise last
         # 兼容 SSE 帧
         for line in body.splitlines():
             if line.startswith("data:"):
@@ -170,7 +238,7 @@ class MCPClient:
     def handshake(self):
         r = self._post({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {
             "protocolVersion": PROTOCOL, "capabilities": {},
-            "clientInfo": {"name": "mcp-fleet", "version": VERSION}}})
+            "clientInfo": {"name": "mcp-fleet", "version": VERSION}}}, retry=True)
         self.info = r.get("result", {}).get("serverInfo", {}) or {}
         try:
             self._post({"jsonrpc": "2.0", "method": "notifications/initialized",
@@ -180,7 +248,8 @@ class MCPClient:
         return self.info
 
     def list_tools(self):
-        r = self._post({"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}})
+        r = self._post({"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}},
+                       retry=True)
         if "error" in r:
             raise MCPError(str(r["error"]))
         return r.get("result", {}).get("tools", [])
@@ -211,7 +280,7 @@ def http_probe(base_url, timeout=8, token="", retries=3):
     last_err = None
     for attempt in range(max(1, retries + 1)):
         try:
-            with urllib.request.urlopen(req, timeout=timeout) as r:
+            with _urlopen(req, timeout=timeout) as r:
                 return json.loads(r.read().decode("utf-8", "ignore") or "{}")
         except Exception as e:
             last_err = e
@@ -267,11 +336,18 @@ def domain_ok(cur_url, new_url):
     xxx.trycloudflare.com → yyy.trycloudflare.com）。注册域都变了
     （例如跳到 evil.example.com）则拒绝，需人工确认。
     设 FLEET_ALLOW_DOMAIN_CHANGE=1 可显式放行。
+
+    例外：同属一个 tailnet（100.64.0.0/10 / fd7a:115c:a1e0::/48）的 IP 之间
+    漂移直接放行 —— Tailscale 节点重装 / 重登录会换 IP（2026-10-12 手机
+    100.103.118.7 → 100.81.253.35 就是一例），这是常态不是投毒。
+    真正的鉴权由后面的「匿名探活 + Bearer token 探活」两道闸门保证。
     """
     ch, nh = host_of(cur_url), host_of(new_url)
     if not ch or not nh:
         return True
     if ch == nh:
+        return True
+    if _is_tailnet_host(ch) and _is_tailnet_host(nh):
         return True
     same = reg_suffix(ch) == reg_suffix(nh)
     if same:
@@ -293,7 +369,7 @@ def probe_anonymous(url, timeout=6):
         req = urllib.request.Request(
             url, method="POST", data=json.dumps(payload).encode("utf-8"),
             headers={"Content-Type": "application/json", "Accept": "application/json"})
-        with urllib.request.urlopen(req, timeout=timeout) as r:
+        with _urlopen(req, timeout=timeout) as r:
             body = r.read(8192).decode("utf-8", "ignore")
         return ("jsonrpc" in body) or ("serverInfo" in body)
     except urllib.error.HTTPError as e:
@@ -480,7 +556,7 @@ def fetch_directory(url=None, token=None, timeout=6):
     req = urllib.request.Request(url + "/nodes", method="GET")
     if token:
         req.add_header("X-Fleet-Token", token)
-    with urllib.request.urlopen(req, timeout=timeout) as r:
+    with _urlopen(req, timeout=timeout) as r:
         data = json.loads(r.read().decode("utf-8", "ignore") or "{}")
     return data.get("nodes") or {}
 
@@ -553,6 +629,142 @@ def sync_from_directory(name, cur_url=None, timeout=8, quiet=False, verbose=True
     return new_mcp
 
 
+# ------------------------------------------------ Tailscale IP 漂移自动纠正
+# 背景：Tailscale 节点重装 / 重登录会换 IP（如手机 100.103.118.7 →
+# 100.81.253.35），主端登记表里的旧地址随即失效。地址目录（directory）
+# 机制要求额外部署目录服务器，且 domain_ok 本来就拒绝 IP→IP 变更，
+# 所以这里走权威得多的渠道：Tailscale 控制面 API。
+#
+# 一次性准备（老郭操作一次即可）：
+#   1. https://login.tailscale.com/admin/settings/keys → Generate API access token
+#      （或 OAuth client），只需要 devices:read 权限；
+#   2. export TAILSCALE_API_KEY='tskey-api-...'（或写进 ~/.mcp-fleet/nodes.json
+#      顶层的 "tailscale_api_key" —— 注意该文件权限应为 0600）；
+#   3. 给 tailnet 节点登记 MagicDNS 主机名：
+#      python fleet.py add --name phone --ip <当前IP> --tailnet phone --force
+# 之后节点 IP 再漂移，主端会在探测失败时自动用 API 查最新 IP 并更新登记表。
+
+def tailscale_api_key():
+    """Tailscale API 密钥：环境变量优先，其次登记表顶层配置。"""
+    k = (os.environ.get("TAILSCALE_API_KEY") or "").strip()
+    if k:
+        return k
+    try:
+        return (load_registry().get("tailscale_api_key") or "").strip()
+    except Exception:
+        return ""
+
+
+def tailscale_device_ips(timeout=10):
+    """查 Tailscale 控制面，返回 {hostname小写: [ip,...]}。
+
+    无密钥返回 None（调用方据此跳过，不报错）；API 异常则抛给调用方处理。
+    """
+    key = tailscale_api_key()
+    if not key:
+        return None
+    req = urllib.request.Request(
+        "https://api.tailscale.com/api/v2/tailnet/-/devices?fields=all",
+        headers={"Authorization": "Bearer " + key})
+    with _urlopen(req, timeout=timeout) as r:
+        devs = json.loads(r.read().decode("utf-8", "ignore") or "{}").get("devices") or []
+    out = {}
+    for dv in devs:
+        hn = (dv.get("hostname") or dv.get("name") or "").lower()
+        ips = []
+        for a in dv.get("addresses") or []:
+            ip = (a or "").split("/")[0]
+            if ip:
+                ips.append(ip)
+        if hn and ips:
+            out[hn] = ips
+    return out
+
+
+def _pick_tailnet_ip(ips):
+    """优先选 IPv4 tailnet 地址（100.64/10），其次第一个。"""
+    for ip in ips or []:
+        if _is_tailnet_host(ip) and "." in ip:
+            return ip
+    return (ips or [None])[0]
+
+
+def sync_from_tailnet(name, cur_url=None, token="", timeout=8, quiet=False, verbose=True):
+    """用 Tailscale API 纠正节点的漂移 IP。返回新 url；无需/无法纠正返回 None。
+
+    流程：登记表取 tailnet 主机名 → API 查当前 IP → 与现地址比对 →
+    无变化直接返回；有变化则「匿名探活 + Bearer 探活」双验证通过后回写登记表。
+    数据源是用户自己的 tailnet 控制面（可信），再加上 token 鉴权探活，
+    不会被投毒。
+    """
+    try:
+        node = (load_registry().get("nodes") or {}).get(name) or {}
+    except Exception:
+        return None
+    thost = (node.get("tailnet") or "").strip().lower()
+    if not thost:
+        return None
+    try:
+        devs = tailscale_device_ips(timeout)
+    except Exception as e:
+        if not quiet:
+            print(warn("Tailscale API 查询失败：%s" % e), file=sys.stderr)
+        return None
+    if devs is None:
+        if verbose and not quiet:
+            print(dim("未配置 TAILSCALE_API_KEY，跳过 tailnet IP 自动纠正"
+                      "（https://login.tailscale.com/admin/settings/keys 建一个 devices:read 的 token）"),
+                  file=sys.stderr)
+        return None
+    ips = devs.get(thost)
+    if not ips:
+        if not quiet:
+            print(warn("Tailscale 里找不到主机 %r（检查 fleet.py add --tailnet 写的主机名）" % thost),
+                  file=sys.stderr)
+        return None
+    new_ip = _pick_tailnet_ip(ips)
+    if not new_ip:
+        return None
+    cur_host = host_of(cur_url) if cur_url else ""
+    if cur_host and cur_host.lower() == new_ip.lower():
+        return None                      # 没漂移
+    try:
+        from urllib.parse import urlparse
+        port = urlparse(cur_url).port if cur_url else None
+    except Exception:
+        port = None
+    new_mcp = "http://%s:%d/mcp" % (new_ip, port or 3100)
+    if new_mcp == cur_url:
+        return None
+    # ---- 双重验证：先确认对面像副端，再带 token 确认是「我们」的副端 ----
+    if not probe_anonymous(new_mcp, timeout=min(timeout, 6)):
+        if not quiet:
+            print(warn("Tailscale 给的 %s 看起来不是 MCP 副端，放弃纠正" % new_mcp),
+                  file=sys.stderr)
+        return None
+    try:
+        if not http_probe(new_mcp, timeout=min(timeout, 6), token=token):
+            raise RuntimeError("无响应")
+    except Exception:
+        if not quiet:
+            print(warn("Tailscale 给的 %s 鉴权探活失败（副端可能还没起来）" % new_mcp),
+                  file=sys.stderr)
+        return None
+    reg = load_registry()
+    node = (reg.get("nodes") or {}).get(name)
+    if node is not None:
+        old = node.get("url")
+        node["url"] = new_mcp
+        node["url_prev"] = old
+        node["tailnet_ip"] = new_ip
+        node["synced_at"] = int(time.time())
+        save_registry(reg)
+    if verbose:
+        print(ok("tailnet IP 已自动纠正：%s → %s" % (cur_url or "(空)", new_mcp)),
+              file=sys.stderr)
+    return new_mcp
+
+
 def resolve_target(target, agent=None, port=3100, sync=None):
     """名字 → url；也接受直接给地址（URL / IPv4 / 带点的主机名）。返回 (url, meta)。"""
     t = (target or "").strip()
@@ -568,6 +780,15 @@ def resolve_target(target, agent=None, port=3100, sync=None):
             if new:
                 url = new
                 m = dict(m, url=new)
+        # tailnet IP 纠正：directory 机制管不了 Tailscale 漂移，这里补上。
+        # 故意不受 --no-sync 影响（健康看门用 --no-sync 跑 probe，照样能自愈）；
+        # 关掉：FLEET_NO_TAILNET_SYNC=1。无 API key 或无 tailnet 字段时是空操作。
+        if url and os.environ.get("FLEET_NO_TAILNET_SYNC") != "1":
+            new2 = sync_from_tailnet(t, url, token=m.get("token", ""),
+                                    quiet=True, verbose=False)
+            if new2:
+                url = new2
+                m = dict(m, url=new2)
         return url, m
     for n, m in nodes.items():        # 允许 http://... 直接当 key 写进过配置
         if m["url"] == t:
@@ -1297,9 +1518,12 @@ def cmd_add(a):
 
     # 写本地登记表（让不支持 MCP 的 agent 也能用 fleet.py 操控）
     reg = load_registry()
-    reg.setdefault("nodes", {})[a.name] = {"url": url,
-                                           "description": "mcp-fleet 副端",
-                                           "token": token}
+    entry = {"url": url,
+             "description": "mcp-fleet 副端",
+             "token": token}
+    if getattr(a, "tailnet", ""):
+        entry["tailnet"] = a.tailnet.strip().lower()
+    reg.setdefault("nodes", {})[a.name] = entry
     save_registry(reg)
     print(ok("[+] ") + "已登记到 %s" % REGISTRY)
 
@@ -1412,6 +1636,39 @@ def cmd_sync(a):
     print(dim("说明：地址目录里没有的副端不会被改动；登记表里的地址已更新 %d 条。" % changed))
     print(dim("      agent 自己的 mcp.json 不会被动 —— 那边改完要重启 agent，"
               "用 `fleet.py exec` 则立即生效。"))
+    return 0
+
+
+def cmd_tailscale_sync(a):
+    """用 Tailscale API 刷新 tailnet 节点的漂移 IP（需要 TAILSCALE_API_KEY）。"""
+    names = a.names or []
+    reg = load_registry()
+    nodes = reg.get("nodes") or {}
+    if not names:
+        names = [n for n, m in nodes.items() if (m or {}).get("tailnet")]
+    if not names:
+        print(warn("没有登记 tailnet 主机名的节点。用法："))
+        print("  python fleet.py add --name phone --ip <当前IP> --tailnet phone --force")
+        return 1
+    if tailscale_api_key() == "":
+        print(warn("未配置 TAILSCALE_API_KEY。去 https://login.tailscale.com/admin/settings/keys"))
+        print(warn("建一个 devices:read 的 API token，然后 export TAILSCALE_API_KEY='tskey-api-...'"))
+        return 2
+    changed = 0
+    for name in names:
+        m = nodes.get(name) or {}
+        cur = m.get("url") or ""
+        try:
+            new = sync_from_tailnet(name, cur, token=m.get("token", ""),
+                                    timeout=a.timeout, quiet=False, verbose=True)
+        except Exception as e:
+            print(err("[x] %s：%s" % (name, e)))
+            continue
+        flag = ok("CHANGED ") if new else dim("ok      ")
+        print("  %s %-14s %s" % (flag, name, new or cur or "(无地址)"))
+        if new:
+            changed += 1
+    print(dim("共纠正 %d 个节点。" % changed))
     return 0
 
 
@@ -1609,6 +1866,8 @@ def build_parser():
     sp.add_argument("--no-test", action="store_true", help="跳过连通性测试")
     sp.add_argument("--force", action="store_true", help="测试失败也写入")
     sp.add_argument("--timeout", type=int, default=10)
+    sp.add_argument("--tailnet", default="",
+                    help="该副端的 Tailscale MagicDNS 主机名（如 phone）。登记后 IP 漂移可自动纠正")
     sp.set_defaults(func=cmd_add)
 
     sp = sub.add_parser("remove", help="注销副端")
@@ -1622,6 +1881,11 @@ def build_parser():
     sp.add_argument("--agent", default="auto")
     sp.add_argument("--timeout", type=int, default=10)
     sp.set_defaults(func=cmd_sync)
+
+    sp = sub.add_parser("tailscale-sync", help="用 Tailscale API 纠正 tailnet 节点的漂移 IP")
+    sp.add_argument("names", nargs="*", help="要纠正的副端名字（默认全部登记了 tailnet 主机名的）")
+    sp.add_argument("--timeout", type=int, default=10)
+    sp.set_defaults(func=cmd_tailscale_sync)
 
     sp = sub.add_parser("directory", help="查看/设置地址目录（副端上报地址、主端自动跟随）")
     sp.add_argument("--url", help="地址目录服务地址，如 http://192.168.1.10:8790")

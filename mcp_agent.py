@@ -48,7 +48,14 @@ import sys
 import threading
 import time
 import uuid
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from http.server import BaseHTTPRequestHandler, HTTPServer
+try:
+    from http.server import ThreadingHTTPServer
+except ImportError:
+    # Python 3.6 兼容：ThreadingHTTPServer 是 3.7+ 才有的
+    import socketserver
+    class ThreadingHTTPServer(socketserver.ThreadingMixIn, HTTPServer):
+        daemon_threads = True
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 CONFIG_PATH = os.path.join(HERE, "mcp_agent_config.json")
@@ -109,6 +116,28 @@ def load_config():
         except Exception as e:
             print("[warn] 读配置失败，用默认值: %s" % e, file=sys.stderr)
     return cfg
+
+
+# ---- 本机 Tailscale IP 探测（v3.4：供主端诊断「登记 IP vs 实际 IP」）----
+_TS_IP_CACHE = {"ts": 0, "ip": ""}
+def tailscale_ip():
+    """本机 tailscale IPv4（100.64/10），60 秒缓存；没有/失败返回 ""。"""
+    now = time.time()
+    if now - _TS_IP_CACHE["ts"] < 60:
+        return _TS_IP_CACHE["ip"]
+    ip = ""
+    try:
+        p = subprocess.run(["tailscale", "ip", "-4"], capture_output=True,
+                           text=True, timeout=3)
+        for line in (p.stdout or "").splitlines():
+            line = line.strip()
+            if line.startswith("100."):
+                ip = line
+                break
+    except Exception:
+        ip = ""
+    _TS_IP_CACHE.update(ts=now, ip=ip)
+    return ip
 
 
 def save_config(cfg):
@@ -1075,6 +1104,7 @@ class Handler(BaseHTTPRequestHandler):
                     "auth": bool(CFG.get("auth_token") or ""),
                     "allow_ips": CFG.get("allow_ips") or [],
                     "transports": ["POST /mcp (streamable-http)", "GET /sse (sse)"],
+                    "tailscale_ip": tailscale_ip(),
                 })
             self._json(200, body)
             return
