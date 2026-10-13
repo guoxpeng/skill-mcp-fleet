@@ -41,6 +41,8 @@ import hmac
 import ipaddress
 import locale
 import shlex
+import signal
+import socket
 import subprocess
 import sys
 import threading
@@ -63,7 +65,7 @@ for _stream in (sys.stdout, sys.stderr):
 DEFAULT_CONFIG = {
     "name": "node",             # 副端标识（显示在状态页与 serverInfo）
     "tool_prefix": "",          # 工具名前缀，如 "nas_"；留空则用裸名（exec/read/...）
-    "version": "3.3.0",
+    "version": "3.4.0",
     "sudo_password": "",        # 留空且非 root 时会尝试免密 sudo
     "work_dir": "/",            # 默认工作目录
     "command_timeout": 120,     # 秒
@@ -91,6 +93,10 @@ DEFAULT_CONFIG = {
     "max_body_bytes": 1048576,       # 1 MB
     # SSE 并发连接上限，防止线程被常驻连接打满。
     "max_sse_conns": 16,
+    # ---- 稳定性（v3.4）----------------------------------------------------
+    # 单连接空闲多少秒后断开。原来没有超时：隧道/NAT 留下的半开连接会永久占住线程，
+    # 日积月累把 agent 拖到无响应（进程还在，保活守护看不出来）。
+    "socket_timeout": 300,
 }
 
 
@@ -308,6 +314,22 @@ def _wrap(cmd, sudo=False):
     return "sudo -n bash " + flag + " " + shlex.quote(cmd)
 
 
+def _kill_tree(p):
+    """杀掉子进程及其整个进程组（POSIX）；Windows 退化为 kill。"""
+    if p is None:
+        return
+    try:
+        if not _is_windows():
+            os.killpg(p.pid, signal.SIGKILL)
+        else:
+            p.kill()
+    except Exception:
+        try:
+            p.kill()
+        except Exception:
+            pass
+
+
 def run_local(command, sudo=False, timeout=None, work_dir=None, stdin=None):
     """在设备本机执行命令，返回 (exit_code, stdout, stderr)。"""
     t = timeout or CFG.get("command_timeout", 120)
@@ -318,19 +340,30 @@ def run_local(command, sudo=False, timeout=None, work_dir=None, stdin=None):
         argv = ["cmd", "/c", command]
     else:
         argv = ["bash", "-c", _wrap(command, sudo=sudo)]
+    p = None
     try:
-        p = subprocess.run(
+        # POSIX 下放进独立进程组：超时时整组杀掉。原来只杀 bash，
+        # 它拉起的子孙进程（如 `ping`、`tail -f`、后台服务）会成孤儿继续跑，
+        # 还可能攥着管道让 communicate 迟迟不返回，请求线程被拖住。
+        p = subprocess.Popen(
             argv,
             cwd=wd if os.path.isdir(wd) else None,
-            input=stdin.encode("utf-8") if stdin is not None else None,
+            stdin=subprocess.PIPE if stdin is not None else subprocess.DEVNULL,
             stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-            timeout=t,
+            start_new_session=not _is_windows(),
         )
-        return (p.returncode,
-                _decode_output(p.stdout),
-                _decode_output(p.stderr))
+        out, err = p.communicate(
+            input=stdin.encode("utf-8") if stdin is not None else None,
+            timeout=t)
+        return (p.returncode, _decode_output(out), _decode_output(err))
     except subprocess.TimeoutExpired:
-        return -1, "", "[超时 %ss 被终止]" % t
+        _kill_tree(p)
+        try:
+            out, err = p.communicate(timeout=5)
+        except Exception:
+            out, err = b"", b""
+        return (-1, _decode_output(out or b""),
+                (_decode_output(err or b"") + "\n[超时 %ss 被终止]" % t).lstrip())
     except FileNotFoundError:
         return -1, "", "[执行失败] 找不到 shell（Windows 需 cmd，POSIX 需 bash）"
     except Exception as e:
@@ -426,7 +459,9 @@ def t_exec_async(a):
         proc = subprocess.Popen(
             argv,
             cwd=wd if os.path.isdir(wd) else None,
-            stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            start_new_session=not _is_windows())
     except FileNotFoundError:
         return "错误: 找不到 shell（Windows 需 cmd，POSIX 需 bash）", True
     except Exception as e:
@@ -492,11 +527,18 @@ def t_exec_kill(a):
     if not job:
         return "未知 job_id（可能已过期清理）", True
     try:
-        job["proc"].terminate()
+        p = job["proc"]
         try:
-            job["proc"].wait(timeout=5)
+            if not _is_windows():
+                os.killpg(p.pid, signal.SIGTERM)   # 连同子孙进程一起
+            else:
+                p.terminate()
+        except Exception:
+            p.terminate()
+        try:
+            p.wait(timeout=5)
         except subprocess.TimeoutExpired:
-            job["proc"].kill()
+            _kill_tree(p)
         return "[job %s] 已终止" % job["id"], False
     except Exception as e:
         return "终止失败: %r" % (e,), True
@@ -852,6 +894,31 @@ def handle_rpc(msg):
 
 SESSIONS = {}
 
+def _enable_tcp_keepalive(sock):
+    """TCP 保活：对端（主端/隧道）悄悄消失时，内核能在几分钟内发现并断开。"""
+    try:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+        for opt, val in (("TCP_KEEPIDLE", 60), ("TCP_KEEPINTVL", 15), ("TCP_KEEPCNT", 4)):
+            if hasattr(socket, opt):
+                sock.setsockopt(socket.IPPROTO_TCP, getattr(socket, opt), val)
+    except Exception:
+        pass
+
+
+class FleetHTTPServer(ThreadingHTTPServer):
+    daemon_threads = True
+    allow_reuse_address = True
+    request_queue_size = 128
+
+    def handle_error(self, request, client_address):
+        # 单个连接出错不影响整体服务；只记一行，不打整段 traceback
+        e = sys.exc_info()[1]
+        if isinstance(e, (ConnectionError, socket.timeout, TimeoutError)):
+            return
+        print("[%s] 连接 %s 处理异常: %r" % (time.strftime("%F %T"), client_address, e),
+              file=sys.stderr)
+
+
 # SSE 并发计数：每个 /sse 连接会常驻一个 while True 线程，无上限时可被打满。
 SSE_LOCK = threading.Lock()
 SSE_ACTIVE = 0
@@ -859,6 +926,19 @@ SSE_ACTIVE = 0
 
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
+
+    def setup(self):
+        # 空闲超时：读不到下一个请求就关连接，防半开连接永久占线程
+        self.timeout = float(CFG.get("socket_timeout", 300) or 300)
+        super().setup()
+        _enable_tcp_keepalive(self.connection)
+
+    def handle(self):
+        try:
+            super().handle()
+        except (ConnectionError, socket.timeout, TimeoutError, OSError):
+            # 客户端断开/超时属正常现象，静默收尾，别把 traceback 刷进日志
+            self.close_connection = True
 
     def log_message(self, fmt, *args):
         pass
@@ -1015,14 +1095,14 @@ class Handler(BaseHTTPRequestHandler):
             self.wfile.write(("event: endpoint\ndata: /messages?sessionId=%s\n\n" % sid).encode("utf-8"))
             self.wfile.flush()
             try:
-                last = idle = 0
+                idle = 0
                 while True:
                     q = SESSIONS.get(sid, [])
-                    while last < len(q):
-                        payload = json.dumps(q[last], ensure_ascii=False)
+                    # 发一条删一条：原来按下标读、从不清理，长连接内存只增不减
+                    while q:
+                        payload = json.dumps(q.pop(0), ensure_ascii=False)
                         self.wfile.write(("event: message\ndata: %s\n\n" % payload).encode("utf-8"))
                         self.wfile.flush()
-                        last += 1
                     time.sleep(0.2)
                     idle += 1
                     if idle % 100 == 0:
@@ -1034,6 +1114,16 @@ class Handler(BaseHTTPRequestHandler):
                 SESSIONS.pop(sid, None)
                 with SSE_LOCK:
                     SSE_ACTIVE -= 1
+            return
+        if path in ("/mcp", "/rpc"):
+            # MCP 规范：服务端不提供 GET 流时必须回 405。原来回 404，而 404 在规范里
+            # 表示「会话已失效」——部分客户端（含带 Mcp-Session-Id 的重连）据此
+            # 判定掉线、反复重新 initialize，表现为副端时好时坏。
+            self.send_response(405)
+            self.send_header("Allow", "POST, DELETE, OPTIONS")
+            self.send_header("Content-Length", "0")
+            self._cors()
+            self.end_headers()
             return
         self._json(404, {"error": "not found"})
 
@@ -1070,7 +1160,7 @@ def main():
               file=sys.stderr)
         sys.exit(2)
 
-    httpd = ThreadingHTTPServer((args.host, args.port), Handler)
+    httpd = FleetHTTPServer((args.host, args.port), Handler)
     print("MCP 副端 Agent 已启动: %s v%s" % (SERVER_NAME, SERVER_VERSION))
     print("  Streamable HTTP : http://%s:%d/mcp" % (args.host, args.port))
     print("  SSE             : http://%s:%d/sse" % (args.host, args.port))
@@ -1098,6 +1188,10 @@ def main():
         httpd.serve_forever()
     except KeyboardInterrupt:
         print("\n已停止")
+    except Exception as e:
+        # 主循环意外退出：以非零码退出，交给 systemd Restart=always / 守护壳重启
+        print("[FATAL] 服务主循环异常退出: %r" % (e,), file=sys.stderr)
+        sys.exit(1)
 
 
 if __name__ == "__main__":
