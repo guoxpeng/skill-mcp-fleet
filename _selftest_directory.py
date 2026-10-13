@@ -24,6 +24,8 @@ import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 PY = r"<home>\.workbuddy\binaries\python\versions\3.13.12\python.exe"
+if not os.path.exists(PY):
+    PY = sys.executable  # 非 WorkBuddy 环境（Linux/CI）用当前解释器
 SRC = os.path.join(HERE, "fleet-directory.py")
 BASE = os.path.join(HERE, ".selftest_dir_tmp")
 TOK = "DIRTOKEN_XYZ789"
