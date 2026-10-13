@@ -65,7 +65,7 @@ for _stream in (sys.stdout, sys.stderr):
 DEFAULT_CONFIG = {
     "name": "node",             # 副端标识（显示在状态页与 serverInfo）
     "tool_prefix": "",          # 工具名前缀，如 "nas_"；留空则用裸名（exec/read/...）
-    "version": "3.4.0",
+    "version": "3.5.0",
     "sudo_password": "",        # 留空且非 root 时会尝试免密 sudo
     "work_dir": "/",            # 默认工作目录
     "command_timeout": 120,     # 秒
@@ -97,6 +97,11 @@ DEFAULT_CONFIG = {
     # 单连接空闲多少秒后断开。原来没有超时：隧道/NAT 留下的半开连接会永久占住线程，
     # 日积月累把 agent 拖到无响应（进程还在，保活守护看不出来）。
     "socket_timeout": 300,
+    # ---- 对等互控（v3.5）--------------------------------------------------
+    # 不再区分主端/副端：每个节点既能被连，也能通过 peer_* 工具去连别的节点。
+    "peer_tools": True,         # False = 不暴露 peers/peer_call/peer_add/peer_remove
+    "peer_max_hops": 3,         # A→B→C… 最多转几跳，防止互相转发成环
+    "self_url": "",             # 别的节点回连本机用的地址；留空=自动（隧道地址 > 内网 IP）
 }
 
 
@@ -138,7 +143,9 @@ def gen_token():
 
 CFG = load_config()
 SERVER_NAME = CFG.get("name", "node")
-SERVER_VERSION = CFG.get("version", "1.0.0")
+# 版本以代码为准：配置文件里的 version 是安装当时写的，重装时不覆盖，会显示成旧版本
+AGENT_VERSION = DEFAULT_CONFIG["version"]
+SERVER_VERSION = AGENT_VERSION
 PREFIX = CFG.get("tool_prefix", "") or ""
 
 
@@ -755,6 +762,242 @@ def t_http_get(a):
 
 
 # ---------------------------------------------------------------------------
+# 对等互控（v3.5）：节点之间不分主副，任何一台都能经 MCP 调用另一台
+# ---------------------------------------------------------------------------
+# 对等节点表与本机 fleet 命令共用同一个文件：<安装目录>/peers.json（0600）
+PEERS_PATH = os.path.join(HERE, "peers.json")
+PEERS_LOCK = threading.Lock()
+_REQ = threading.local()          # 当前请求带进来的跳数（X-Fleet-Hops）
+try:
+    LISTEN_PORT = int(open(os.path.join(HERE, "port.txt")).read().strip())
+except Exception:
+    LISTEN_PORT = None                # main() 里会按实际监听端口覆盖
+
+
+def load_peers():
+    try:
+        with open(PEERS_PATH, encoding="utf-8") as f:
+            d = json.load(f)
+        if isinstance(d.get("nodes"), dict):
+            return d
+    except Exception:
+        pass
+    return {"nodes": {}}
+
+
+def save_peers(d):
+    tmp = PEERS_PATH + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(d, f, ensure_ascii=False, indent=2)
+        f.write("\n")
+    try:
+        os.chmod(tmp, 0o600)          # 里面有别的节点的令牌
+    except Exception:
+        pass
+    os.replace(tmp, PEERS_PATH)
+
+
+def _lan_ip():
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        s.connect(("10.255.255.255", 1))
+        return s.getsockname()[0]
+    except Exception:
+        return "127.0.0.1"
+    finally:
+        s.close()
+
+
+def self_url():
+    """别的节点回连本机的地址：配置 self_url > 当前隧道地址 > 内网 IP:端口。"""
+    u = (CFG.get("self_url") or "").strip()
+    if not u:
+        try:
+            u = open(os.path.join(HERE, "current_url.txt"), encoding="utf-8").read().strip()
+        except Exception:
+            u = ""
+    if not u:
+        u = "http://%s:%s" % (_lan_ip(), LISTEN_PORT or 3100)
+    u = u.rstrip("/")
+    return u if u.endswith("/mcp") else u + "/mcp"
+
+
+def _norm_mcp_url(u):
+    u = (u or "").strip().rstrip("/")
+    if not u.startswith(("http://", "https://")):
+        u = "http://" + u
+    if not re.search(r"/(mcp|sse)$", u):
+        u += "/mcp"
+    return u
+
+
+def _peer_opener(url):
+    """内网/本机地址不走 http_proxy（设备上配了代理时，局域网对等节点会被代理成 404/超时）。"""
+    import urllib.request
+    import urllib.parse
+    host = urllib.parse.urlsplit(url).hostname or ""
+    direct = host == "localhost" or host.endswith(".local")
+    try:
+        ip = ipaddress.ip_address(host)
+        direct = direct or ip.is_private or ip.is_loopback or ip.is_link_local
+    except ValueError:
+        pass
+    if direct:
+        return urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    return urllib.request.build_opener()
+
+
+def _peer_rpc(url, token, payload, sid, hops, timeout):
+    import urllib.request
+    import urllib.error
+    req = urllib.request.Request(url, data=json.dumps(payload).encode("utf-8"), method="POST",
+                                 headers={"Content-Type": "application/json",
+                                          "Accept": "application/json, text/event-stream",
+                                          "X-Fleet-Hops": str(hops),
+                                          "X-Fleet-From": SERVER_NAME})
+    if token:
+        req.add_header("Authorization", "Bearer " + token)
+    if sid:
+        req.add_header("Mcp-Session-Id", sid)
+    try:
+        with _peer_opener(url).open(req, timeout=timeout) as r:
+            sid = r.headers.get("Mcp-Session-Id") or sid
+            body = r.read().decode("utf-8", "ignore")
+    except urllib.error.HTTPError as e:
+        raise ValueError("对端返回 HTTP %s %s%s" % (e.code, e.reason,
+                         "（令牌不对或本机 IP 不在对端 allow_ips 里）" if e.code in (401, 403) else ""))
+    except Exception as e:
+        raise ValueError("连不上 %s：%s" % (url, getattr(e, "reason", e)))
+    for line in body.splitlines():
+        if line.startswith("data:"):
+            body = line[5:].strip()
+            break
+    return (json.loads(body) if body.strip() else {}), sid
+
+
+def peer_call(url, token, tool, arguments, timeout=130):
+    """对另一个节点做一次完整 MCP 调用：initialize → tools/call。返回 (text, is_err)。"""
+    hops = int(getattr(_REQ, "hops", 0) or 0) + 1
+    if hops > int(CFG.get("peer_max_hops", 3)):
+        raise ValueError("转发跳数超过上限 peer_max_hops=%s，疑似互相转发成环，已拒绝"
+                         % CFG.get("peer_max_hops", 3))
+    r, sid = _peer_rpc(url, token, {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {
+        "protocolVersion": "2024-11-05", "capabilities": {},
+        "clientInfo": {"name": "mcp-fleet-peer:" + SERVER_NAME, "version": SERVER_VERSION}}},
+        None, hops, 20)
+    try:
+        _peer_rpc(url, token, {"jsonrpc": "2.0", "method": "notifications/initialized"},
+                  sid, hops, 10)
+    except ValueError:
+        pass
+    r, _ = _peer_rpc(url, token, {"jsonrpc": "2.0", "id": 2, "method": "tools/call",
+                                  "params": {"name": tool, "arguments": arguments or {}}},
+                     sid, hops, timeout)
+    if "error" in r:
+        return "对端错误: %s" % json.dumps(r["error"], ensure_ascii=False), True
+    res = r.get("result") or {}
+    text = "\n".join(c.get("text", "") for c in res.get("content") or [])
+    return text, bool(res.get("isError"))
+
+
+def _peer_entry(name):
+    nodes = load_peers()["nodes"]
+    if name in nodes:
+        return name, nodes[name]
+    if name.startswith(("http://", "https://")):
+        return name, {"url": name, "token": ""}
+    raise ValueError("没有叫 %r 的对等节点。已知：%s（先用 peer_add 添加，或在本机跑 fleet pair）"
+                     % (name, ", ".join(sorted(nodes)) or "无"))
+
+
+def t_peers(a):
+    nodes = load_peers()["nodes"]
+    lines = ["本机: %s  回连地址: %s" % (SERVER_NAME, self_url()), ""]
+    if not nodes:
+        lines.append("（还没有对等节点。用 peer_add 添加，或在本机跑：fleet pair <对方地址> --token <令牌>）")
+    for n in sorted(nodes):
+        v = nodes[n]
+        st = ""
+        if a.get("check"):
+            try:
+                import urllib.request
+                base = re.sub(r"/(mcp|sse)$", "", v.get("url", ""))
+                req = urllib.request.Request(base + "/health")
+                if v.get("token"):
+                    req.add_header("Authorization", "Bearer " + v["token"])
+                with _peer_opener(base).open(req, timeout=5) as r:
+                    st = "  在线" if r.status == 200 else "  HTTP %s" % r.status
+            except Exception as e:
+                st = "  不通(%s)" % (getattr(e, "reason", None) or type(e).__name__)
+        lines.append("- %s  %s  %s%s" % (n, v.get("url"), "带令牌" if v.get("token") else "无令牌", st))
+    return "\n".join(lines), False
+
+
+def t_peer_call(a):
+    name, v = _peer_entry(a["peer"])
+    if _norm_mcp_url(v.get("url")) == self_url():
+        return "目标就是本机，直接调本机工具即可", True
+    args = a.get("arguments") or {}
+    if isinstance(args, str):
+        args = json.loads(args or "{}")
+    t = int(a.get("timeoutMs") or 130000) / 1000.0
+    text, is_err = peer_call(_norm_mcp_url(v["url"]), v.get("token", ""), a["tool"], args, t)
+    return "[%s → %s] %s\n%s" % (SERVER_NAME, name, a["tool"], text), is_err
+
+
+def t_peer_add(a):
+    name = (a.get("name") or "").strip()
+    if not re.match(r"^[A-Za-z0-9_.-]{1,64}$", name):
+        return "name 只能是字母数字和 _ . -（1~64 位）", True
+    url = _norm_mcp_url(a["url"])
+    with PEERS_LOCK:
+        d = load_peers()
+        old = d["nodes"].get(name)
+        d["nodes"][name] = {"url": url, "token": (a.get("token") or "").strip(),
+                            "added_by": a.get("_from") or "", "updated": int(time.time())}
+        save_peers(d)
+    return "%s对等节点 %s → %s" % ("已更新" if old else "已添加", name, url), False
+
+
+def t_peer_remove(a):
+    with PEERS_LOCK:
+        d = load_peers()
+        if d["nodes"].pop(a["name"], None) is None:
+            return "没有叫 %r 的对等节点" % a["name"], True
+        save_peers(d)
+    return "已移除对等节点 %s" % a["name"], False
+
+
+def t_peer_info(a):
+    """配对用：告诉对方「回连我用哪个地址」。令牌不在这里返回（对方本来就持有）。"""
+    return json.dumps({"name": SERVER_NAME, "url": self_url(), "version": SERVER_VERSION,
+                       "peers": sorted(load_peers()["nodes"])}, ensure_ascii=False), False
+
+
+PEER_TOOLS = [
+    ("peers", "列出本节点认识的对等节点（check=true 顺带探活）。节点之间不分主副，可互相调用。",
+     {"type": "object", "properties": {"check": {"type": "boolean"}}}),
+    ("peer_call", "经本节点调用另一个节点的工具（如 peer=nas, tool=exec, arguments={command:'uptime'}）。可多跳转发进内网。",
+     {"type": "object", "properties": {
+         "peer": {"type": "string", "description": "对等节点名字（见 peers），或完整 http(s)://…/mcp 地址"},
+         "tool": {"type": "string", "description": "对端工具名，如 exec / read / sysinfo / peer_call"},
+         "arguments": {"type": "object", "description": "传给对端工具的参数"},
+         "timeoutMs": {"type": "number"}}, "required": ["peer", "tool"]}),
+    ("peer_add", "添加/更新一个对等节点（名字 + 地址 + 令牌），之后即可用 peer_call 控制它。",
+     {"type": "object", "properties": {
+         "name": {"type": "string"}, "url": {"type": "string"},
+         "token": {"type": "string", "description": "对端的 auth_token，未开鉴权可留空"}},
+      "required": ["name", "url"]}),
+    ("peer_remove", "移除一个对等节点。",
+     {"type": "object", "properties": {"name": {"type": "string"}}, "required": ["name"]}),
+    ("peer_info", "返回本节点名字与回连地址（配对时由对方调用）。",
+     {"type": "object", "properties": {}}),
+]
+PEER_FUNCS = {"peers": t_peers, "peer_call": t_peer_call, "peer_add": t_peer_add,
+              "peer_remove": t_peer_remove, "peer_info": t_peer_info}
+
+
+# ---------------------------------------------------------------------------
 # 工具清单（base 名，暴露时按 tool_prefix 加前缀）
 # ---------------------------------------------------------------------------
 BASE_TOOLS = [
@@ -830,6 +1073,9 @@ BASE_FUNCS = {
     "exec_result": t_exec_result, "exec_kill": t_exec_kill,
     "exec_jobs": t_exec_jobs,
 }
+if CFG.get("peer_tools", True):
+    BASE_TOOLS += PEER_TOOLS
+    BASE_FUNCS.update(PEER_FUNCS)
 
 # 对外暴露的工具（含前缀）
 TOOLS = []
@@ -1007,6 +1253,10 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         if self._guard():
             return
+        try:
+            _REQ.hops = max(0, int(self.headers.get("X-Fleet-Hops") or 0))
+        except ValueError:
+            _REQ.hops = 0
         path = self.path.split("?")[0].rstrip("/")
         # 边界校验：length 原来直接取自请求头且无上限 —— -1 会一直读到 EOF，
         # 超大值会一次性吃满内存，单连接即可长时间占住一个线程。
@@ -1160,6 +1410,8 @@ def main():
               file=sys.stderr)
         sys.exit(2)
 
+    global LISTEN_PORT
+    LISTEN_PORT = args.port
     httpd = FleetHTTPServer((args.host, args.port), Handler)
     print("MCP 副端 Agent 已启动: %s v%s" % (SERVER_NAME, SERVER_VERSION))
     print("  Streamable HTTP : http://%s:%d/mcp" % (args.host, args.port))
