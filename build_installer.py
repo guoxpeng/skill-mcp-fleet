@@ -26,6 +26,11 @@ SRC = os.path.join(HERE, "mcp_agent.py")
 OUT = os.path.join(HERE, "install.sh")
 
 agent_src = io.open(SRC, encoding="utf-8").read()
+# v3.5：节点不分主副 —— 每个节点同时带上控制端 fleet.py（装成 `fleet` 命令）
+fleet_src = io.open(os.path.join(HERE, "fleet.py"), encoding="utf-8").read()
+for line in fleet_src.splitlines():
+    if line.strip() == "FLEET_PY_EOF":
+        raise SystemExit("fleet.py 里出现了与内嵌定界符冲突的行，请更换定界符")
 
 # 安全检查：内嵌用的定界符绝不能出现在源码行首
 for line in agent_src.splitlines():
@@ -309,6 +314,9 @@ if [ "$UNINSTALL" = "1" ]; then
   if [ -x "$DIR/_portkill.py" ] || [ -f "$DIR/_portkill.py" ]; then
     command -v python3 >/dev/null 2>&1 && python3 "$DIR/_portkill.py" "$PORT" >/dev/null 2>&1 || true
   fi
+  for _fb in /usr/local/bin/fleet "${_TERMUX_PREFIX:-/nonexistent}/bin/fleet"; do
+    grep -q "$DIR/fleet.py" "$_fb" 2>/dev/null && rm -f "$_fb"
+  done
   rm -rf "$DIR"
   log "已卸载（目录 $DIR 已删除）"
   exit 0
@@ -412,6 +420,28 @@ cat > "$DIR/mcp_agent.py" <<'MCP_AGENT_PY_EOF'
 __AGENT_SOURCE__
 MCP_AGENT_PY_EOF
 
+# ---------- v3.5：对等互控 —— 本节点也带控制端，装成 `fleet` 命令 ----------
+# 节点目录里的 fleet.py 与 agent 共用 $DIR/peers.json：
+#   在本机 `fleet pair/exec` 登记的对方，AI 经 MCP 调 peers/peer_call 也能用，反之亦然。
+cat > "$DIR/fleet.py" <<'FLEET_PY_EOF'
+__FLEET_SOURCE__
+FLEET_PY_EOF
+FLEET_BIN=""
+if is_termux; then
+  FLEET_BIN="${_TERMUX_PREFIX:-/data/data/com.termux/files/usr}/bin/fleet"
+elif [ -d /usr/local/bin ] && [ -w /usr/local/bin ]; then
+  FLEET_BIN="/usr/local/bin/fleet"
+fi
+if [ -n "$FLEET_BIN" ] \
+   && printf '#!/usr/bin/env bash\n# mcp-fleet 节点 %s 的控制端（install.sh 生成）\nexec "%s" "%s/fleet.py" "$@"\n' \
+        "$NAME" "$PY3" "$DIR" > "$FLEET_BIN" 2>/dev/null; then
+  chmod +x "$FLEET_BIN" 2>/dev/null || true
+  log "控制端命令: fleet（$FLEET_BIN → $DIR/fleet.py）"
+else
+  FLEET_BIN=""
+  warn "没装上 fleet 命令（无写权限），用 $PY3 $DIR/fleet.py 代替"
+fi
+
 # 配置文件（已存在则不覆盖，避免冲掉你的设置）
 CFG_PREEXIST="0"
 if [ -f "$DIR/mcp_agent_config.json" ]; then
@@ -424,7 +454,7 @@ else
 {
   "name": "$NAME",
   "tool_prefix": "$PREFIX",
-  "version": "3.4.0",
+  "version": "3.5.0",
   "sudo_password": "$SUDO_PASS",
   "work_dir": "/",
   "command_timeout": 120,
@@ -467,7 +497,7 @@ if dtok:
     d["directory_token"] = dtok
 if reqauth == "1":
     d["require_auth"] = True
-d["version"] = "3.1.0"
+d["version"] = "3.5.0"
 d.setdefault("name", "")
 with open(p, "w", encoding="utf-8") as f:
     json.dump(d, f, ensure_ascii=False, indent=2)
@@ -1917,7 +1947,7 @@ cat <<EOF
  手动前台 : $PY3 -u $DIR/mcp_agent.py --host 0.0.0.0 --port $PORT
 
 ----------------------------------------------------------------------------
- 在主端（WorkBuddy 所在电脑）的 ~/.workbuddy/mcp.json 里加这一段：
+ 想用 AI 直接控制本节点：在任意 MCP 客户端（WorkBuddy / Claude / Cursor …）的配置里加：
 
   "mcpServers": {
     "$NAME": {
@@ -1928,8 +1958,16 @@ $(if [ -n "$AUTH_TOK" ]; then echo "      \"headers\": { \"Authorization\": \"Be
   }
  $URL_NOTE
 
- 加完重启 WorkBuddy（或重载 MCP 配置）即可使用。
- 工具名形如： ${PREFIX}exec / ${PREFIX}sysinfo / ${PREFIX}docker_ps ...
+ 加完重启该客户端（或重载 MCP 配置）即可使用。
+ 工具名形如： ${PREFIX}exec / ${PREFIX}sysinfo / ${PREFIX}peer_call ...
+
+----------------------------------------------------------------------------
+ 节点互控（v3.5，不分主副）：本机已带控制端 $( [ -n "$FLEET_BIN" ] && echo "fleet 命令" || echo "$PY3 $DIR/fleet.py" )
+   和另一个节点双向配对（之后两边都能控制对方）：
+     fleet pair http://<对方IP>:3100/mcp --token <对方令牌>
+   别的节点要配对本机时，填：
+     地址 $MCP_URL$( [ -n "$AUTH_TOK" ] && printf '\n     令牌 %s' "$AUTH_TOK" )
+   配好后： fleet exec <对方名字> 'uptime'   或让 AI 调 peer_call
 
 ----------------------------------------------------------------------------
  可达性自查（重要）：
@@ -1960,7 +1998,7 @@ cat <<NOAUTH_HINT
 
  拿到令牌后，在**主端** mcp.json 的 "$NAME" 条目里补上：
    "headers": { "Authorization": "Bearer <令牌>" }
- 再重启 WorkBuddy。漏了 headers 的话，加完令牌主端就会一直收到 401。
+ 再重启该 MCP 客户端。漏了 headers 的话，加完令牌就会一直收到 401。
 
  或者重装时直接带上参数： --generate-token --require-auth
 ============================================================================
@@ -1968,7 +2006,7 @@ NOAUTH_HINT
 fi
 '''
 
-content = TEMPLATE.replace("__AGENT_SOURCE__", agent_src)
+content = TEMPLATE.replace("__AGENT_SOURCE__", agent_src).replace("__FLEET_SOURCE__", fleet_src)
 with io.open(OUT, "w", encoding="utf-8", newline="\n") as f:
     f.write(content)
 
