@@ -76,6 +76,8 @@ KEEPALIVE="1"
 REQUIRE_AUTH="0"
 GEN_TOKEN="0"
 
+# 先存一份原始参数：下面的解析会把 $@ shift 光，非 root 自动 sudo 重执行时要用
+ORIG_ARGS=("$@")
 while [ $# -gt 0 ]; do
   case "$1" in
     --name)       NAME="${2:-}"; shift 2 ;;
@@ -214,7 +216,9 @@ if [ "$(id -u)" -ne 0 ]; then
     warn "当前非 root：agent 只能操作 Termux 沙盒内的文件。如需整机权限，请先 pkg install tsu 再用 tsu 运行本脚本。"
   elif [ -r "$0" ] && command -v sudo >/dev/null 2>&1; then
     echo "[i] 需要 root，自动用 sudo 重新执行"
-    exec sudo -E bash "$0" "$@"
+    # 原来这里用 "$@"，但参数早已被 shift 空 → sudo 重执行后 --name/--port 全丢，
+    # 装成了默认名、默认端口（3100），和主端配置对不上，表现为「连不上/掉线」
+    exec sudo -E bash "$0" ${ORIG_ARGS[@]+"${ORIG_ARGS[@]}"}
   elif [ ! -r "$0" ]; then
     die "检测到管道方式执行（curl | bash）且当前非 root。
     请改用：curl -fsSL <URL> | sudo bash -s -- --name <名字> --port 3100
@@ -414,6 +418,8 @@ import hmac
 import ipaddress
 import locale
 import shlex
+import signal
+import socket
 import subprocess
 import sys
 import threading
@@ -436,7 +442,7 @@ for _stream in (sys.stdout, sys.stderr):
 DEFAULT_CONFIG = {
     "name": "node",             # 副端标识（显示在状态页与 serverInfo）
     "tool_prefix": "",          # 工具名前缀，如 "nas_"；留空则用裸名（exec/read/...）
-    "version": "3.3.0",
+    "version": "3.4.0",
     "sudo_password": "",        # 留空且非 root 时会尝试免密 sudo
     "work_dir": "/",            # 默认工作目录
     "command_timeout": 120,     # 秒
@@ -464,6 +470,10 @@ DEFAULT_CONFIG = {
     "max_body_bytes": 1048576,       # 1 MB
     # SSE 并发连接上限，防止线程被常驻连接打满。
     "max_sse_conns": 16,
+    # ---- 稳定性（v3.4）----------------------------------------------------
+    # 单连接空闲多少秒后断开。原来没有超时：隧道/NAT 留下的半开连接会永久占住线程，
+    # 日积月累把 agent 拖到无响应（进程还在，保活守护看不出来）。
+    "socket_timeout": 300,
 }
 
 
@@ -681,6 +691,22 @@ def _wrap(cmd, sudo=False):
     return "sudo -n bash " + flag + " " + shlex.quote(cmd)
 
 
+def _kill_tree(p):
+    """杀掉子进程及其整个进程组（POSIX）；Windows 退化为 kill。"""
+    if p is None:
+        return
+    try:
+        if not _is_windows():
+            os.killpg(p.pid, signal.SIGKILL)
+        else:
+            p.kill()
+    except Exception:
+        try:
+            p.kill()
+        except Exception:
+            pass
+
+
 def run_local(command, sudo=False, timeout=None, work_dir=None, stdin=None):
     """在设备本机执行命令，返回 (exit_code, stdout, stderr)。"""
     t = timeout or CFG.get("command_timeout", 120)
@@ -691,19 +717,30 @@ def run_local(command, sudo=False, timeout=None, work_dir=None, stdin=None):
         argv = ["cmd", "/c", command]
     else:
         argv = ["bash", "-c", _wrap(command, sudo=sudo)]
+    p = None
     try:
-        p = subprocess.run(
+        # POSIX 下放进独立进程组：超时时整组杀掉。原来只杀 bash，
+        # 它拉起的子孙进程（如 `ping`、`tail -f`、后台服务）会成孤儿继续跑，
+        # 还可能攥着管道让 communicate 迟迟不返回，请求线程被拖住。
+        p = subprocess.Popen(
             argv,
             cwd=wd if os.path.isdir(wd) else None,
-            input=stdin.encode("utf-8") if stdin is not None else None,
+            stdin=subprocess.PIPE if stdin is not None else subprocess.DEVNULL,
             stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-            timeout=t,
+            start_new_session=not _is_windows(),
         )
-        return (p.returncode,
-                _decode_output(p.stdout),
-                _decode_output(p.stderr))
+        out, err = p.communicate(
+            input=stdin.encode("utf-8") if stdin is not None else None,
+            timeout=t)
+        return (p.returncode, _decode_output(out), _decode_output(err))
     except subprocess.TimeoutExpired:
-        return -1, "", "[超时 %ss 被终止]" % t
+        _kill_tree(p)
+        try:
+            out, err = p.communicate(timeout=5)
+        except Exception:
+            out, err = b"", b""
+        return (-1, _decode_output(out or b""),
+                (_decode_output(err or b"") + "\n[超时 %ss 被终止]" % t).lstrip())
     except FileNotFoundError:
         return -1, "", "[执行失败] 找不到 shell（Windows 需 cmd，POSIX 需 bash）"
     except Exception as e:
@@ -799,7 +836,9 @@ def t_exec_async(a):
         proc = subprocess.Popen(
             argv,
             cwd=wd if os.path.isdir(wd) else None,
-            stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            start_new_session=not _is_windows())
     except FileNotFoundError:
         return "错误: 找不到 shell（Windows 需 cmd，POSIX 需 bash）", True
     except Exception as e:
@@ -865,11 +904,18 @@ def t_exec_kill(a):
     if not job:
         return "未知 job_id（可能已过期清理）", True
     try:
-        job["proc"].terminate()
+        p = job["proc"]
         try:
-            job["proc"].wait(timeout=5)
+            if not _is_windows():
+                os.killpg(p.pid, signal.SIGTERM)   # 连同子孙进程一起
+            else:
+                p.terminate()
+        except Exception:
+            p.terminate()
+        try:
+            p.wait(timeout=5)
         except subprocess.TimeoutExpired:
-            job["proc"].kill()
+            _kill_tree(p)
         return "[job %s] 已终止" % job["id"], False
     except Exception as e:
         return "终止失败: %r" % (e,), True
@@ -1225,6 +1271,31 @@ def handle_rpc(msg):
 
 SESSIONS = {}
 
+def _enable_tcp_keepalive(sock):
+    """TCP 保活：对端（主端/隧道）悄悄消失时，内核能在几分钟内发现并断开。"""
+    try:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+        for opt, val in (("TCP_KEEPIDLE", 60), ("TCP_KEEPINTVL", 15), ("TCP_KEEPCNT", 4)):
+            if hasattr(socket, opt):
+                sock.setsockopt(socket.IPPROTO_TCP, getattr(socket, opt), val)
+    except Exception:
+        pass
+
+
+class FleetHTTPServer(ThreadingHTTPServer):
+    daemon_threads = True
+    allow_reuse_address = True
+    request_queue_size = 128
+
+    def handle_error(self, request, client_address):
+        # 单个连接出错不影响整体服务；只记一行，不打整段 traceback
+        e = sys.exc_info()[1]
+        if isinstance(e, (ConnectionError, socket.timeout, TimeoutError)):
+            return
+        print("[%s] 连接 %s 处理异常: %r" % (time.strftime("%F %T"), client_address, e),
+              file=sys.stderr)
+
+
 # SSE 并发计数：每个 /sse 连接会常驻一个 while True 线程，无上限时可被打满。
 SSE_LOCK = threading.Lock()
 SSE_ACTIVE = 0
@@ -1232,6 +1303,19 @@ SSE_ACTIVE = 0
 
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
+
+    def setup(self):
+        # 空闲超时：读不到下一个请求就关连接，防半开连接永久占线程
+        self.timeout = float(CFG.get("socket_timeout", 300) or 300)
+        super().setup()
+        _enable_tcp_keepalive(self.connection)
+
+    def handle(self):
+        try:
+            super().handle()
+        except (ConnectionError, socket.timeout, TimeoutError, OSError):
+            # 客户端断开/超时属正常现象，静默收尾，别把 traceback 刷进日志
+            self.close_connection = True
 
     def log_message(self, fmt, *args):
         pass
@@ -1388,14 +1472,14 @@ class Handler(BaseHTTPRequestHandler):
             self.wfile.write(("event: endpoint\ndata: /messages?sessionId=%s\n\n" % sid).encode("utf-8"))
             self.wfile.flush()
             try:
-                last = idle = 0
+                idle = 0
                 while True:
                     q = SESSIONS.get(sid, [])
-                    while last < len(q):
-                        payload = json.dumps(q[last], ensure_ascii=False)
+                    # 发一条删一条：原来按下标读、从不清理，长连接内存只增不减
+                    while q:
+                        payload = json.dumps(q.pop(0), ensure_ascii=False)
                         self.wfile.write(("event: message\ndata: %s\n\n" % payload).encode("utf-8"))
                         self.wfile.flush()
-                        last += 1
                     time.sleep(0.2)
                     idle += 1
                     if idle % 100 == 0:
@@ -1407,6 +1491,16 @@ class Handler(BaseHTTPRequestHandler):
                 SESSIONS.pop(sid, None)
                 with SSE_LOCK:
                     SSE_ACTIVE -= 1
+            return
+        if path in ("/mcp", "/rpc"):
+            # MCP 规范：服务端不提供 GET 流时必须回 405。原来回 404，而 404 在规范里
+            # 表示「会话已失效」——部分客户端（含带 Mcp-Session-Id 的重连）据此
+            # 判定掉线、反复重新 initialize，表现为副端时好时坏。
+            self.send_response(405)
+            self.send_header("Allow", "POST, DELETE, OPTIONS")
+            self.send_header("Content-Length", "0")
+            self._cors()
+            self.end_headers()
             return
         self._json(404, {"error": "not found"})
 
@@ -1443,7 +1537,7 @@ def main():
               file=sys.stderr)
         sys.exit(2)
 
-    httpd = ThreadingHTTPServer((args.host, args.port), Handler)
+    httpd = FleetHTTPServer((args.host, args.port), Handler)
     print("MCP 副端 Agent 已启动: %s v%s" % (SERVER_NAME, SERVER_VERSION))
     print("  Streamable HTTP : http://%s:%d/mcp" % (args.host, args.port))
     print("  SSE             : http://%s:%d/sse" % (args.host, args.port))
@@ -1471,6 +1565,10 @@ def main():
         httpd.serve_forever()
     except KeyboardInterrupt:
         print("\n已停止")
+    except Exception as e:
+        # 主循环意外退出：以非零码退出，交给 systemd Restart=always / 守护壳重启
+        print("[FATAL] 服务主循环异常退出: %r" % (e,), file=sys.stderr)
+        sys.exit(1)
 
 
 if __name__ == "__main__":
@@ -1490,7 +1588,7 @@ else
 {
   "name": "$NAME",
   "tool_prefix": "$PREFIX",
-  "version": "3.3.0",
+  "version": "3.4.0",
   "sudo_password": "$SUDO_PASS",
   "work_dir": "/",
   "command_timeout": 120,
@@ -1744,6 +1842,10 @@ start() {
   "$PY" "$DIR/_portkill.py" "$PORT" >/dev/null 2>&1 || true
   rm -f "$PIDF"
   cd "$DIR"
+  # Termux：申请唤醒锁，防止 Android 息屏/省电时冻结或杀掉后台进程（手机副端掉线主因）
+  if command -v termux-wake-lock >/dev/null 2>&1; then
+    termux-wake-lock >/dev/null 2>&1 || true
+  fi
   setsid nohup "$DIR/_supervisor.sh" >> "$LOG" 2>&1 < /dev/null &
   for _ in $(seq 1 20); do
     running && break
@@ -2552,6 +2654,99 @@ cfg() { "$PY" -c "import json;print(json.load(open('$CFG')).get('$1',''))" 2>/de
 alive_agent()  { pgrep -f "$DIR/mcp_agent.py" >/dev/null 2>&1; }
 alive_tunnel() { [ -f "$DIR/tunnel.pid" ] && kill -0 "$(cat "$DIR/tunnel.pid" 2>/dev/null)" 2>/dev/null; }
 
+# ---- v3.4 真实探活 ----------------------------------------------------------
+# 原来只看「进程在不在」：agent 线程被半开连接占满/卡死、cloudflared 进程还在但
+# 隧道早已断开时，守护都认为一切正常，主端那头却一直连不上。
+# 现在对 agent 本机端口、隧道公网地址各发一次真实 HTTP 请求，连续失败才处置，
+# 避免网络抖动一次就重启。
+AGENT_FAIL_MAX="${WATCHDOG_AGENT_FAILS:-2}"
+TUNNEL_FAIL_MAX="${WATCHDOG_TUNNEL_FAILS:-3}"
+
+# 输出 HTTP 状态码（连不上为 000）
+http_code() {
+  local url="$1" tok c
+  tok="$(cfg auth_token)"
+  if command -v curl >/dev/null 2>&1 && curl --version >/dev/null 2>&1; then
+    if [ -n "$tok" ]; then
+      c="$(curl -s -m 10 -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $tok" "$url" 2>/dev/null || true)"
+    else
+      c="$(curl -s -m 10 -o /dev/null -w '%{http_code}' "$url" 2>/dev/null || true)"
+    fi
+    echo "${c:-000}"
+    return 0
+  fi
+  "$PY" - "$url" "$tok" <<'CODE_PY_EOF' 2>/dev/null || echo 000
+import sys, urllib.request, urllib.error
+url, tok = sys.argv[1], sys.argv[2]
+req = urllib.request.Request(url)
+if tok:
+    req.add_header("Authorization", "Bearer " + tok)
+try:
+    with urllib.request.urlopen(req, timeout=10) as r:
+        print(r.status)
+except urllib.error.HTTPError as e:
+    print(e.code)
+except Exception:
+    print("000")
+CODE_PY_EOF
+}
+
+# 失败计数（落盘，--once 模式每轮是新进程也能累计）
+fails_get() { cat "$DIR/.wd_$1_fails" 2>/dev/null || echo 0; }
+fails_set() { echo "$2" > "$DIR/.wd_$1_fails" 2>/dev/null || true; }
+
+restart_agent() {
+  if [ -f "/etc/systemd/system/${UNIT}.service" ] && command -v systemctl >/dev/null 2>&1; then
+    systemctl restart "$UNIT" >> "$LOG" 2>&1 || log "systemctl restart 失败"
+  else
+    bash "$DIR/mcp-ctl.sh" restart >> "$LOG" 2>&1 || log "mcp-ctl.sh restart 失败"
+  fi
+  sleep 3
+}
+
+# 进程在但不响应 → 连续 AGENT_FAIL_MAX 轮后重启
+check_agent_health() {
+  local code n
+  code="$(http_code "http://127.0.0.1:$PORT/health")"
+  case "$code" in
+    2*|401|403) fails_set agent 0; return 0 ;;
+  esac
+  n=$(( $(fails_get agent) + 1 ))
+  fails_set agent "$n"
+  log "agent 探活失败 (HTTP $code，第 $n 次)"
+  if [ "$n" -ge "$AGENT_FAIL_MAX" ]; then
+    log "agent 无响应 → 重启"
+    restart_agent
+    fails_set agent 0
+  fi
+}
+
+# 隧道进程在但公网不通 → 连续 TUNNEL_FAIL_MAX 轮后重建
+check_tunnel_health() {
+  local url="$1" code n
+  [ -z "$url" ] && return 0
+  code="$(http_code "${url%/}/health")"
+  case "$code" in
+    2*|401|403) fails_set tunnel 0; return 0 ;;
+  esac
+  n=$(( $(fails_get tunnel) + 1 ))
+  fails_set tunnel "$n"
+  log "隧道公网探活失败 (HTTP $code，第 $n 次) $url"
+  if [ "$n" -ge "$TUNNEL_FAIL_MAX" ]; then
+    # agent 本机都不通时别急着重建隧道（问题在 agent，不在隧道）
+    case "$(http_code "http://127.0.0.1:$PORT/health")" in
+      2*|401|403) ;;
+      *) log "本机 agent 也不通，先不重建隧道"; return 0 ;;
+    esac
+    log "隧道已断 → 重建"
+    [ -f "$DIR/tunnel.pid" ] && kill "$(cat "$DIR/tunnel.pid" 2>/dev/null)" 2>/dev/null || true
+    rm -f "$DIR/tunnel.pid"
+    CF_NO_FALLBACK=0 bash "$DIR/mcp-tunnel.sh" >> "$LOG" 2>&1 || log "隧道重建失败"
+    fails_set tunnel 0
+    sleep 3
+  fi
+}
+
 # 把当前地址上报到「地址目录」，主端据此自动更新，不必手工改 mcp.json
 report() {
   local url="$1" durl dtok name
@@ -2579,7 +2774,7 @@ REPORT_PY_EOF
 
 # 拉起 agent：systemd 环境交给 systemctl（避免和 Restart=always 抢），否则用 mcp-ctl.sh
 ensure_agent() {
-  if alive_agent; then return 0; fi
+  if alive_agent; then check_agent_health; return 0; fi
   if [ -f "/etc/systemd/system/${UNIT}.service" ] && command -v systemctl >/dev/null 2>&1; then
     log "agent 未运行 → systemctl restart $UNIT"
     systemctl restart "$UNIT" >> "$LOG" 2>&1 || log "systemctl restart 失败"
@@ -2598,9 +2793,12 @@ round() {
   if [ ! -f "$DIR/.want_tunnel" ]; then
     return 0
   fi
+  local rebuilt=0
   if ! alive_tunnel; then
     log "隧道进程不在 → 重建（地址会变）"
     CF_NO_FALLBACK=0 bash "$DIR/mcp-tunnel.sh" >> "$LOG" 2>&1 || log "隧道重建失败"
+    fails_set tunnel 0
+    rebuilt=1
     sleep 3
   fi
 
@@ -2613,6 +2811,9 @@ round() {
     url="$(grep -oE 'https://[a-z0-9][a-z0-9-]*\.trycloudflare\.com' "$DIR/tunnel.log" 2>/dev/null | tail -1)"
   fi
   [ -z "$url" ] && { log "还没拿到隧道地址"; return 0; }
+  [ "$rebuilt" = "0" ] && check_tunnel_health "$url"
+  # 重建后地址可能变了，重新读一次
+  [ -f "$DIR/.tunnel_url" ] && url="$(cat "$DIR/.tunnel_url" 2>/dev/null || echo "$url")"
 
   if [ "$(cat "$CUR" 2>/dev/null)" != "$url" ]; then
     echo "$url" > "$CUR"
