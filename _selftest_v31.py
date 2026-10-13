@@ -133,7 +133,7 @@ def main():
         rec("A4 exec 通路返回合法 JSON-RPC（本机无原生 bash，仅验通路）", okfmt, body[:110])
         st, body = rpc(pA, {"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}})
         n = len(json.loads(body).get("result", {}).get("tools", []))
-        rec("A5 回归 tools/list 正常", n == 17, "tools=%d" % n)
+        rec("A5 回归 tools/list 正常", n == 20, "tools=%d" % n)
     finally:
         procA.kill()
 
@@ -149,7 +149,7 @@ def main():
         st, body, _ = get(pB, {"Authorization": "Bearer TESTTOKEN_ABC123"})
         j = json.loads(body)
         rec("B2 正确凭据 GET / → 200", st == 200, st)
-        rec("B3 认证后可看到工具清单", j.get("tools") == 17, j.get("tools"))
+        rec("B3 认证后可看到工具清单", j.get("tools") == 20, j.get("tools"))
         rec("B4 认证后 auth 字段为 True", j.get("auth") is True, j.get("auth"))
         # 非 ASCII Authorization（老代码在此抛 TypeError）
         c = http.client.HTTPConnection("127.0.0.1", pB, timeout=6)
