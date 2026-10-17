@@ -218,3 +218,129 @@ class TestDeliverNow:
         assert pend[0]["attempts"] == 1          # 失败重试计数增加
         sent = d.mail._load_jsonl(d.mail.sent_path)
         assert len(sent) == 1 and sent[0]["to"] == "b"  # 成功进 sent
+
+
+# ===========================================================================
+# v5.0.2 连接稳定性：退避 / 重试上限 / per-peer 熔断
+# ===========================================================================
+class TestConnectionStability:
+    """B5/B6 修复护栏：死节点不再拖垮投递与同步循环。"""
+
+    def test_retry_backoff_curve(self):
+        """退避曲线：0-4 次 15s；5-9 次 60s；10-14 次 240s；20+ 封顶 3600s。"""
+        from fleet_proto import _retry_backoff
+        assert _retry_backoff(0) == 15
+        assert _retry_backoff(4) == 15
+        assert _retry_backoff(5) == 60
+        assert _retry_backoff(9) == 60
+        assert _retry_backoff(10) == 240
+        assert _retry_backoff(20) == 3600
+        assert _retry_backoff(999) == 3600     # 封顶
+
+    def test_outbox_retryable_filters_backoff(self, tmp_engine):
+        """刚失败的消息按退避间隔排除；间隔过后重新可试。"""
+        import time as _t
+        me = tmp_engine
+        me.outbox_append({"from": "a", "to": "ghost", "text": "x"})
+        mid = me.outbox_pending()[0]["msg_id"]
+        me.outbox_increment_attempt(mid)          # attempts=1, last=now
+
+        # 距上次失败 5s < 15s 退避 -> 本轮不可试
+        assert me.outbox_retryable(now=_t.time() + 5) == []
+        # 距上次失败 16s -> 可试
+        r = me.outbox_retryable(now=_t.time() + 16)
+        assert len(r) == 1 and r[0]["msg_id"] == mid
+
+    def test_outbox_retryable_new_msg_immediate(self, tmp_engine):
+        """新消息（无 last_attempt_ts）立即可试，行为与旧版一致。"""
+        tmp_engine.outbox_append({"from": "a", "to": "ghost", "text": "n"})
+        assert len(tmp_engine.outbox_retryable()) == 1
+        assert len(tmp_engine.outbox_pending()) == 1   # 全量语义不变
+
+    def test_max_attempts_marks_dead(self, tmp_engine):
+        """超过 MAX_RETRY_ATTEMPTS -> status=dead，pending/retryable 均排除。"""
+        from fleet_proto import MAX_RETRY_ATTEMPTS
+        me = tmp_engine
+        me.outbox_append({"from": "a", "to": "ghost", "text": "x"})
+        mid = me.outbox_pending()[0]["msg_id"]
+        # 直接把 attempts 拉到上限-1，再一次 increment 触发 dead
+        with me._lock:
+            msgs = me._load_jsonl(me.outbox_path)
+            for m in msgs:
+                if m.get("msg_id") == mid:
+                    m["attempts"] = MAX_RETRY_ATTEMPTS - 1
+            me._save_jsonl(me.outbox_path, msgs)
+        me.outbox_increment_attempt(mid)
+        assert me.outbox_pending() == []            # 不再 pending
+        assert me.outbox_retryable() == []
+        dead = me._load_jsonl(me.outbox_path)
+        assert len(dead) == 1 and dead[0]["status"] == "dead"   # 记录保留供审计
+
+    def test_peer_health_breaker_state_machine(self):
+        """熔断状态机：2 次失败 -> 冷却 90s；失败翻倍；成功清零。"""
+        from fleet_proto import PeerHealth
+        h = PeerHealth()
+        t0 = 1000.0
+        assert h.is_available("p1", now=t0)          # 无记录 -> 可用
+        h.record_failure("p1", now=t0)
+        assert h.is_available("p1", now=t0)          # 1 次未达阈值
+        h.record_failure("p1", now=t0)               # 2 次 -> 进入冷却
+        assert not h.is_available("p1", now=t0)
+        assert not h.is_available("p1", now=t0 + 89)
+        assert h.is_available("p1", now=t0 + 90)     # 冷却到期，放行探测
+        h.record_failure("p1", now=t0 + 90)          # 探测失败 -> 冷却翻倍 180s
+        h.record_failure("p1", now=t0 + 90)
+        assert not h.is_available("p1", now=t0 + 90 + 179)
+        assert h.is_available("p1", now=t0 + 90 + 180)
+        h.record_success("p1")                       # 成功 -> 完全恢复
+        assert h.is_available("p1", now=t0)
+        assert h.cooldown_remaining("p1", now=t0) == 0
+
+    def test_peer_health_independent_keys(self):
+        """不同 peer 的熔断状态互不影响。"""
+        from fleet_proto import PeerHealth
+        h = PeerHealth()
+        h.record_failure("a")
+        h.record_failure("a")
+        assert not h.is_available("a")
+        assert h.is_available("b")                   # b 不受 a 连累
+
+    def test_deliver_skips_cooldown_peer(self, tmp_path):
+        """冷却中的 peer：投递直接 False，不发 HTTP（不打 urlopen）。"""
+        me = MailEngine(str(tmp_path), "node-a")
+        d = MessageDelivery(me, lambda: {"b": {"url": "http://b:1/mcp", "token": ""}})
+        d.health.record_failure("http://b:1/mcp")
+        d.health.record_failure("http://b:1/mcp")   # 进入冷却
+        called = []
+        import urllib.request as _u
+        orig = _u.urlopen
+        monkey_urlopen = lambda *a, **k: called.append(1) or orig(*a, **k)
+        _u.urlopen = monkey_urlopen
+        try:
+            assert d.deliver_now({"to": "b", "text": "x"}) is False
+        finally:
+            _u.urlopen = orig
+        assert called == []                          # 零 HTTP 尝试
+
+    def test_sync_skips_cooldown_peer(self, tmp_path, monkeypatch):
+        """冷却中的 peer：gossip 同步跳过（sync_with_peer 返回 None 且不发请求）。"""
+        me = MailEngine(str(tmp_path), "node-a")
+        from fleet_proto import SyncEngine
+        s = SyncEngine(me, lambda: {})
+        s.health.record_failure("http://dead:1/mcp")
+        s.health.record_failure("http://dead:1/mcp")
+        hits = []
+        monkeypatch.setattr(s, "_poll_peer",
+                            lambda *a: hits.append(1) or [])
+        # sync_with_peer 应在 health 检查处直接短路（后续代码不执行）
+        assert s.sync_with_peer("http://dead:1/mcp", "") is None
+        assert hits == []
+
+    def test_failure_recording_on_dead_peer(self, tmp_path):
+        """对真实不可达端口的投递失败 -> 熔断器计数（连通性异常路径）。"""
+        me = MailEngine(str(tmp_path), "node-a")
+        d = MessageDelivery(me, lambda: {})
+        url = "http://127.0.0.1:1/mcp"               # 端口 1 必然拒绝
+        assert d._http_deliver(url, "", {"to": "x", "text": "t"}) is False
+        assert d._http_deliver(url, "", {"to": "x", "text": "t"}) is False
+        assert not d.health.is_available(url)        # 2 次失败 -> 冷却
