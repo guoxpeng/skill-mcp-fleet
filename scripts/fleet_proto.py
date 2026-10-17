@@ -14,6 +14,7 @@ fleet_proto -- MCP-Fleet 自研通讯协议层（零依赖，纯 Python 标准�
 import json, os, re, socket, threading, time, uuid, io
 import urllib.request, urllib.parse, urllib.error
 import base64, hashlib, hmac
+import collections
 
 PROTO_NAME = "fleet"
 PROTO_VERSION = 1
@@ -41,7 +42,31 @@ PBKDF2_ROUNDS = 100000
 
 
 def _derive_key(secret, salt):
-    return hashlib.pbkdf2_hmac("sha256", secret.encode("utf-8"), salt, PBKDF2_ROUNDS)
+    """PBKDF2 派生（带 LRU 缓存）。
+
+    v5.0.1 修复：原实现每次加/解密都重跑 100k 轮 PBKDF2（实测单次 ~18ms），
+    _load_jsonl 逐条解密导致 N 条消息 ~N*18ms，且投递循环（15s）/Dashboard
+    轮询（5s）/gossip 同步（60s）每次都重复支付 —— 消息一多节点近乎卡死。
+    现按 (secret, salt) 缓存派生结果，同一 salt 只派生一次。
+    """
+    cache_key = (secret, bytes(salt))
+    with _KEY_CACHE_LOCK:
+        got = _KEY_CACHE.get(cache_key)
+        if got is not None:
+            _KEY_CACHE.move_to_end(cache_key)
+            return got
+    key = hashlib.pbkdf2_hmac("sha256", secret.encode("utf-8"), salt, PBKDF2_ROUNDS)
+    with _KEY_CACHE_LOCK:
+        _KEY_CACHE[cache_key] = key
+        if len(_KEY_CACHE) > _KEY_CACHE_MAX:
+            _KEY_CACHE.popitem(last=False)   # 淘汰最久未用
+    return key
+
+
+# 派生密钥 LRU 缓存（模块级：多 MailEngine 实例共享同一 secret 时也命中）
+_KEY_CACHE = collections.OrderedDict()
+_KEY_CACHE_LOCK = threading.Lock()
+_KEY_CACHE_MAX = 128
 
 
 def _keystream(key, nonce, length):
@@ -54,9 +79,14 @@ def _keystream(key, nonce, length):
     return out[:length]
 
 
-def encrypt_text(secret, plaintext):
-    """加密字符串 -> 'enc1$...' 形态。secret 为节点 auth_token。"""
-    salt = os.urandom(16)
+def encrypt_text(secret, plaintext, salt=None):
+    """加密字符串 -> 'enc1$...' 形态。secret 为节点 auth_token。
+
+    salt 缺省随机（兼容旧调用/测试）；MailEngine 写路径传固定 salt，
+    使同一邮箱的所有消息共享派生密钥（nonce 仍每条随机，keystream 不重复，
+    安全性等价），配合 _derive_key 缓存实现 O(1) 读写。
+    """
+    salt = bytes(salt) if salt is not None else os.urandom(16)
     nonce = os.urandom(16)
     key = _derive_key(secret, salt)
     pt = plaintext.encode("utf-8")
@@ -123,7 +153,25 @@ class MailEngine:
         self._lock = threading.RLock()
         self._cond = threading.Condition(self._lock)
         self._agents = set([node_name])
+        # v5.0.1: 邮箱固定 salt（mailbox/.salt）。写路径统一用它 -> 所有消息
+        # 共享同一派生密钥（配合 _derive_key 缓存，写读均 O(1) 派生）。
+        # blob 内仍自带 salt 字段，旧格式（每条独立 salt）解密自动兼容。
+        self._salt = self._load_or_create_salt() if self.secret else None
         self._next_id = self._calc_next_id()
+
+    def _load_or_create_salt(self):
+        p = os.path.join(self.dir, ".salt")
+        try:
+            if os.path.exists(p):
+                data = open(p, "rb").read()
+                if len(data) >= 16:
+                    return data[:16]
+            s = os.urandom(16)
+            with io.open(p, "wb") as f:
+                f.write(s)
+            return s
+        except OSError:
+            return os.urandom(16)   # 只读目录等场景：退化为每条随机 salt
 
     # -- v5.0: 落盘加密钩子 --
     def _encrypt_field(self, msg):
@@ -135,7 +183,7 @@ class MailEngine:
         t = m.get("text")
         if isinstance(t, str) and t and not t.startswith(CRYPTO_PREFIX):
             try:
-                m["text"] = encrypt_text(self.secret, t)
+                m["text"] = encrypt_text(self.secret, t, salt=self._salt)
             except Exception:
                 pass
         return m
@@ -324,6 +372,12 @@ class MailEngine:
         return msgs
 
     def _save_jsonl(self, path, msgs):
+        # v5.0.1 修复：_load_jsonl 读时解密 -> 修改（投递重试/成功/poll 移出）
+        # -> 这里写回。原实现直接 json.dumps 落盘，密文一经任何重写操作
+        # 即整体退化为明文（投递循环每 15s 触发一次，加密静默失效）。
+        # 现在写盘前对称过 _encrypt_field（幂等：已是 enc1$ 的不会被二次加密）。
+        if self.secret:
+            msgs = [self._encrypt_field(m) for m in msgs]
         tmp = path + ".tmp"
         with io.open(tmp, "w", encoding="utf-8") as f:
             for m in msgs:
@@ -498,7 +552,17 @@ class MessageDelivery:
         self._stop.set()
 
     def deliver_now(self, msg):
-        """尝试立即投递。返回 True=成功 False=失败。"""
+        """尝试立即投递。返回 True=成功 False=失败。
+
+        v5.0.1 修复：目标匹配顺序 ——
+        1. 消息自带 _target_url/_target_token
+        2. to 是 peer 节点名 -> 投给该节点
+        3. to 是远程 agent 名 -> 查各 peer 的 agents 归属（gossip 同步时
+           对端上报 local_agents，由宿主节点记录），命中则投给宿主节点。
+           原实现缺第 3 步：单播给远程 agent 永远 False，消息滞留 outbox
+           无法自动投递（仅 to=* 广播可经 poll 到达）。
+        4. to == "*" -> 广播
+        """
         to = msg.get("to", "")
         url = msg.get("_target_url", "")
         token = msg.get("_target_token", "")
@@ -507,7 +571,14 @@ class MessageDelivery:
             if to in peers:
                 url = peers[to].get("url", "")
                 token = peers[to].get("token", "")
-            elif to == "*":
+            elif to != "*":
+                # v5.0.1: agent 归属匹配 —— 找到宣称收留该 agent 的 peer
+                for pname, info in peers.items():
+                    if to in (info.get("agents") or []):
+                        url = info.get("url", "")
+                        token = info.get("token", "")
+                        break
+            else:
                 return self._broadcast(msg)
         if not url:
             return False
@@ -578,10 +649,14 @@ class SyncEngine:
     节点间邮箱同步：定期向已知 peer 发 sync_summary，
     如果对方有给我的本地 agent 的消息，就 poll 过来。
     """
-    def __init__(self, mail_engine, get_peers_func, self_url=""):
+    def __init__(self, mail_engine, get_peers_func, self_url="",
+                 on_peer_agents=None):
         self.mail = mail_engine
         self.get_peers = get_peers_func
         self.self_url = self_url
+        # v5.0.1: 对端 gossip 响应携带 local_agents 时回调
+        # f(peer_node_name, [agent, ...])，宿主侧记入 peers 用于投递归属
+        self.on_peer_agents = on_peer_agents
         self._stop = threading.Event()
 
     def stop(self):
@@ -609,6 +684,14 @@ class SyncEngine:
                 req.add_header("Authorization", "Bearer " + token)
             with urllib.request.urlopen(req, timeout=10) as r:
                 resp = json.loads(r.read().decode("utf-8"))
+
+            # v5.0.1: 记录对端 agent 归属（用于 deliver_now 的远程 agent 匹配）
+            if self.on_peer_agents and isinstance(resp, dict):
+                try:
+                    self.on_peer_agents(resp.get("node", ""),
+                                        resp.get("local_agents") or [])
+                except Exception:
+                    pass
 
             # 2. 如果对方有给我的 agent 的消息，逐个 poll
             for agent in self.mail.local_agents():
