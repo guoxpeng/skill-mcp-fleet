@@ -1,0 +1,10 @@
+{
+  "nodes": {
+    "demo-b": {
+      "url": "http://127.0.0.1:3112/mcp",
+      "token": "",
+      "added_by": "",
+      "updated": 1792229282
+    }
+  }
+}

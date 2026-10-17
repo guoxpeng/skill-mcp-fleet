@@ -1,0 +1,7 @@
+2026-10-17 17:28:01 | ip=- | tool=exec | args={"command": "echo ok"}
+2026-10-17 17:28:01 | ip=- | tool=exec | args={"command": "echo ok"}
+2026-10-17 17:28:01 | ip=- | tool=exec | args={"command": "echo '我是节点 A（端口 3111）'"}
+2026-10-17 17:28:02 | ip=- | tool=exec | args={"command": "echo '我是节点 B（端口 3112）'"}
+2026-10-17 17:28:02 | peer_call | node -> demo-b | exec | calling | 
+2026-10-17 17:28:02 | ip=- | tool=exec | args={"command": "echo 来自 B 的问候 ✅"}
+2026-10-17 17:28:02 | peer_call | node -> demo-b | exec | ok | 
