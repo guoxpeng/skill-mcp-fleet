@@ -67,6 +67,13 @@ try:
 except ImportError:
     _HAS_PROTO = False
 
+# v5.0: Web Dashboard 单文件页面（零 CDN 依赖）
+try:
+    from dashboard_html import DASHBOARD_HTML
+    _HAS_DASHBOARD = True
+except ImportError:
+    _HAS_DASHBOARD = False
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 CONFIG_PATH = os.path.join(HERE, "mcp_agent_config.json")
 
@@ -82,7 +89,7 @@ for _stream in (sys.stdout, sys.stderr):
 DEFAULT_CONFIG = {
     "name": "node",             # 副端标识（显示在状态页与 serverInfo）
     "tool_prefix": "",          # 工具名前缀，如 "nas_"；留空则用裸名（exec/read/...）
-    "version": "4.0.0",
+    "version": "5.0.0",
     "sudo_password": "",        # 留空且非 root 时会尝试免密 sudo
     "work_dir": "/",            # 默认工作目录
     "command_timeout": 120,     # 秒
@@ -943,9 +950,18 @@ def _init_proto():
     global _mail_engine, _discovery_layer, _delivery_engine, _sync_engine
     if not _HAS_PROTO:
         return
-    _mail_engine = MailEngine(HERE, SERVER_NAME)
+    # v5.0: 邮箱落盘加密密钥 = 节点 auth_token（PBKDF2 派生，零新增配置）
+    _proto_secret = CFG.get("auth_token", "") or None
+    _mail_engine = MailEngine(HERE, SERVER_NAME, secret=_proto_secret)
     def _get_peers():
         return load_peers().get("nodes", {})
+    def _verify_peer_token(name):
+        """v5.0: 供 UDP hello 验签——返回已配对 peer 的 token。"""
+        try:
+            with PEERS_LOCK:
+                return load_peers().get("nodes", {}).get(name, {}).get("token", "") or None
+        except Exception:
+            return None
     _delivery_engine = MessageDelivery(_mail_engine, _get_peers, self_url())
     _sync_engine = SyncEngine(_mail_engine, _get_peers, self_url())
 
@@ -964,6 +980,69 @@ def _on_discover(name, ip, port, caps):
                     _mail_engine.register_agent(name)
     except Exception:
         pass
+
+
+def _dashboard_data():
+    """v5.0: Web Dashboard 数据聚合（/fleet/ui/data）。
+    只读、轻量：不跑 shell，纯标准库取数。消息文本已由 MailEngine 自动解密。"""
+    now = time.time()
+    known = {}
+    if _discovery_layer:
+        try:
+            known = _discovery_layer.known_nodes() or {}
+        except Exception:
+            pass
+    with PEERS_LOCK:
+        peers = load_peers().get("nodes", {})
+    peer_list = []
+    for name in sorted(peers):
+        info = peers[name] or {}
+        last_seen = known.get(name)
+        peer_list.append({
+            "name": name,
+            "url": info.get("url", ""),
+            "token": bool(info.get("token", "")),
+            "added_by": info.get("added_by", ""),
+            "online": bool(last_seen and (now - last_seen) < 90),
+            "last_seen_ago": int(now - last_seen) if last_seen else None,
+        })
+    stats = _mail_engine.stats() if _mail_engine else {}
+    recent = []
+    if _mail_engine:
+        try:
+            msgs = _mail_engine._load_jsonl(_mail_engine.inbox_path)[-10:]
+            for m in reversed(msgs):
+                recent.append({
+                    "from": m.get("from", ""), "to": m.get("to", ""),
+                    "text": (m.get("text", "") or "")[:120],
+                    "ts": m.get("ts", ""),
+                })
+        except Exception:
+            pass
+    sys_lite = {"platform": sys.platform,
+                "python": sys.version.split()[0]}
+    try:
+        sys_lite["load"] = "%.2f" % (os.getloadavg()[0],)
+    except Exception:
+        sys_lite["load"] = "-"       # Windows 无 getloadavg
+    try:
+        import shutil as _sh
+        _du = _sh.disk_usage(HERE)
+        sys_lite["disk_free_gb"] = round(_du.free / 1073741824.0, 1)
+    except Exception:
+        pass
+    return {
+        "node": SERVER_NAME, "version": SERVER_VERSION,
+        "tools": len(TOOLS),
+        "encryption": bool(CFG.get("auth_token") or ""),
+        "peers": peer_list,
+        "mailbox": stats,
+        "recent": recent,
+        "sys": sys_lite,
+        "ts": time.strftime("%Y-%m-%d %H:%M:%S"),
+    }
+
+
 _REQ = threading.local()          # 当前请求带进来的跳数（X-Fleet-Hops）
 try:
     LISTEN_PORT = int(open(os.path.join(HERE, "port.txt")).read().strip())
@@ -2747,6 +2826,25 @@ class Handler(BaseHTTPRequestHandler):
                 self._json(503, {"error": "proto not initialized"})
             return
 
+        # ---- v5.0: Web Dashboard ----
+        if path == "/fleet/ui":
+            if _HAS_DASHBOARD:
+                body = DASHBOARD_HTML.encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.send_header("Content-Length", str(len(body)))
+                self.send_header("Cache-Control", "no-store")
+                self._cors()
+                self.end_headers()
+                self.wfile.write(body)
+            else:
+                self._json(503, {"error": "dashboard_html.py missing"})
+            return
+
+        if path == "/fleet/ui/data":
+            self._json(200, _dashboard_data())
+            return
+
         if path == "/fleet/status":
             if _mail_engine:
                 self._json(200, _mail_engine.stats())
@@ -2859,10 +2957,15 @@ def main():
         _discovery_layer = DiscoveryLayer(
             SERVER_NAME, args.port, caps=caps_summary,
             discover_port=int(CFG.get("discover_port", 3199)),
-            on_discover=_on_discover)
+            on_discover=_on_discover,
+            sign_secret=CFG.get("auth_token", "") or None,
+            verify_token_func=lambda n: load_peers().get("nodes", {}).get(n, {}).get("token", "") or None)
         _discovery_layer.start()
         print("  UDP 发现        : 端口 %d (每 %ds 广播)" % (
             int(CFG.get("discover_port", 3199)), 30))
+        if CFG.get("auth_token", ""):
+            print("  hello 签名      : 开启 (HMAC-SHA256, 已配对节点验签防伪造)")
+            print("  邮箱加密        : 开启 (PBKDF2+HMAC-SHA256 流加密, 密文落盘)")
         # 消息投递 daemon
         if _delivery_engine:
             _delivery_engine.start_delivery()
