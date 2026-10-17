@@ -188,10 +188,24 @@ def build_schtasks_minute(python, target, port, task=TASK_WATCHDOG):
 
 
 def win_find_pythonw():
-    """python.exe 同目录的 pythonw.exe（无控制台窗口）；找不到回退当前解释器。"""
-    py = sys.executable or "python"
-    cand = os.path.join(os.path.dirname(py), "pythonw.exe")
-    return cand if os.path.isfile(cand) else py
+    """pythonw.exe 无控制台窗口版解释器：依次找 venv 同目录 -> 真实安装目录。
+
+    v5.0.5: venv 的 Scripts 下只有 python.exe 没有 pythonw.exe，直接回退
+    python.exe 会让 ONLOGON 自启每次登录闪一个黑窗 —— 补查 sys.base_prefix
+    （venv 里指向真实 Python 安装目录）。都找不到才回退当前解释器。
+    """
+    cands = []
+    exe_dir = os.path.dirname(sys.executable or "")
+    if exe_dir:
+        cands.append(os.path.join(exe_dir, "pythonw.exe"))
+    for base in (getattr(sys, "base_prefix", None),
+                 getattr(sys, "base_exec_prefix", None)):
+        if base:
+            cands.append(os.path.join(base, "pythonw.exe"))
+    for cand in cands:
+        if os.path.isfile(cand):
+            return cand
+    return sys.executable or "python"
 
 
 def parse_netstat_pids(text, port):
@@ -240,8 +254,12 @@ def probe_agent(port, timeout=5.0, token=None):
     req = urllib.request.Request(url)
     if token:
         req.add_header("Authorization", "Bearer " + token)
+    # v5.0.5: 探活目标永远 127.0.0.1，强制禁代理 —— Windows 代理软件未豁免
+    # <local> 时 urlopen 会把回环请求发给代理服务器，健康节点被误判成宕机，
+    # 看门狗每分钟重拉一次（重启风暴）。
+    _probe_opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as r:
+        with _probe_opener.open(req, timeout=timeout) as r:
             if r.status != 200:
                 return False
             data = json.loads(r.read().decode("utf-8", "replace"))
@@ -318,9 +336,10 @@ def watchdog_once(port, target, timeout=5.0, probe=None, spawn=None, kill=None):
 
 
 def _run_cmd(argv):
-    """静默执行外部命令，返回 (rc, 输出拼串)。"""
+    """静默执行外部命令，返回 (rc, 输出拼串)。errors=replace：极端字节
+    不让 UnicodeDecodeError 中断安装流程（schtasks 本地化消息不可控）。"""
     try:
-        r = subprocess.run(argv, capture_output=True, text=True, timeout=30)
+        r = subprocess.run(argv, capture_output=True, timeout=30, errors="replace")
         return r.returncode, (r.stdout or "") + (r.stderr or "")
     except Exception as e:
         return 1, str(e)
@@ -422,7 +441,9 @@ def do_install(args):
                 log("旧自启     : 已移除 Startup 启动项（升级清理）")
             pyw = win_find_pythonw()
             rc1, out1 = _run_cmd(build_schtasks_onlogon(pyw, target, args.port))
-            rc2, out2 = _run_cmd(build_schtasks_minute(sys.executable, target, args.port))
+            # v5.0.5: 看门狗也用 pythonw —— 用 python.exe 会让任务计划
+            # 每分钟弹一次黑控制台窗口（用户会以为中毒）
+            rc2, out2 = _run_cmd(build_schtasks_minute(pyw, target, args.port))
             if rc1 == 0:
                 log("开机自启   : 已注册（计划任务 %s / 登录自启，pythonw 无窗口）" % TASK_AGENT)
             else:
