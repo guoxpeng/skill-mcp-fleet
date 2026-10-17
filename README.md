@@ -1,6 +1,6 @@
 # MCP Fleet · 节点互控系统
 
-> 零依赖 · 纯 Python 标准库 · 兼容 Python 3.6+ · 38 个工具（32 原有 + 6 新增增强） · 自研通讯协议
+> 零依赖 · 纯 Python 标准库 · 兼容 Python 3.6+ · 41 个工具 · 自研通讯协议 · [20 秒演示视频](https://mcp-fleet-demo.obs.cn-north-4.myhuaweicloud.com/fleet-demo.mp4)
 
 给你的设备集群（NAS / 飞牛 OS / 树莓派 / 云主机 / 容器 / 手机…）每台装一个「节点」，即可被**任意支持 MCP 的 AI agent / 客户端**远程操控 —— WorkBuddy、Claude Desktop、Claude Code、Cursor、Cline、Cherry Studio、Codex 或你自己写的 agent 都行，不绑定某一家。
 
@@ -35,7 +35,7 @@
   ├── UDP :3199 广播自动发现同网段节点
   ├── HTTP /fleet/* 端点：消息投递、上线收信、邮箱同步
   ├── mailbox/ 邮箱：inbox + outbox + sent（store-and-forward）
-  └── 38 个工具（32 原有 + 6 新增增强）：exec/read/write/edit/docker/systemctl + peer + msg + collab + mesh
+  └── 41 个工具：exec/read/write/edit/search/upload/download + docker/systemctl + peer + msg + collab + mesh
 ```
 
 ## 快速开始（3 步）
@@ -153,18 +153,21 @@ agent-b 节点启动 → UDP 广播 → 发现其他节点 → peer_add
 | `/fleet/register_agent` | POST | agent 注册到本节点 |
 | `/fleet/status` | GET | 邮箱状态 |
 
-## 工具清单（38 个）
+## 工具清单（41 个）
 
 | 类别 | 工具 | 作用 |
 |------|------|------|
 | **执行** | `exec` / `exec_async` / `exec_poll` / `exec_result` / `exec_kill` / `exec_jobs` | 同步/后台命令执行 |
-| **文件** | `read` / `write` / `edit` / `list_dir` | 文件读写编辑 |
+| **文件** | `read` / `write` / `edit` / `list_dir` / `search` | 文件读写编辑 + 内容/文件名搜索（edit 支持 dryRun 预览） |
+| **传输** | `upload` / `download` | base64 文件传输，支持二进制 |
+| **进程/网络** | `ps` / `kill` / `net_check` | 进程列表与终止 + 端口/DNS/监听诊断 |
 | **Docker** | `docker_ps` / `docker_logs` / `docker_restart` | 容器管理 |
 | **系统** | `systemctl` / `service_logs` / `sysinfo` / `http_get` | 服务管理 + 系统信息 |
 | **Peer Mesh** | `peers` / `peer_call` / `peer_add` / `peer_remove` / `peer_info` | 节点互控（多跳转发） |
 | **消息总线** | `msg_send` / `msg_recv` / `msg_history` | store-and-forward + topic + 离线邮箱 |
 | **Agent 协作** | `caps` / `mesh_caps` / `delegate` / `group_form` / `group_list` / `group_disband` | 能力声明 + 任务委派 + 群组 |
 | **Mesh 拓扑** | `mesh` | 全网拓扑与在线状态 |
+| **模式** | `node_mode` / `request_assist` / `assist_queue` | 连接/控制模式 + 辅助审查队列 |
 
 ## CLI 用法
 
@@ -216,8 +219,9 @@ mcp-fleet/
 ├── SKILL.md                          # AgentSkill 规范
 ├── mcp_agent_config.example.json     # 配置模板
 ├── scripts/
-│   ├── mcp_agent.py                  # 节点 MCP 服务器（核心，38 个工具（32 原有 + 6 新增增强））
+│   ├── mcp_agent.py                  # 节点 MCP 服务器（核心，41 个工具）
 │   ├── fleet_proto.py                # v4.1 自研通讯协议层
+│   ├── demo.sh                       # v4.6 一键演示：双节点互联 30 秒上手
 │   ├── fleet.py                      # 主端统一 CLI
 │   ├── fleet_chat.py                 # AI 间消息 CLI
 │   ├── fleet_watch.py                # 保活守护
@@ -269,3 +273,18 @@ MIT
 - **P2: `net_check` 工具** — 端口探测、DNS 解析、列出本机监听端口
 - **P2: `edit` dryRun** — `dryRun=true` 预览修改效果但不实际写入
 - **P2: 错误消息 i18n** — 错误提示改为中英双语
+
+---
+
+## v4.6 更新
+
+### Bug 修复
+- **mesh / mesh_caps 遍历层级修复** — `load_peers()` 返回 `{"nodes": {...}}` 嵌套结构，此前两处直接遍历外层导致拓扑里对等节点显示异常，现已统一 `.get("nodes", {})`
+
+### 新增
+- **`scripts/demo.sh` 一键演示** — 本机 30 秒拉起双节点（demo-nas/demo-cloud），自动演示互发现、配对、跨节点 exec、消息投递、mesh 拓扑，结束自动清理。第一次接触本项目的用户和评测评测建议从这里开始
+- **SKILL.md 文档增强** — 新增「谁需要它」六类用户画像、兼容性清单（标准 MCP JSON-RPC，CodeArts/Claude Code/Cursor 等均可接入）、description 触发句式改造
+- **20 秒演示视频** — https://mcp-fleet-demo.obs.cn-north-4.myhuaweicloud.com/fleet-demo.mp4 （云上项目远程查询 + 出门在外管理家里设备两大场景）
+
+### 参赛信息
+本作品参加 2026 华为开发者大赛 · 小红书 Skill 创新赛，已上架 [华为云 Skill 市场](https://skills.huaweicloud.com/community)（搜 "mcp-fleet"）。
