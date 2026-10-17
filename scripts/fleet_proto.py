@@ -25,6 +25,77 @@ DELIVERY_INTERVAL = 15
 SYNC_INTERVAL = 60
 MAX_HOPS = 5
 
+# v5.0.2 连接稳定性：
+#   HTTP_TIMEOUT      —— 客户端超时（投递/sync/poll）。原 10s：对「挂起不
+#                       响应」的主机，每条消息都要等满；配合熔断降为 6s，
+#                       局域网/中转场景均足够宽裕。
+#   RETRY_BACKOFF     —— 消息级重试退避：attempts 0-4 每 15s；5-9 每 60s；
+#                       10-14 每 240s；15-19 每 960s；20+ 每 3600s 封顶。
+#                       目标节点短暂离线时快速重试，长期离线时降频省资源。
+#   MAX_RETRY_ATTEMPTS —— 重试上限（约 2 天），到顶标 status=dead 停止重试，
+#                       防 outbox 无限膨胀；dead 记录保留供审计。
+#   DELIVERY_BATCH_MAX —— 投递循环单轮批量上限，防大 outbox 长时间占循环。
+HTTP_TIMEOUT = 6
+MAX_RETRY_ATTEMPTS = 250
+DELIVERY_BATCH_MAX = 50
+
+
+def _retry_backoff(attempts):
+    """按失败次数计算下次可重试的等待秒数（见上表）。"""
+    return min(15 * 4 ** min(attempts // 5, 4), 3600)
+
+
+class PeerHealth:
+    """v5.0.2: per-peer 连接熔断器（circuit breaker）。
+
+    连接稳定性核心：一个下线/挂死的 peer 不再拖垮全局——
+    - 连续失败 FAIL_THRESHOLD 次 -> 进入冷却期，期间对该 peer 的一切
+      主动连接（投递/gossip/poll）直接跳过，不再每 15s 白等一次超时；
+    - 冷却到期后放行一次探测请求：成功即完全恢复，失败则冷却期翻倍
+      （90s -> 180s -> ... 封顶 30min），适配「长期离线的设备」；
+    - 投递引擎与同步引擎共享同一实例，健康状态全局部一致。
+    """
+
+    FAIL_THRESHOLD = 2
+    COOLDOWN_BASE = 90.0
+    COOLDOWN_MAX = 1800.0
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        # key -> {"fails": 连续失败数, "until": 冷却截止 ts, "rounds": 冷却轮次}
+        self._state = {}
+
+    def is_available(self, key, now=None):
+        """该 peer 当前是否可尝试连接（无记录/不在冷却期 -> True）。"""
+        now = time.time() if now is None else now
+        with self._lock:
+            st = self._state.get(key)
+            return (not st) or now >= st.get("until", 0)
+
+    def cooldown_remaining(self, key, now=None):
+        """剩余冷却秒数（调试/Dashboard 用，不在冷却返回 0）。"""
+        now = time.time() if now is None else now
+        with self._lock:
+            st = self._state.get(key)
+            return max(0, int(st.get("until", 0) - now)) if st else 0
+
+    def record_success(self, key):
+        """连接成功：健康状态完全清零。"""
+        with self._lock:
+            self._state.pop(key, None)
+
+    def record_failure(self, key, now=None):
+        """连接失败：连续达阈值则开启/加倍冷却期。"""
+        now = time.time() if now is None else now
+        with self._lock:
+            st = self._state.setdefault(key, {"fails": 0, "until": 0, "rounds": 0})
+            st["fails"] += 1
+            if st["fails"] >= self.FAIL_THRESHOLD:
+                cd = min(self.COOLDOWN_BASE * (2 ** st["rounds"]), self.COOLDOWN_MAX)
+                st["until"] = now + cd
+                st["rounds"] += 1
+                st["fails"] = 0   # 冷却结束后从探测重新计数
+
 
 # ---------------------------------------------------------------------------
 # v5.0 落盘加密（标准库实现，零第三方依赖）
@@ -272,6 +343,27 @@ class MailEngine:
             msgs = self._load_jsonl(self.outbox_path)
             return [m for m in msgs if m.get("status") == "pending"]
 
+    def outbox_retryable(self, now=None):
+        """v5.0.2: 本轮投递循环可尝试的消息（退避过滤 + 上限过滤）。
+
+        与 outbox_pending()（全量 pending，统计语义）分开：
+        - 无 last_attempt_ts（新消息）-> 立即可试
+        - 距上次失败不足 _retry_backoff(attempts) -> 跳过本轮
+        - status=dead（超过 MAX_RETRY_ATTEMPTS）-> 永久排除
+        """
+        now = time.time() if now is None else now
+        with self._lock:
+            msgs = self._load_jsonl(self.outbox_path)
+            out = []
+            for m in msgs:
+                if m.get("status") != "pending":
+                    continue
+                last = m.get("last_attempt_ts")
+                if last is not None and now - last < _retry_backoff(m.get("attempts", 0)):
+                    continue
+                out.append(m)
+            return out
+
     def outbox_mark_delivered(self, msg_id):
         with self._lock:
             msgs = self._load_jsonl(self.outbox_path)
@@ -296,6 +388,10 @@ class MailEngine:
                 if m.get("msg_id") == msg_id and m.get("status") == "pending":
                     m["attempts"] = m.get("attempts", 0) + 1
                     m["last_attempt_ts"] = time.time()
+                    # v5.0.2: 超过重试上限 -> 标 dead 停止重试（记录保留供审计）
+                    if m["attempts"] >= MAX_RETRY_ATTEMPTS:
+                        m["status"] = "dead"
+                        m["dead_ts"] = time.time()
             self._save_jsonl(self.outbox_path, msgs)
 
     # -- poll（上线收信）--
@@ -542,10 +638,12 @@ class MessageDelivery:
     2. 广播(to=*) -> 发给所有 peer
     3. 未知目标 -> 留 outbox，等发现后重试
     """
-    def __init__(self, mail_engine, get_peers_func, self_url=""):
+    def __init__(self, mail_engine, get_peers_func, self_url="", health=None):
         self.mail = mail_engine
         self.get_peers = get_peers_func
         self.self_url = self_url
+        # v5.0.2: 连接熔断器（与 SyncEngine 共享同一实例，见 mcp_agent._init_proto）
+        self.health = health or PeerHealth()
         self._stop = threading.Event()
 
     def stop(self):
@@ -585,6 +683,9 @@ class MessageDelivery:
         return self._http_deliver(url, token, msg)
 
     def _http_deliver(self, url, token, msg):
+        # v5.0.2: 冷却中的 peer 直接跳过——不让挂死的主机每轮白等一次超时
+        if not self.health.is_available(url):
+            return False
         try:
             base = url.rstrip("/")
             for suffix in ["/mcp", "/sse", "/rpc"]:
@@ -607,9 +708,13 @@ class MessageDelivery:
             req.add_header("Content-Type", "application/json; charset=utf-8")
             if token:
                 req.add_header("Authorization", "Bearer " + token)
-            with urllib.request.urlopen(req, timeout=10) as r:
-                return r.status == 200
+            with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT) as r:
+                ok = (r.status == 200)
+            self.health.record_success(url)
+            return ok
         except Exception:
+            # v5.0.2: 失败计入熔断——连续 2 次后进入冷却，不再每轮白等
+            self.health.record_failure(url)
             return False
 
     def _broadcast(self, msg):
@@ -623,10 +728,15 @@ class MessageDelivery:
         return any_ok
 
     def delivery_loop(self):
-        """后台 daemon：定期重试 outbox 投递。"""
+        """后台 daemon：定期重试 outbox 投递。
+
+        v5.0.2: 用 outbox_retryable()（退避过滤）替代全量 pending——
+        刚失败的消息按退避间隔跳过，避免死节点消息每轮阻塞循环；
+        单轮最多 DELIVERY_BATCH_MAX 条，防止超大 outbox 挤占循环周期。
+        """
         while not self._stop.is_set():
             try:
-                pending = self.mail.outbox_pending()
+                pending = self.mail.outbox_retryable()[:DELIVERY_BATCH_MAX]
                 for msg in pending:
                     msg_id = msg.get("msg_id", "")
                     if self.deliver_now(msg):
@@ -650,13 +760,15 @@ class SyncEngine:
     如果对方有给我的本地 agent 的消息，就 poll 过来。
     """
     def __init__(self, mail_engine, get_peers_func, self_url="",
-                 on_peer_agents=None):
+                 on_peer_agents=None, health=None):
         self.mail = mail_engine
         self.get_peers = get_peers_func
         self.self_url = self_url
         # v5.0.1: 对端 gossip 响应携带 local_agents 时回调
         # f(peer_node_name, [agent, ...])，宿主侧记入 peers 用于投递归属
         self.on_peer_agents = on_peer_agents
+        # v5.0.2: 与 MessageDelivery 共享的连接熔断器
+        self.health = health or PeerHealth()
         self._stop = threading.Event()
 
     def stop(self):
@@ -664,6 +776,9 @@ class SyncEngine:
 
     def sync_with_peer(self, url, token):
         """和一个 peer 同步：告诉它我的本地 agent，拉取给我的消息。"""
+        # v5.0.2: 冷却中的 peer 跳过本轮 gossip（死节点不再拖慢同步循环）
+        if not self.health.is_available(url):
+            return None
         try:
             base = url.rstrip("/")
             for suffix in ["/mcp", "/sse", "/rpc"]:
@@ -682,8 +797,9 @@ class SyncEngine:
             req.add_header("Content-Type", "application/json; charset=utf-8")
             if token:
                 req.add_header("Authorization", "Bearer " + token)
-            with urllib.request.urlopen(req, timeout=10) as r:
+            with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT) as r:
                 resp = json.loads(r.read().decode("utf-8"))
+            self.health.record_success(url)   # v5.0.2: gossip 通了即恢复健康
 
             # v5.0.1: 记录对端 agent 归属（用于 deliver_now 的远程 agent 匹配）
             if self.on_peer_agents and isinstance(resp, dict):
@@ -702,6 +818,8 @@ class SyncEngine:
                     self.mail.inbox_append(m)
             return resp
         except Exception:
+            # v5.0.2: gossip 失败计入熔断（与投递共享冷却状态）
+            self.health.record_failure(url)
             return None
 
     def _poll_peer(self, base, token, agent_name):
@@ -711,7 +829,7 @@ class SyncEngine:
             req = urllib.request.Request(poll_url)
             if token:
                 req.add_header("Authorization", "Bearer " + token)
-            with urllib.request.urlopen(req, timeout=10) as r:
+            with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT) as r:
                 return json.loads(r.read().decode("utf-8")).get("messages", [])
         except Exception:
             return []
