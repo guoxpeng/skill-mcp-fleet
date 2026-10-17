@@ -145,6 +145,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
       ph += '<div class="peer'+(p.online?" on":"")+'">'
         + '<span class="st"></span><span class="nm">'+esc(p.name)+'</span>'
         + (p.token?'<span class="badge ok">已配对</span>':'<span class="badge">未配对</span>')
+        + (p.cooldown?'<span class="badge">冷却 '+p.cooldown+'s</span>':'')
         + '<div class="meta">'+esc(p.url)
         + '<br>'+esc(p.added_by||"")+(p.last_seen_ago!=null?(' · '+p.last_seen_ago+'s 前发现'):'')
         + '</div></div>';
