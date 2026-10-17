@@ -52,7 +52,14 @@ import io
 import urllib.parse
 import urllib.request
 import urllib.error
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+try:
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+except ImportError:
+    # Python 3.6 没有 ThreadingHTTPServer（3.7+ 才有），手动构造
+    from http.server import BaseHTTPRequestHandler, HTTPServer
+    from socketserver import ThreadingMixIn
+    class ThreadingHTTPServer(ThreadingMixIn, HTTPServer):
+        pass
 try:
     from fleet_proto import (MailEngine, DiscoveryLayer, MessageDelivery,
                              SyncEngine, DEFAULT_DISCOVER_PORT, PROTO_VERSION)
@@ -303,7 +310,7 @@ def _check_path(p):
         # （Linux 下 os.sep 就是 "/"，与原行为完全等价）
         if rr == "/" or ap == rr or ap.startswith(rr.rstrip("/\\") + os.sep):
             return ap
-    raise ValueError("路径不在允许范围内: %s" % ap)
+    raise ValueError("Path not in allowed roots / 路径不在允许范围内: %s" % ap)
 
 
 def _which(cmd):
@@ -648,14 +655,14 @@ def t_write(a):
             mode = "a" if a.get("mode", "overwrite") == "append" else "w"
             with open(p, mode, encoding="utf-8") as f:
                 f.write(a.get("content", ""))
-            return "[exit 0] 写入成功: " + p, False
+            return "[exit 0] Write OK / 写入成功: " + p, False
         except Exception as e:
             return "[exit 1]\n[写入失败] %r" % (e,), True
     op = ">>" if a.get("mode", "overwrite") == "append" else ">"
     cmd = "cat " + op + " " + shlex.quote(p)
     code, out, err = run_local(cmd, sudo=bool(a.get("sudo")), stdin=a.get("content", ""))
     if code == 0:
-        return "[exit 0] 写入成功: " + p, False
+        return "[exit 0] Write OK / 写入成功: " + p, False
     return fmt_result(code, out, err), True
 
 
@@ -670,10 +677,14 @@ def t_edit(a):
         old, new = a.get("oldText", ""), a.get("newText", "")
         if old not in s:
             return "[exit 3]\nNOT_FOUND", True
+        if a.get("dryRun"):
+            preview = s.replace(old, new, 1)
+            return "[exit 0] dryRun preview / 预览修改（未实际写入）:\n" + preview, False
         open(p, "w", encoding="utf-8").write(s.replace(old, new, 1))
         return "[exit 0]\nOK", False
     b_old = base64.b64encode(a.get("oldText", "").encode()).decode()
     b_new = base64.b64encode(a.get("newText", "").encode()).decode()
+    _dry_run = bool(a.get("dryRun"))
     script = (
         "python3 - <<'__MCP_EDIT_EOF__'\n"
         "import base64, sys\n"
@@ -686,6 +697,8 @@ def t_edit(a):
         "    print('READ_FAIL', e); sys.exit(2)\n"
         "if old not in s:\n"
         "    print('NOT_FOUND'); sys.exit(3)\n"
+        "if " + repr(_dry_run) + ":\n"
+        "    print('DRYRUN_PREVIEW:'); print(s.replace(old, new, 1)); sys.exit(0)\n"
         "open(p, 'w', encoding='utf-8').write(s.replace(old, new, 1))\n"
         "print('OK')\n"
         "__MCP_EDIT_EOF__"
@@ -695,7 +708,7 @@ def t_edit(a):
 
 
 def t_list_dir(a):
-    p = _check_path(a.get("path", "/"))
+    p = _check_path(a.get("filePath") or a.get("path", "/"))
     if _is_windows():
         # Windows 无 ls，直接用 os.scandir
         try:
@@ -792,6 +805,124 @@ def t_http_get(a):
     cmd = "curl -sS -m %d -w '\\n[HTTP %%{http_code}]' " % t + shlex.quote(url)
     code, out, err = run_local(cmd)
     return fmt_result(code, out, err), code != 0
+
+
+
+
+# ---------------------------------------------------------------------------
+# P2 增强工具
+# ---------------------------------------------------------------------------
+def t_search(a):
+    """P2-1: 文件内容/文件名搜索，结构化输出。"""
+    path = _check_path(a.get("filePath") or a.get("path", "/"))
+    pattern = a["pattern"]
+    search_type = a.get("type", "content")  # content or filename
+    max_results = int(a.get("maxResults", 50))
+    if search_type == "filename":
+        cmd = "find %s -name %s -type f 2>/dev/null | head -%d" % (
+            shlex.quote(path), shlex.quote("*" + pattern + "*"), max_results)
+    else:
+        cmd = "grep -rn --include='*' %s %s 2>/dev/null | head -%d" % (
+            shlex.quote(pattern), shlex.quote(path), max_results)
+    code, out, err = run_local(cmd)
+    return fmt_result(code, out, err), code != 0
+
+
+def t_upload(a):
+    """P2-2: base64 内容写入文件（用于二进制文件传输）。"""
+    p = _check_path(a["filePath"])
+    b64data = a["content"]  # base64 编码的内容
+    try:
+        raw = base64.b64decode(b64data)
+    except Exception as e:
+        return "[exit 1] base64 decode failed: %r" % (e,), True
+    if _is_windows():
+        try:
+            with open(p, "wb") as f:
+                f.write(raw)
+            return "[exit 0] Upload OK / 上传成功: %s (%d bytes)" % (p, len(raw)), False
+        except Exception as e:
+            return "[exit 1] Write failed: %r" % (e,), True
+    # Linux: 用 base64 -d 写入
+    cmd = "base64 -d > " + shlex.quote(p)
+    code, out, err = run_local(cmd, sudo=bool(a.get("sudo")), stdin=b64data)
+    if code == 0:
+        return "[exit 0] Upload OK / 上传成功: %s (%d bytes)" % (p, len(raw)), False
+    return fmt_result(code, out, err), True
+
+
+def t_download(a):
+    """P2-2: 读取文件返回 base64 内容（用于二进制文件传输）。"""
+    p = _check_path(a["filePath"])
+    if _is_windows():
+        try:
+            with open(p, "rb") as f:
+                raw = f.read()
+            return base64.b64encode(raw).decode(), False
+        except Exception as e:
+            return "[exit 1] Read failed: %r" % (e,), True
+    cmd = "base64 " + shlex.quote(p)
+    code, out, err = run_local(cmd)
+    return fmt_result(code, out, err), code != 0
+
+
+def t_ps(a):
+    """P2-5: 进程列表，结构化输出。"""
+    all_procs = bool(a.get("all", False))
+    cmd = "ps -eo pid,ppid,user,pcpu,pmem,comm,args --sort=-pcpu"
+    if not all_procs:
+        cmd += " | head -20"
+    code, out, err = run_local(cmd)
+    return fmt_result(code, out, err), code != 0
+
+
+def t_kill(a):
+    """P2-5: 终止进程。"""
+    pid = str(a["pid"])
+    signal_name = a.get("signal", "TERM")
+    # 只允许数字 PID，防止注入
+    if not pid.isdigit():
+        return "[exit 1] Invalid PID / 无效的 PID: %s" % pid, True
+    valid_signals = {"TERM", "KILL", "HUP", "INT", "STOP", "CONT", "USR1", "USR2"}
+    if signal_name not in valid_signals:
+        return "[exit 1] Invalid signal / 无效信号: %s" % signal_name, True
+    cmd = "kill -%s %s" % (signal_name, pid)
+    code, out, err = run_local(cmd, sudo=bool(a.get("sudo")))
+    return fmt_result(code, out, err), code != 0
+
+
+def t_net_check(a):
+    """P2-5: 网络诊断工具 - 端口探测/DNS 解析。"""
+    action = a.get("action", "port")
+    if action == "port":
+        host = a["host"]
+        port = int(a["port"])
+        timeout = float(a.get("timeout", 5))
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.settimeout(timeout)
+            result = sock.connect_ex((host, port))
+            sock.close()
+            if result == 0:
+                return "[exit 0] Port %s:%d is OPEN / 端口开放" % (host, port), False
+            else:
+                return "[exit 1] Port %s:%d is CLOSED (errno=%d) / 端口关闭" % (host, port, result), True
+        except Exception as e:
+            return "[exit 1] Connection error: %r" % (e,), True
+    elif action == "dns":
+        domain = a["host"]
+        try:
+            addrs = socket.getaddrinfo(domain, None)
+            unique = sorted(set(addr[4][0] for addr in addrs))
+            return "[exit 0] DNS %s -> %s" % (domain, ", ".join(unique)), False
+        except Exception as e:
+            return "[exit 1] DNS resolve failed: %r" % (e,), True
+    elif action == "listen":
+        # 列出本机监听端口
+        cmd = "ss -tlnp 2>/dev/null || netstat -tlnp 2>/dev/null"
+        code, out, err = run_local(cmd)
+        return fmt_result(code, out, err), code != 0
+    return "[exit 1] Unknown action: %s" % action, True
 
 
 # ---------------------------------------------------------------------------
@@ -1930,13 +2061,14 @@ BASE_TOOLS = [
          "filePath": {"type": "string"}, "content": {"type": "string"},
          "mode": {"type": "string", "enum": ["overwrite", "append"]},
          "sudo": {"type": "boolean"}}, "required": ["filePath", "content"]}),
-    ("edit", "替换文件中指定的文本块（oldText -> newText），无需整文件重写。",
+    ("edit", "替换文件中指定的文本块（oldText -> newText），无需整文件重写。dryRun=true 只预览不实际修改。",
      {"type": "object", "properties": {
          "filePath": {"type": "string"}, "oldText": {"type": "string"},
-         "newText": {"type": "string"}, "sudo": {"type": "boolean"}},
+         "newText": {"type": "string"}, "sudo": {"type": "boolean"},
+         "dryRun": {"type": "boolean", "description": "预览修改效果但不实际写入"}},
          "required": ["filePath", "oldText", "newText"]}),
-    ("list_dir", "列出目录内容。",
-     {"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"]}),
+    ("list_dir", "列出目录内容（filePath 指定目录，兼容旧参数 path）。",
+     {"type": "object", "properties": {"filePath": {"type": "string"}, "path": {"type": "string", "description": "deprecated, use filePath"}}, "required": ["filePath"]}),
     ("docker_ps", "列出 Docker 容器（all=true 含已停止）。",
      {"type": "object", "properties": {"all": {"type": "boolean"}}}),
     ("docker_logs", "查看指定容器日志尾部。",
@@ -1976,6 +2108,33 @@ BASE_TOOLS = [
      {"type": "object", "properties": {"job_id": {"type": "string"}}, "required": ["job_id"]}),
     ("exec_jobs", "列出当前所有后台任务（job_id / 状态 / 输出大小）。",
      {"type": "object", "properties": {}}),
+    ("search", "P2: 在指定目录下搜索文件内容(grep)或文件名(find)，结构化输出。",
+     {"type": "object", "properties": {
+         "filePath": {"type": "string", "description": "搜索目录"},
+         "pattern": {"type": "string", "description": "搜索关键词"},
+         "type": {"type": "string", "enum": ["content", "filename"], "description": "content=搜内容, filename=搜文件名"},
+         "maxResults": {"type": "number", "description": "最大返回条数，默认50"}},
+      "required": ["filePath", "pattern"]}),
+    ("upload", "P2: 上传 base64 编码的文件内容到指定路径（用于二进制文件传输）。",
+     {"type": "object", "properties": {
+         "filePath": {"type": "string"}, "content": {"type": "string", "description": "base64 编码的内容"},
+         "sudo": {"type": "boolean"}}, "required": ["filePath", "content"]}),
+    ("download", "P2: 读取文件并返回 base64 编码内容（用于二进制文件传输）。",
+     {"type": "object", "properties": {
+         "filePath": {"type": "string"}}, "required": ["filePath"]}),
+    ("ps", "P2: 列出进程（按 CPU 排序），all=true 列出全部。",
+     {"type": "object", "properties": {"all": {"type": "boolean"}}}),
+    ("kill", "P2: 终止指定进程。signal 默认 TERM，可选 KILL/HUP/INT 等。",
+     {"type": "object", "properties": {
+         "pid": {"type": "number"}, "signal": {"type": "string"}, "sudo": {"type": "boolean"}},
+      "required": ["pid"]}),
+    ("net_check", "P2: 网络诊断。action=port(端口探测) dns(DNS解析) listen(列出本机监听端口)。",
+     {"type": "object", "properties": {
+         "action": {"type": "string", "enum": ["port", "dns", "listen"]},
+         "host": {"type": "string", "description": "目标主机/域名"},
+         "port": {"type": "number", "description": "目标端口(action=port时)"},
+         "timeout": {"type": "number", "description": "超时秒数(action=port时)"}},
+      "required": ["action"]}),
     ("msg_send", "节点间消息：给另一个 AI/节点发消息（存进本节点邮箱）。from=你的名字, to=对方名字或 *(广播), topic=可选主题。",
      {"type": "object", "properties": {
          "from": {"type": "string"}, "to": {"type": "string"}, "text": {"type": "string"},
@@ -2020,6 +2179,8 @@ BASE_FUNCS = {
     "exec_async": t_exec_async, "exec_poll": t_exec_poll,
     "exec_result": t_exec_result, "exec_kill": t_exec_kill,
     "exec_jobs": t_exec_jobs,
+    "search": t_search, "upload": t_upload, "download": t_download,
+    "ps": t_ps, "kill": t_kill, "net_check": t_net_check,
     "msg_send": t_msg_send, "msg_recv": t_msg_recv, "msg_history": t_msg_history,
     "node_mode": t_node_mode, "request_assist": t_request_assist,
     "assist_queue": t_assist_queue,
@@ -2044,10 +2205,36 @@ for _base, _fn in BASE_FUNCS.items():
     TOOL_FUNCS["nas_" + _base] = _fn
 
 
+
+# ---------------------------------------------------------------------------
+# P1-2: 操作审计日志
+# ---------------------------------------------------------------------------
+AUDIT_LOG_PATH = os.path.join(HERE, "audit.log")
+AUDIT_LOCK = threading.Lock()
+
+def _audit_log(tool_name, args_dict, client_ip=""):
+    """记录每次危险工具调用到审计日志。"""
+    if not CFG.get("audit_log", True):
+        return
+    try:
+        ts = time.strftime("%Y-%m-%d %H:%M:%S")
+        # 参数摘要：截断长值，避免日志爆炸
+        summary = {}
+        for k, v in (args_dict or {}).items():
+            s = str(v)
+            summary[k] = s[:200] + "..." if len(s) > 200 else s
+        line = "%s | ip=%s | tool=%s | args=%s\n" % (
+            ts, client_ip or "-", tool_name, json.dumps(summary, ensure_ascii=False))
+        with AUDIT_LOCK:
+            with open(AUDIT_LOG_PATH, "a") as f:
+                f.write(line)
+    except Exception:
+        pass  # 审计日志写入失败不应影响主流程
+
 def call_tool(name, args, _bypass_assisted=False):
     fn = TOOL_FUNCS.get(name)
     if not fn:
-        return {"content": [{"type": "text", "text": "未知工具: %s" % name}], "isError": True}
+        return {"content": [{"type": "text", "text": "Unknown tool / 未知工具: %s" % name}], "isError": True}
     # v4.2: assisted 模式下，远程 agent 只能用白名单工具
     # node_mode/request_assist/assist_queue 始终可用
     # _bypass_assisted=True 时跳过限制（本机 agent approve 时用）
@@ -2063,11 +2250,16 @@ def call_tool(name, args, _bypass_assisted=False):
                 "[assisted 模式] 工具 %s 需要本机 agent 批准。\n"
                 "请用 request_assist 提交辅助请求，或用 node_mode action=set_control control_mode=direct 切换为直接控制。" % name}],
                 "isError": True}
+    # P1-2: 审计危险工具
+    _dangerous = {"exec", "exec_async", "write", "edit", "docker_restart", "systemctl"}
+    _bare = name.replace(PREFIX, "").replace("nas_", "")
+    if _bare in _dangerous:
+        _audit_log(name, args)
     try:
         text, is_err = fn(args or {})
         return {"content": [{"type": "text", "text": text}], "isError": bool(is_err)}
     except KeyError as e:
-        return {"content": [{"type": "text", "text": "缺少参数: %s" % e}], "isError": True}
+        return {"content": [{"type": "text", "text": "Missing parameter / 缺少参数: %s" % e}], "isError": True}
     except ValueError as e:
         return {"content": [{"type": "text", "text": str(e)}], "isError": True}
     except Exception as e:
@@ -2590,6 +2782,10 @@ def main():
                     help="未配置 auth_token 时拒绝启动（公网/隧道场景建议开启）")
     ap.add_argument("--generate-token", action="store_true",
                     help="未配置 auth_token 时自动生成一个并写回配置文件（权限 0600）")
+    ap.add_argument("--tls-cert", default=None,
+                    help="TLS 证书文件路径（PEM 格式），启用 HTTPS")
+    ap.add_argument("--tls-key", default=None,
+                    help="TLS 私钥文件路径（PEM 格式），启用 HTTPS")
     args = ap.parse_args()
 
     # ---- 鉴权前置校验（v3.1）---------------------------------------------
@@ -2610,8 +2806,17 @@ def main():
     global LISTEN_PORT
     LISTEN_PORT = args.port
     httpd = FleetHTTPServer((args.host, args.port), Handler)
+    # P1-1: TLS 支持
+    if args.tls_cert and args.tls_key:
+        import ssl as _ssl
+        ctx = _ssl.SSLContext(_ssl.PROTOCOL_TLS_SERVER)
+        ctx.load_cert_chain(args.tls_cert, args.tls_key)
+        httpd.socket = ctx.wrap_socket(httpd.socket, server_side=True)
+        print("  TLS             : 已启用（证书: %s）" % args.tls_cert)
+        _mcp_url = "https://%s:%d/mcp" % (args.host, args.port)
+    else:
+        _mcp_url = "http://%s:%d/mcp" % (args.host, args.port)
     # v4.3: 醒目的设备码 + API + 配对命令
-    _mcp_url = "http://%s:%d/mcp" % (args.host, args.port)
     _bar = "═" * 60
     print("╔%s╗" % _bar)
     print("║  MCP Fleet 节点已启动 v%-47s║" % (SERVER_VERSION,))

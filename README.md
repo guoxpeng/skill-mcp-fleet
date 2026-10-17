@@ -1,6 +1,6 @@
 # MCP Fleet · 节点互控系统 v4.4
 
-> 零依赖 · 纯 Python 标准库 · 兼容 Python 3.6+ · 32 个工具 · 自研通讯协议
+> 零依赖 · 纯 Python 标准库 · 兼容 Python 3.6+ · 38 个工具（32 原有 + 6 新增增强） · 自研通讯协议
 
 给你的设备集群（NAS / 飞牛 OS / 树莓派 / 云主机 / 容器 / 手机…）每台装一个「节点」，即可被**任意支持 MCP 的 AI agent / 客户端**远程操控 —— WorkBuddy、Claude Desktop、Claude Code、Cursor、Cline、Cherry Studio、Codex 或你自己写的 agent 都行，不绑定某一家。
 
@@ -35,7 +35,7 @@
   ├── UDP :3199 广播自动发现同网段节点
   ├── HTTP /fleet/* 端点：消息投递、上线收信、邮箱同步
   ├── mailbox/ 邮箱：inbox + outbox + sent（store-and-forward）
-  └── 32 个工具：exec/read/write/edit/docker/systemctl + peer + msg + collab + mesh
+  └── 38 个工具（32 原有 + 6 新增增强）：exec/read/write/edit/docker/systemctl + peer + msg + collab + mesh
 ```
 
 ## 快速开始（3 步）
@@ -151,7 +151,7 @@ agent-b 节点启动 → UDP 广播 → 发现其他节点 → peer_add
 | `/fleet/register_agent` | POST | agent 注册到本节点 |
 | `/fleet/status` | GET | 邮箱状态 |
 
-## 工具清单（32 个）
+## 工具清单（38 个）
 
 | 类别 | 工具 | 作用 |
 |------|------|------|
@@ -214,7 +214,7 @@ mcp-fleet/
 ├── SKILL.md                          # AgentSkill 规范
 ├── mcp_agent_config.example.json     # 配置模板
 ├── scripts/
-│   ├── mcp_agent.py                  # 节点 MCP 服务器（核心，32 个工具）
+│   ├── mcp_agent.py                  # 节点 MCP 服务器（核心，38 个工具（32 原有 + 6 新增增强））
 │   ├── fleet_proto.py                # v4.1 自研通讯协议层
 │   ├── fleet.py                      # 主端统一 CLI
 │   ├── fleet_chat.py                 # AI 间消息 CLI
@@ -244,3 +244,26 @@ mcp-fleet/
 ## License
 
 MIT
+
+
+---
+
+## v4.5 增强更新（社区贡献）
+
+### Bug 修复
+- **P0: Python 3.6 兼容性** — `ThreadingHTTPServer` 在 Python 3.6 上不存在，添加 try/except fallback
+- **P0: 参数命名统一** — `list_dir` 的 `path` 参数统一为 `filePath`，保留 `path` 作为兼容别名
+- **P0: 工具数量修正** — README 工具数与实际代码同步
+
+### 安全增强
+- **P1: TLS 支持** — 新增 `--tls-cert` / `--tls-key` 参数，支持 HTTPS 加密传输
+- **P1: 操作审计日志** — `exec`/`write`/`edit`/`docker_restart`/`systemctl` 调用自动记录到 `audit.log`
+- **P1: 安全边界文档化** — `_check_path` 的限制范围在代码注释中明确说明
+
+### 功能增强
+- **P2: `search` 工具** — 文件内容搜索(grep)和文件名搜索(find)，结构化输出
+- **P2: `upload` / `download` 工具** — base64 编码文件传输，支持二进制文件
+- **P2: `ps` / `kill` 工具** — 进程列表和终止进程，带信号选择
+- **P2: `net_check` 工具** — 端口探测、DNS 解析、列出本机监听端口
+- **P2: `edit` dryRun** — `dryRun=true` 预览修改效果但不实际写入
+- **P2: 错误消息 i18n** — 错误提示改为中英双语
