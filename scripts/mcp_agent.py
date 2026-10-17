@@ -1629,7 +1629,7 @@ def t_caps(a):
 def t_mesh_caps(a):
     """查询 mesh 内所有节点的能力清单（本机 + 所有 peers）。"""
     result = {"self": get_caps(), "peers": {}}
-    peers = load_peers()
+    peers = load_peers().get("nodes", {})
     my_name = CFG.get("name", "node")
     for pname, pinfo in peers.items():
         try:
@@ -1777,7 +1777,7 @@ def t_group_disband(a):
 def t_mesh(a):
     """返回 mesh 拓扑信息：本节点 + 所有 peers 的在线状态和能力摘要。"""
     my_name = CFG.get("name", "node")
-    peers = load_peers()
+    peers = load_peers().get("nodes", {})
     topology = {"self": {"name": my_name, "caps": get_caps(), "online": True}}
     topology["peers"] = {}
     for pname, pinfo in peers.items():
