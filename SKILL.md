@@ -230,7 +230,7 @@ mcp-fleet/
 ├── SKILL.md                          # 本文件（AgentSkill 规范）
 ├── mcp_agent_config.example.json     # 配置模板
 ├── scripts/
-│   ├── mcp_agent.py                  # 节点 MCP 服务器（核心，32 个工具）
+│   ├── mcp_agent.py                  # 节点 MCP 服务器（核心，38 个工具）
 │   ├── fleet_proto.py                # v4.1 自研通讯协议层（UDP发现+store-and-forward+gossip）
 │   ├── fleet.py                      # 主端统一 CLI
 │   ├── demo.sh                       # 一键演示：双节点启动→跨节点exec→peer互联→拓扑（v4.5+）
