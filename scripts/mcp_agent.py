@@ -2331,6 +2331,36 @@ class Handler(BaseHTTPRequestHandler):
                 self._json(400, {"error": "missing name"})
             return
 
+        if path == "/fleet/pair":
+            # v4.3: 双向配对端点
+            try:
+                payload = json.loads(raw.decode("utf-8"))
+            except Exception:
+                self._json(400, {"error": "bad json"})
+                return
+            peer_name = payload.get("name", "")
+            peer_url = payload.get("url", "")
+            peer_token = payload.get("token", "")
+            if not peer_name or not peer_url:
+                self._json(400, {"error": "need name and url"})
+                return
+            # 本机 peer_add 对方
+            with PEERS_LOCK:
+                d = load_peers()
+                d["nodes"][peer_name] = {"url": peer_url, "token": peer_token,
+                                         "added_by": "pair", "updated": int(time.time())}
+                save_peers(d)
+            # 回传本机信息
+            self._json(200, {
+                "ok": True,
+                "my_name": SERVER_NAME,
+                "my_url": self_url(),
+                "my_token": CFG.get("auth_token", ""),
+                "my_version": SERVER_VERSION,
+                "message": "已登记 %s" % peer_name
+            })
+            return
+
         if path not in ("/mcp", "/rpc", ""):
             self._json(404, {"error": "not found"})
             return
@@ -2480,10 +2510,18 @@ def main():
     global LISTEN_PORT
     LISTEN_PORT = args.port
     httpd = FleetHTTPServer((args.host, args.port), Handler)
-    print("MCP 副端 Agent 已启动: %s v%s" % (SERVER_NAME, SERVER_VERSION))
-    print("  Streamable HTTP : http://%s:%d/mcp" % (args.host, args.port))
-    print("  SSE             : http://%s:%d/sse" % (args.host, args.port))
-    print("  状态页          : http://%s:%d/" % (args.host, args.port))
+    # v4.3: 醒目的设备码 + API + 配对命令
+    _mcp_url = "http://%s:%d/mcp" % (args.host, args.port)
+    _bar = "═" * 60
+    print("╔%s╗" % _bar)
+    print("║  MCP Fleet 节点已启动 v%-47s║" % (SERVER_VERSION,))
+    print("║%-60s║" % "")
+    print("║  设备码 : %-50s║" % SERVER_NAME)
+    print("║  API    : %-50s║" % _mcp_url)
+    print("║%-60s║" % "")
+    print("║  在其他设备上运行以下命令配对：                       ║")
+    print("║  fleet.py pair %s@%s" % (SERVER_NAME, _mcp_url) + " " * max(1, 60 - 18 - len(SERVER_NAME) - len(_mcp_url)) + "║")
+    print("╚%s╝" % _bar)
     print("  工具数          : %d (%s)" % (len(TOOLS), ", ".join(t["name"] for t in TOOLS[:4]) + " ..."))
     print("  工作目录        : %s" % CFG.get("work_dir"))
     print("  运行身份        : %s" % ("root" if _is_root() else "非 root"))

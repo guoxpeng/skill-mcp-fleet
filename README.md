@@ -1,4 +1,4 @@
-# MCP Fleet · 节点互控系统 v4.2
+# MCP Fleet · 节点互控系统 v4.3
 
 > 零依赖 · 纯 Python 标准库 · 兼容 Python 3.6+ · 32 个工具 · 自研通讯协议
 
@@ -17,6 +17,7 @@
 | 5 | **Mesh 拓扑可视化** | `fleet mesh` 一键打印全网拓扑图（谁连谁、谁在线、各节点能力） |
 | 6 | **连接模式** | `--mode temporary`（TTL 自动退出）/ `permanent`（长期在线） |
 | 7 | **控制模式** | `--control assisted`（本机 agent 审查）/ `direct`（直接控制），运行时可切换 |
+| 8 | **设备码配对** | 安装自动生成设备码，`fleet pair CODE@URL` 一键配对，A 有 agent 操控 B，双 agent 协作 |
 
 ## 架构
 
@@ -35,6 +36,24 @@
   ├── mailbox/ 邮箱：inbox + outbox + sent（store-and-forward）
   └── 32 个工具：exec/read/write/edit/docker/systemctl + peer + msg + collab + mesh
 ```
+
+## 快速开始（3 步）
+
+```
+1. 设备 A 安装：  sudo bash install.sh --port 3100
+   → 显示设备码 nas-a3f2 和 API http://192.168.1.10:3100/mcp
+
+2. 设备 B 安装：  sudo bash install.sh --port 3100
+   → 显示设备码 win-b7k9 和 API http://192.168.1.20:3100/mcp
+
+3. 在 B 上配对：  fleet.py pair nas-a3f2@http://192.168.1.10:3100/mcp
+   → 双向通讯建立！
+```
+
+**然后**：
+- A 有 Claude/Cursor → A 的 AI agent 可以 `exec`、`read`、`write` 操控 B
+- B 有 Claude/Cursor → B 的 AI agent 也可以操控 A
+- 两个 agent 可以 `msg_send` 互发消息、分工协作
 
 ## 快速安装
 

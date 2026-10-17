@@ -223,9 +223,16 @@ if [ -n "$ALLOW_IPS" ]; then
 fi
 
 # ---------- 基本信息 ----------
+# v4.3: 自动生成设备码（hostname前缀 + 4位hex），如 nas-a3f2
 if [ -z "$NAME" ]; then
-  NAME="$(hostname 2>/dev/null | tr 'A-Z' 'a-z' | tr -c 'a-z0-9' '-' | sed 's/-\+$//')"
-  [ -z "$NAME" ] && NAME="node"
+  _HOST_SHORT="$(hostname 2>/dev/null | tr 'A-Z' 'a-z' | tr -c 'a-z0-9' '-' | sed 's/-\+$//' | cut -c1-8)"
+  [ -z "$_HOST_SHORT" ] && _HOST_SHORT="node"
+  _HEX4="$(head -c 4 /dev/urandom 2>/dev/null | od -An -tx1 2>/dev/null | tr -d ' \n' | cut -c1-4)"
+  [ -z "$_HEX4" ] && _HEX4="$(date +%s | tail -c 5)"
+  NAME="${_HOST_SHORT}-${_HEX4}"
+  AUTO_NAME=1
+else
+  AUTO_NAME=0
 fi
 # ---------- Stage 0：平台识别 ----------
 # Termux（Android）：uname -o 返回 Android，或 $PREFIX/bin/pkg 存在
@@ -5207,50 +5214,39 @@ AUTH_TOK="$($PY3 -c "import json;print(json.load(open('$DIR/mcp_agent_config.jso
 
 cat <<EOF
 
-============================================================================
- 安装完成！
-----------------------------------------------------------------------------
- 副端标识 : $NAME
- 监听端口 : $PORT
- 安装目录 : $DIR
- 运行模式 : $MODE$([ "$MODE" = "systemd" ] && echo "（服务单元 ${UNIT}.service）" || echo "（守护进程，用 mcp-ctl.sh 管理）")
- 鉴权     : $(if [ -n "$AUTH_TOK" ]; then echo "已开启（Bearer token）"; else echo "未开启 —— 仅限内网；开公网隧道前请先设 auth_token"; fi)
- 状态查看 : $VERIFY_CMD
- 实时日志 : tail -f $DIR/agent.log
- 重启服务 : $(if [ "$MODE" = "systemd" ]; then echo "systemctl restart $UNIT"; else echo "bash $DIR/mcp-ctl.sh restart"; fi)
- 控制脚本 : bash $DIR/mcp-ctl.sh {start|stop|restart|status|log|tunnel}
- 手动前台 : $PY3 -u $DIR/mcp_agent.py --host 0.0.0.0 --port $PORT
-
-----------------------------------------------------------------------------
- 想用 AI 直接控制本节点：在任意 MCP 客户端（WorkBuddy / Claude / Cursor …）的配置里加：
-
-  "mcpServers": {
-    "$NAME": {
-      "type": "http",
-      "url": "$MCP_URL"$(if [ -n "$AUTH_TOK" ]; then echo ","; fi)
-$(if [ -n "$AUTH_TOK" ]; then echo "      \"headers\": { \"Authorization\": \"Bearer $AUTH_TOK\" }"; fi)
-    }
-  }
- $URL_NOTE
-
- 加完重启该客户端（或重载 MCP 配置）即可使用。
- 工具名形如： ${PREFIX}exec / ${PREFIX}sysinfo / ${PREFIX}peer_call ...
-
-----------------------------------------------------------------------------
- 节点互控（v3.5，不分主副）：本机已带控制端 $( [ -n "$FLEET_BIN" ] && echo "fleet 命令" || echo "$PY3 $DIR/fleet.py" )
-   和另一个节点双向配对（之后两边都能控制对方）：
-     fleet pair http://<对方IP>:3100/mcp --token <对方令牌>
-   别的节点要配对本机时，填：
-     地址 $MCP_URL$( [ -n "$AUTH_TOK" ] && printf '\n     令牌 %s' "$AUTH_TOK" )
-   配好后： fleet exec <对方名字> 'uptime'   或让 AI 调 peer_call
-
-----------------------------------------------------------------------------
- 可达性自查（重要）：
-   本机内网 IP 是 $IP。
-   * 若主端与副端在同一内网（家里 NAS / 飞牛 OS），用 http://$IP:$PORT/mcp 即可。
-   * 若是云容器（PAI-DSW / Docker / 云主机），上面这个内网地址主端连不上，
-     需要：bash $DIR/mcp-tunnel.sh   拿到公网地址后再填 mcp.json。
-============================================================================
+╔══════════════════════════════════════════════════════════════════════════╗
+║                                                                            ║
+║   安装完成！                                                               ║
+║                                                                            ║
+║   ┌─────────────────────────────────────────────────────────────────┐      ║
+║   │  设备码 : $NAME$(printf '%*s' $((30 - ${#NAME})) '')│      ║
+║   │  API    : $MCP_URL$(printf '%*s' $((30 - ${#MCP_URL})) '')│      ║
+║   └─────────────────────────────────────────────────────────────────┘      ║
+║                                                                            ║
+║   把上面这两行告诉另一台设备的 fleet，它们就能通讯：                      ║
+║                                                                            ║
+║     fleet.py pair $NAME@$MCP_URL$( [ -n "$AUTH_TOK" ] && printf ' --token %s' "$AUTH_TOK" )$(printf '%*s' $((10)) '')║
+║                                                                            ║
+║   或让 AI 直接控制本设备（加到 MCP 客户端配置）：                          ║
+║                                                                            ║
+║     "mcpServers": {                                                        ║
+║       "$NAME": { "type": "http", "url": "$MCP_URL"$( [ -n "$AUTH_TOK" ] && printf ',\n     \\"headers\\": { \\"Authorization\\": \\"Bearer %s\\" }' "$AUTH_TOK" ) }$(printf '%*s' $((8)) '')║
+║     }                                                                      ║
+║                                                                            ║
+╠══════════════════════════════════════════════════════════════════════════╣
+║  端口 : $PORT    目录 : $DIR    模式 : $MODE$([ "$MODE" = "systemd" ] && echo "(systemd)" || echo "(daemon)")$(printf '%*s' $((10)) '')║
+║  鉴权 : $(if [ -n "$AUTH_TOK" ]; then echo "已开启"; else echo "未开启（仅限内网）"; fi)$(printf '%*s' $((40)) '')║
+║  日志 : tail -f $DIR/agent.log$(printf '%*s' $((30)) '')║
+║  控制 : bash $DIR/mcp-ctl.sh {start|stop|restart|status}$(printf '%*s' $((12)) '')║
+╠══════════════════════════════════════════════════════════════════════════╣
+║  场景说明：                                                               ║
+║  • 本设备有 AI agent → 可远程操控其他已配对的设备（远程手）               ║
+║  • 本设备无 AI agent → 被其他设备的 agent 操控（提供算力/文件/环境）      ║
+║  • 两边都有 agent → 两个 agent 互相沟通协作，完成各自主人的任务           ║
+║                                                                            ║
+║  内网 IP: $IP$(printf '%*s' $((45)) '')║
+║  $URL_NOTE$(printf '%*s' $((10)) '')║
+╚══════════════════════════════════════════════════════════════════════════╝
 EOF
 
 # ---------------------------------------------------------------------------

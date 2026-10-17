@@ -1525,7 +1525,17 @@ def local_node(self_url=None):
 
 def cmd_pair(a):
     """双向配对：把对方登记到本机，再让对方把本机登记过去，最后从对方回连本机验证。"""
-    url, meta = resolve_target(a.target, port=a.port)
+    # v4.3: 支持 CODE@URL 格式（如 nas-a3f2@http://192.168.1.10:3100/mcp）
+    pair_name = None
+    target = a.target
+    if "@" in target and not target.startswith("http"):
+        parts = target.split("@", 1)
+        pair_name = parts[0].strip()
+        target = parts[1].strip()
+        print(ok("[+] ") + "设备码: %s" % pair_name)
+    if pair_name:
+        a.name = pair_name
+    url, meta = resolve_target(target, port=a.port)
     token = (a.token or meta.get("token") or "").strip()
     c = MCPClient(url, a.timeout, token=token)
     try:
@@ -1576,9 +1586,11 @@ def cmd_pair(a):
         print("    办法：本机开隧道（bash %s/mcp-tunnel.sh），或用 --self-url 指定对方能访问的地址后重跑 pair。"
               % me["dir"])
         return 3
-    print(ok("[+] ") + "双向验证通过：%s 能控制本机，本机也能控制 %s" % (rname, rname))
-    print(dim("    本机控制对方： fleet exec %s 'uptime'" % rname))
-    print(dim("    对方控制本机： 在 %s 上 fleet exec %s 'uptime'，或经 MCP 调 peer_call" % (rname, me["name"])))
+    print(ok("[+] ") + "配对成功！%s ↔ %s 双向通讯已建立" % (me["name"], rname))
+    print("")
+    print("  本机控制对方： fleet exec %s 'uptime'" % rname)
+    print("  对方控制本机： 在 %s 上 fleet exec %s 'uptime'" % (rname, me["name"]))
+    print("  AI 互发消息：  msg_send to=%s text='你好'" % rname)
     return 0
 
 
@@ -1879,8 +1891,8 @@ def build_parser():
     sp.add_argument("--timeout", type=int, default=10)
     sp.set_defaults(func=cmd_sync)
 
-    sp = sub.add_parser("pair", help="双向配对：互相登记，之后两边都能控制对方（v3.5）")
-    sp.add_argument("target", help="对方地址 http(s)://ip:3100/mcp，或已登记的名字")
+    sp = sub.add_parser("pair", help="双向配对：输入对方设备码@地址，两边自动互连（v4.3）")
+    sp.add_argument("target", help="设备码@API 地址（如 nas-a3f2@http://192.168.1.10:3100/mcp），或纯地址，或已登记的名字")
     sp.add_argument("--token", help="对方的 auth_token（对方开了鉴权必填）")
     sp.add_argument("--name", help="给对方起的名字（默认用对方自报的 name）")
     sp.add_argument("--self-url", help="对方回连本机用的地址（默认：本机隧道地址 > 内网 IP:端口）")

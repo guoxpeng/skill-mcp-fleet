@@ -11,10 +11,10 @@ description: |
   peer call, remote exec, 副端安装, 节点发现, agent 协作, task delegation, 
   message bus, mesh topology, 离线消息, 邮箱, mailbox, UDP discovery
 tags: [mcp, fleet, mesh, peer-to-peer, agent-collaboration, remote-control, zero-dependency, store-and-forward]
-version: 4.2.0
+version: 4.3.0
 ---
 
-# MCP Fleet · 节点互控系统 v4.2
+# MCP Fleet · 节点互控系统 v4.3
 
 ## 这是什么
 
@@ -46,6 +46,27 @@ sudo bash install.sh --name nas --port 3100
 ```bash
 sudo bash install.sh --name nas --port 3100 --tailnet my-tailnet --tailnet-key tskey-xxx
 ```
+
+### 设备码配对（v4.3 核心流程）
+
+安装后自动生成**设备码**（hostname 前缀 + 4 位随机，如 `nas-a3f2`），并醒目显示设备码 + API。
+
+**配对只需一步** — 在 B 设备上输入 A 的设备码和地址：
+
+```bash
+# 在设备 B 上运行（A 的设备码和 API 从 A 的安装输出复制）
+fleet.py pair nas-a3f2@http://192.168.1.10:3100/mcp
+```
+
+配对成功后，两台设备双向通讯已建立。
+
+**三种使用场景**：
+
+| 场景 | A 设备 | B 设备 | 效果 |
+|------|--------|--------|------|
+| A 操控 B | 有 AI agent | 无 agent（只装 fleet） | A 的 agent 远程操控 B（exec/read/write），B 是 A 的"远程手" |
+| B 操控 A | 无 agent | 有 AI agent | B 的 agent 远程操控 A |
+| 双向协作 | 有 AI agent | 有 AI agent | 两个 agent 互相发消息、分工协作，完成各自主人的任务 |
 
 ### 临时连接 + 本机辅助模式
 
