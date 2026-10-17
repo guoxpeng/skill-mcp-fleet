@@ -239,3 +239,122 @@ class TestPlatformGuard:
                               kill=lambda p: [777])
         assert act == {"restarted": True, "killed": [777]}
         assert len(calls) == 1  # 杀残留 -> 拉起，各一次
+# -*- coding: utf-8 *
+
+
+class TestWinHardening:
+    """v5.0.5 Windows 专项加固：系统代理豁免 / pythonw 回退链 / 命令容错。"""
+
+    inst = pytest.importorskip("install", reason="install 导入失败")
+
+    def test_probe_agent_ignores_system_proxy(self):
+        """代理软件环境（系统代理未豁免回环）下探活不再被劫持——防看门狗重启风暴。"""
+        import threading, http.server, json, urllib.request
+        s = self.inst
+
+        class H(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                b = json.dumps({"status": "ok", "server": "x",
+                                "version": "5.0.5"}).encode()
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(b)))
+                self.end_headers()
+                self.wfile.write(b)
+
+            def log_message(self, *a):
+                pass
+
+        srv = http.server.HTTPServer(("127.0.0.1", 0), H)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        port = srv.server_address[1]
+        # 安装指向死端口的假系统代理（模拟 Windows 代理软件未设 <local> 豁免）
+        urllib.request.install_opener(urllib.request.build_opener(
+            urllib.request.ProxyHandler({"http": "http://127.0.0.1:1"})))
+        try:
+            assert s.probe_agent(port, timeout=3) is True  # 修复后：禁代理直连
+            # 全链路：健康时 watchdog 零动作（不再误判宕机重启）
+            import tempfile, os
+            with tempfile.TemporaryDirectory() as td:
+                act = s.watchdog_once(port, td)
+            assert act is None
+        finally:
+            srv.shutdown()
+            urllib.request.install_opener(urllib.request.build_opener())  # 还原全局
+
+    def test_opener_for_private_direct(self, monkeypatch):
+        """私网/回环目标禁代理：真实服务 + 假系统代理下直连成功，默认 opener 被劫持（对照）。"""
+        import threading, http.server, urllib.request
+        fp = pytest.importorskip("fleet_proto", reason="fleet_proto 导入失败")
+
+        class H(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                b = b"ok"
+                self.send_response(200)
+                self.send_header("Content-Length", "2")
+                self.end_headers()
+                self.wfile.write(b)
+
+            def log_message(self, *a):
+                pass
+
+        srv = http.server.HTTPServer(("127.0.0.1", 0), H)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        url = "http://127.0.0.1:%d/x" % srv.server_address[1]
+        # 模拟 Windows 代理软件：系统代理指向死端口（未豁免回环）
+        monkeypatch.setattr(urllib.request, "getproxies",
+                            lambda: {"http": "http://127.0.0.1:1"})
+        try:
+            # 正向：_opener_for 对回环直连（ProxyHandler({}) 空代理语义）
+            with fp._opener_for(url).open(url, timeout=3) as r:
+                assert r.read() == b"ok"
+            # 反向对照：默认 opener（读 getproxies）同请求被假代理劫持
+            default = urllib.request.build_opener()
+            with pytest.raises(Exception):
+                default.open(url, timeout=3)
+        finally:
+            srv.shutdown()
+
+    def test_opener_for_public_keeps_proxy(self, monkeypatch):
+        """公网地址仍走系统代理（隧道/中转场景需要）。"""
+        import urllib.request
+        fp = pytest.importorskip("fleet_proto", reason="fleet_proto 导入失败")
+        monkeypatch.setattr(urllib.request, "getproxies",
+                            lambda: {"http": "http://1.2.3.4:8080"})
+        opener = fp._opener_for("http://example.com/mcp")
+        # 功能断言：公网 opener 的请求会尝试经 1.2.3.4:8080（不可达 -> 连接错误）
+        try:
+            opener.open("http://example.com/mcp", timeout=3)
+            raised = None
+        except Exception:
+            raised = True
+        assert raised is not None  # 走了假代理（而非直连成功）
+
+    def test_win_find_pythonw_venv_fallback(self, monkeypatch):
+        """venv（Scripts 下无 pythonw.exe）回退到 base_prefix 找，防登录闪黑窗。"""
+        s = self.inst
+        import sys as _sys
+        monkeypatch.setattr(s.sys, "executable", "/venv/Scripts/python.exe")
+        monkeypatch.setattr(_sys, "executable", "/venv/Scripts/python.exe")
+        monkeypatch.setattr(_sys, "base_prefix", "/real/py")
+        monkeypatch.setattr(_sys, "base_exec_prefix", "/real/py")
+
+        def fake_isfile(p):
+            return p == "/real/py/pythonw.exe"  # venv 无，真实目录有
+
+        monkeypatch.setattr(s.os.path, "isfile", fake_isfile)
+        assert s.win_find_pythonw() == "/real/py/pythonw.exe"
+
+    def test_win_find_pythonw_final_fallback(self, monkeypatch):
+        """都找不到时回退当前解释器（行为不崩）。"""
+        s = self.inst
+        import sys as _sys
+        monkeypatch.setattr(_sys, "executable", "/venv/Scripts/python.exe")
+        monkeypatch.setattr(_sys, "base_prefix", "/real/py")
+        monkeypatch.setattr(s.os.path, "isfile", lambda p: False)
+        assert s.win_find_pythonw() == "/venv/Scripts/python.exe"
+
+    def test_run_cmd_decodes_leniently(self):
+        """_run_cmd 正常命令返回 rc=0 且输出可读（errors=replace 不抛解码异常）。"""
+        s = self.inst
+        rc, out = s._run_cmd(["echo", "hello-fleet"])
+        assert rc == 0 and "hello-fleet" in out
