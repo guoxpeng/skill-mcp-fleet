@@ -90,7 +90,7 @@ for _stream in (sys.stdout, sys.stderr):
 DEFAULT_CONFIG = {
     "name": "node",             # 副端标识（显示在状态页与 serverInfo）
     "tool_prefix": "",          # 工具名前缀，如 "nas_"；留空则用裸名（exec/read/...）
-    "version": "5.0.4",
+    "version": "5.0.5",
     "sudo_password": "",        # 留空且非 root 时会尝试免密 sudo
     "work_dir": "/",            # 默认工作目录
     "command_timeout": 120,     # 秒
@@ -2157,7 +2157,9 @@ def _send_goodbye():
                 }).encode("utf-8")
                 req = urllib.request.Request(url + "/fleet/discover", data=payload, method="POST")
                 req.add_header("Content-Type", "application/json")
-                urllib.request.urlopen(req, timeout=5)
+                # v5.0.5: 走 _peer_opener（内网禁代理），与投递/gossip 同规则
+                with _peer_opener(url).open(req, timeout=5):
+                    pass
             except Exception:
                 pass
     except Exception:
