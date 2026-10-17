@@ -4,7 +4,6 @@
 > 赛道：**通用赛道 · 开发工具**
 > 作者：guoxpeng ｜ 开源仓库：https://github.com/guoxpeng/skill-mcp-fleet
 
-https://0519i.com/1792233507871.mp4
 ---
 
 ## 一、核心叙事
