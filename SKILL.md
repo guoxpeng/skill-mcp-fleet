@@ -1,13 +1,13 @@
 ---
 name: mcp-fleet
-version: 5.0.1
-description: 把闲置的NAS、云主机、办公室电脑、软路由变成一张「AI对等协作网」——设备上的AI Agent互发消息、按能力委派任务、离线不丢消息（store-and-forward邮箱），零依赖一条命令装机。自研通讯协议（UDP广播发现+HTTP消息端点+gossip同步），设备码/邀请链接安全确权，41个工具，支持TLS加密、消息落盘加密（PBKDF2派生密钥）、UDP hello防伪签名、Web Dashboard实时拓扑、Windows一键安装、61用例测试套件，不依赖任何外部服务。当用户提到：管NAS、控制家里电脑、远程操控设备、多台设备互联、让AI操作电脑、设备上的AI协作、远程执行命令、离线留言给AI、软路由排查、家里服务器管理、设备监控面板、Windows远程管理、fleet、MCP组网等需求时使用本技能。
+version: 5.0.2
+description: 把闲置的NAS、云主机、办公室电脑、软路由变成一张「AI对等协作网」——设备上的AI Agent互发消息、按能力委派任务、离线不丢消息（store-and-forward邮箱），零依赖一条命令装机。自研通讯协议（UDP广播发现+HTTP消息端点+gossip同步），设备码/邀请链接安全确权，41个工具，支持TLS加密、消息落盘加密（PBKDF2派生密钥）、UDP hello防伪签名、Web Dashboard实时拓扑、Windows一键安装、70用例测试套件，不依赖任何外部服务。当用户提到：管NAS、控制家里电脑、远程操控设备、多台设备互联、让AI操作电脑、设备上的AI协作、远程执行命令、离线留言给AI、软路由排查、家里服务器管理、设备监控面板、Windows远程管理、fleet、MCP组网等需求时使用本技能。
 tags: 设备互联, MCP, 远程操控, 效率工具, 开发工具, 自研协议, agent协作, 离线邮箱
 ---
 
 # MCP Fleet · 节点互控系统 v5.0
 
-> 软件包下载：[GitHub Release v5.0.1](https://github.com/guoxpeng/skill-mcp-fleet/releases/tag/v5.0.1) ｜
+> 软件包下载：[GitHub Release v5.0.2](https://github.com/guoxpeng/skill-mcp-fleet/releases/tag/v5.0.2) ｜
 > 全版本更新说明：[CHANGELOG.md](https://github.com/guoxpeng/skill-mcp-fleet/blob/main/CHANGELOG.md)
 
 ## 这是什么
