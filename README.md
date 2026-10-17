@@ -6,8 +6,8 @@
 > 赛道：**通用赛道 · 开发工具**
 > 作者：guoxpeng ｜ 开源仓库：https://github.com/guoxpeng/skill-mcp-fleet
 >
-> **软件包下载**：[GitHub Release v5.0.0](https://github.com/guoxpeng/skill-mcp-fleet/releases/tag/v5.0.0)（`mcp-fleet-v5.0.0.zip`）
-> **版本历史**：[CHANGELOG.md](https://github.com/guoxpeng/skill-mcp-fleet/blob/main/CHANGELOG.md)（13 个版本演进，git tag 与参赛版本号对齐）
+> **软件包下载**：[GitHub Release v5.0.1](https://github.com/guoxpeng/skill-mcp-fleet/releases/tag/v5.0.1)（`mcp-fleet-v5.0.1.zip`）
+> **版本历史**：[CHANGELOG.md](https://github.com/guoxpeng/skill-mcp-fleet/blob/main/CHANGELOG.md)（14 个版本演进，git tag 与参赛版本号对齐）
 >
 > 觉得有用？欢迎去仓库点一个 **Star** ⭐ —— 你的star会让更多人看到这张「AI 协作网」。
 
