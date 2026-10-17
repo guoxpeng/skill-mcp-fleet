@@ -97,3 +97,145 @@ class TestAuditRotation:
         mp.audit_log("peer_call", "a", "b", "exec", "ok")   # 应触发轮转并写入新文件
         assert (tmp_path / "audit.log.1").read_text() == "old" * 100
         assert "peer_call" in audit.read_text()
+# -*- coding: utf-8 *
+
+
+class TestPlatformGuard:
+    """v5.0.4 平台守护：launchd plist / schtasks 构造 / 看门狗（纯逻辑，跨平台可测）。"""
+
+    inst = pytest.importorskip("install", reason="install 导入失败")
+
+    def test_sanitize_label(self):
+        s = self.inst
+        assert s.sanitize_label("office pc.1") == "office-pc-1"
+        assert s.sanitize_label("") == "node"
+        assert s.sanitize_label("a" * 100) == "a" * 40  # 截断防超长 Label
+
+    def test_launchd_plist_structure(self):
+        s = self.inst
+        p = s.build_launchd_plist("office-pc", "/usr/bin/python3",
+                                  "/Users/x/.mcp-fleet", 3100)
+        for key in ("<key>RunAtLoad</key>", "<key>KeepAlive</key>",
+                    "<key>ThrottleInterval</key>", "<key>WorkingDirectory</key>"):
+            assert key in p, key
+        assert "<string>com.mcp-fleet.office-pc</string>" in p
+        assert "--port" in p and "<string>3100</string>" in p  # 端口进了 ProgramArguments
+        assert "<true/>" in p  # RunAtLoad/KeepAlive 布尔真
+
+    def test_launchd_plist_escapes_xml(self):
+        """安装路径含 & < 时 plist 仍是合法 XML。"""
+        s = self.inst
+        p = s.build_launchd_plist("n", "/usr/bin/python3", '/Users/a&b/c<d', 3100)
+        assert '<string>/Users/a&amp;b/c&lt;d</string>' in p
+
+    def test_schtasks_onlogon_cmd(self):
+        s = self.inst
+        c = s.build_schtasks_onlogon("C:\\py\\pythonw.exe", "C:\\fleet", 3100)
+        assert c[0] == "schtasks" and "/SC" in c and "ONLOGON" in c
+        tr = c[-1]
+        assert "pythonw" in tr and "mcp_agent.py" in tr and "3100" in tr
+
+    def test_schtasks_watchdog_cmd(self):
+        s = self.inst
+        c = s.build_schtasks_minute("C:\\py\\python.exe", "C:\\fleet", 3100)
+        assert "MINUTE" in c and "/MO" in c and c[c.index("/MO") + 1] == "1"
+        tr = c[-1]
+        assert "--watchdog" in tr and "install.py" in tr and "--port 3100" in tr
+
+    def test_netstat_pid_parsing(self):
+        s = self.inst
+        sample = "\n".join([
+            "  TCP    0.0.0.0:3100           0.0.0.0:0              LISTENING       12345",
+            "  TCP    [::]:3100              [::]:0                 LISTENING       12345",
+            "  TCP    192.168.1.5:3100       10.0.0.2:8080          ESTABLISHED     12345",
+            "  TCP    0.0.0.0:3101           0.0.0.0:0              LISTENING       99999",
+        ])
+        assert s.parse_netstat_pids(sample, 3100) == [12345]  # v4+v6 去重，排除 ESTABLISHED
+        assert s.parse_netstat_pids(sample, 3101) == [99999]
+        assert s.parse_netstat_pids(sample, 3102) == []
+
+    def test_tasklist_python_filter(self):
+        s = self.inst
+        tl = "\n".join([
+            "Image Name                     PID Session Name",
+            "========================= ======== ================",
+            "svchost.exe                  12345 Services",
+        ])
+        assert s.parse_tasklist_image(tl) == "svchost.exe"
+        assert s.is_python_image("python.exe") and s.is_python_image("pythonw.exe")
+        assert s.is_python_image("python3.11.exe")  # 版本号后缀也算
+        assert not s.is_python_image("svchost.exe")  # 非 python 映像不杀
+
+    def test_probe_agent_verifies_json(self):
+        """探活必须校验 /health 的 JSON 结构：200 但非 agent 结构 -> 不算健康（防误判）。"""
+        import threading, http.server, json
+        s = self.inst
+
+        class AgentLike(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                b = json.dumps({"status": "ok", "server": "x",
+                                "version": "5.0.4"}).encode()
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(b)))
+                self.end_headers()
+                self.wfile.write(b)
+
+            def log_message(self, *a):
+                pass
+
+        class Stranger(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                b = b"<html>welcome</html>"
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(b)))
+                self.end_headers()
+                self.wfile.write(b)
+
+            def log_message(self, *a):
+                pass
+
+        srvs = []
+        for handler, expect in ((AgentLike, True), (Stranger, False)):
+            srv = http.server.HTTPServer(("127.0.0.1", 0), handler)
+            threading.Thread(target=srv.serve_forever, daemon=True).start()
+            assert s.probe_agent(srv.server_address[1], timeout=3) is expect
+            srvs.append(srv)
+        assert s.probe_agent(1, timeout=0.5) is False  # 连接失败 -> 不健康
+        for srv in srvs:
+            srv.shutdown()
+
+    def test_watchdog_healthy_noop(self, tmp_path):
+        s = self.inst
+        calls = []
+        # 裸奔模式（无 auth_token 配置文件）-> 匿名探活
+        act = s.watchdog_once(3100, str(tmp_path),
+                              probe=lambda p, timeout=5.0, token=None: True,
+                              spawn=lambda *a: calls.append(a),
+                              kill=lambda p: calls.append(("kill", p)))
+        assert act is None and calls == []  # 健康时零动作
+
+    def test_watchdog_reads_token_for_probe(self, tmp_path):
+        """开鉴权节点：watchdog 自动读 auth_token 带凭据探活（匿名 /health 是 401）。"""
+        s = self.inst
+        import json as _json
+        (tmp_path / "mcp_agent_config.json").write_text(
+            _json.dumps({"auth_token": "TOK123"}))
+        seen = {}
+
+        def fake_probe(p, timeout=5.0, token=None):
+            seen["token"] = token
+            return True
+
+        s.watchdog_once(3100, str(tmp_path), probe=fake_probe,
+                        spawn=lambda *a: None, kill=lambda p: [])
+        assert seen["token"] == "TOK123"  # 从安装目录配置读出并传给探活
+
+    def test_watchdog_unhealthy_restarts(self, tmp_path):
+        s = self.inst
+        calls = []
+        act = s.watchdog_once(3100, str(tmp_path),
+                              probe=lambda p, timeout=5.0, token=None: False,
+                              spawn=lambda *a: calls.append(a),
+                              kill=lambda p: [777])
+        assert act == {"restarted": True, "killed": [777]}
+        assert len(calls) == 1  # 杀残留 -> 拉起，各一次
