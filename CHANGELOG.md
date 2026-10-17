@@ -6,7 +6,47 @@
 
 ---
 
-## [5.0.0] — 2026-10-17 · 当前参赛版本（git tag: v5.0.0）
+## [5.0.1] — 2026-10-17 · 稳定性版本（git tag: v5.0.1）
+
+**二轮代码审查捕获的四个 bug：投递正确性、加密正确性、性能、跨平台各一，全部实锤复现后修复。**
+
+### 修复
+- **[严重] 邮箱明文回写（加密静默失效）**：`_load_jsonl` 读取时解密 → 修改（投递重试计数 /
+  成功移出 / poll 拉取）→ `_save_jsonl` 写回时未重新加密，一次 outbox 重试后整个邮箱文件
+  退化为明文，落盘加密形同虚设（投递循环每 15s 触发一次）。修复：`_save_jsonl` 写盘前对
+  每条消息过 `_encrypt_field`（幂等：已有 `enc1$` 前缀不会二次加密），inbox/outbox/sent
+  全路径覆盖。实锤：修复前 `outbox_increment_attempt` 一次后文件全明文；修复后任意读写
+  轮次密文保持。
+- **[架构] 远程 agent 单播永远投不出去**：`deliver_now` 只匹配 `to in peers`（节点名），
+  单播给远程 agent（agent 名）永不命中 → 返回 False → 消息滞留 outbox 无法自动投递
+  （仅 `to=*` 广播可经 poll 到达），且 `/fleet/sync` 收到对端 `local_agents` 直接丢弃、
+  归属信息不传播。修复三件套：① `deliver_now` 新增 agent 归属匹配——`to` 非 peer 名且
+  非 `*` 时遍历 peers 的 `agents` 列表，命中则投给宿主节点；② `SyncEngine` 新增
+  `on_peer_agents` 回调，gossip 响应携带对端 `local_agents` 时上报；③
+  `mcp_agent._note_peer_agents` 把对端 agent 记入 peers 条目（有变化才写盘，上限 64
+  防御）。端到端验证（双节点 HTTP 实测）：归属同步前投递 False → 同步后 True。
+- **[性能] PBKDF2 每条消息重复派生**：单次派生 ~18ms（100k 轮），`_load_jsonl` 逐条解密
+  N 条消息 ~N×18ms（50 条实测 0.89s），投递循环(15s)/Dashboard 轮询(5s)/gossip(60s)
+  每轮重复支付。修复：`_derive_key` LRU 缓存（模块级，上限 128，锁保护）+ 邮箱固定
+  salt（`mailbox/.salt`，初始化时加载/创建）→ 同一邮箱共享派生密钥，写读均 O(1) 派生；
+  nonce 仍每条随机，安全性等价；旧格式（每条独立 salt）解密自动兼容。实测 50 条
+  0.89s → 0.00s。
+- **[Windows] 中文路径启动脚本乱码**：`install.py` 以 utf-8 写 `start-fleet.bat`，
+  cmd 按 ANSI 代码页（中文系统 = GBK）解码 → 中文用户名安装路径乱码（`张三` →
+  `寮犱笁`），`cd /d` 失败节点起不来。修复：新增 `_write_bat` 按系统 ANSI 代码页写入
+  （ASCII 路径下字节与旧版完全一致，极端不可编码字符退回 utf-8），Startup 开机自启
+  bat 同步修复。
+
+### 验证
+- 61 用例全量回归通过（`python3 -m pytest tests/ -q`，约 2s）。
+- B3 端到端：模拟双节点（真实 HTTP `/fleet/mail` + `/fleet/sync`），单播远程 agent 实收、
+  未知 agent 滞留、gossip 归属回调触发、同步前 False → 同步后 True 闭环。
+- B4：GBK 代码页模拟验证（中文路径 GBK 落盘读回一致 / 旧版乱码复现 / ASCII 字节零回归 /
+  极端字符不崩溃）。
+
+---
+
+## [5.0.0] — 2026-10-17 · 安全大版本（git tag: v5.0.0）
 
 **安全大版本：加密、防伪、可视化、跨平台、测试护栏。**
 
