@@ -1,7 +1,7 @@
 ---
 name: mcp-fleet
-version: 5.0.4
-description: 把闲置的NAS、云主机、办公室电脑、软路由变成一张「AI对等协作网」——设备上的AI Agent互发消息、按能力委派任务、离线不丢消息（store-and-forward邮箱），零依赖一条命令装机。自研通讯协议（UDP广播发现+HTTP消息端点+gossip同步），设备码/邀请链接安全确权，41个工具，支持TLS加密、消息落盘加密（PBKDF2派生密钥）、UDP hello防伪签名、Web Dashboard实时拓扑、Windows/macOS一键安装（Windows计划任务+macOS launchd双守护：开机自启与崩溃自动重启）、94用例测试套件，不依赖任何外部服务。当用户提到：管NAS、控制家里电脑、远程操控设备、多台设备互联、让AI操作电脑、设备上的AI协作、远程执行命令、离线留言给AI、软路由排查、家里服务器管理、设备监控面板、Windows远程管理、fleet、MCP组网等需求时使用本技能。
+version: 5.0.5
+description: 把闲置的NAS、云主机、办公室电脑、软路由变成一张「AI对等协作网」——设备上的AI Agent互发消息、按能力委派任务、离线不丢消息（store-and-forward邮箱），零依赖一条命令装机。自研通讯协议（UDP广播发现+HTTP消息端点+gossip同步），设备码/邀请链接安全确权，41个工具，支持TLS加密、消息落盘加密（PBKDF2派生密钥）、UDP hello防伪签名、Web Dashboard实时拓扑、Windows/macOS一键安装（Windows计划任务+macOS launchd双守护：开机自启与崩溃自动重启）、100用例测试套件，不依赖任何外部服务。当用户提到：管NAS、控制家里电脑、远程操控设备、多台设备互联、让AI操作电脑、设备上的AI协作、远程执行命令、离线留言给AI、软路由排查、家里服务器管理、设备监控面板、Windows远程管理、fleet、MCP组网等需求时使用本技能。
 tags: 设备互联, MCP, 远程操控, 效率工具, 开发工具, 自研协议, agent协作, 离线邮箱
 ---
 
@@ -204,7 +204,7 @@ python3 install.py --name mac-mini --auto-start
 - 已配对节点的 UDP 发现包**自动携带签名**，伪造已知节点名会被拒收并计数（`mesh` 可见）
 - 与旧版本混部不破坏网络：无签名的 v4.x 节点照常发现
 
-### 测试套件（94 个用例）
+### 测试套件（100 个用例）
 
 ```bash
 python3 -m pytest tests/ -q    # 2.6s 全量回归
@@ -310,7 +310,7 @@ mcp-fleet/
 │   ├── demo.sh                       # 一键演示：双节点互联 30 秒上手
 │   ├── make-offline.py               # 生成离线安装包（systemd 单元由 install.sh 运行时生成）
 │   └── mcp_agent_config.example.json # 配置模板
-├── tests/                            # v5.0 测试套件（94 用例，pytest 一键回归）
+├── tests/                            # v5.0 测试套件（100 用例，pytest 一键回归）
 │   ├── conftest.py                   # sys.path 公共配置
 │   ├── test_crypto.py                # 加解密往返 / 防篡改 / 密钥派生（12）
 │   ├── test_mail_engine.py           # 邮箱读写 / 加密落盘 / 并发 / 投递三分支（24）
