@@ -1,13 +1,13 @@
 ---
 name: mcp-fleet
-version: 5.0.2
-description: 把闲置的NAS、云主机、办公室电脑、软路由变成一张「AI对等协作网」——设备上的AI Agent互发消息、按能力委派任务、离线不丢消息（store-and-forward邮箱），零依赖一条命令装机。自研通讯协议（UDP广播发现+HTTP消息端点+gossip同步），设备码/邀请链接安全确权，41个工具，支持TLS加密、消息落盘加密（PBKDF2派生密钥）、UDP hello防伪签名、Web Dashboard实时拓扑、Windows一键安装、70用例测试套件，不依赖任何外部服务。当用户提到：管NAS、控制家里电脑、远程操控设备、多台设备互联、让AI操作电脑、设备上的AI协作、远程执行命令、离线留言给AI、软路由排查、家里服务器管理、设备监控面板、Windows远程管理、fleet、MCP组网等需求时使用本技能。
+version: 5.0.3
+description: 把闲置的NAS、云主机、办公室电脑、软路由变成一张「AI对等协作网」——设备上的AI Agent互发消息、按能力委派任务、离线不丢消息（store-and-forward邮箱），零依赖一条命令装机。自研通讯协议（UDP广播发现+HTTP消息端点+gossip同步），设备码/邀请链接安全确权，41个工具，支持TLS加密、消息落盘加密（PBKDF2派生密钥）、UDP hello防伪签名、Web Dashboard实时拓扑、Windows一键安装、83用例测试套件，不依赖任何外部服务。当用户提到：管NAS、控制家里电脑、远程操控设备、多台设备互联、让AI操作电脑、设备上的AI协作、远程执行命令、离线留言给AI、软路由排查、家里服务器管理、设备监控面板、Windows远程管理、fleet、MCP组网等需求时使用本技能。
 tags: 设备互联, MCP, 远程操控, 效率工具, 开发工具, 自研协议, agent协作, 离线邮箱
 ---
 
 # MCP Fleet · 节点互控系统 v5.0
 
-> 软件包下载：[GitHub Release v5.0.2](https://github.com/guoxpeng/skill-mcp-fleet/releases/tag/v5.0.2) ｜
+> 软件包下载：[GitHub Release v5.0.3](https://github.com/guoxpeng/skill-mcp-fleet/releases/tag/v5.0.3) ｜
 > 全版本更新说明：[CHANGELOG.md](https://github.com/guoxpeng/skill-mcp-fleet/blob/main/CHANGELOG.md)
 
 ## 这是什么
@@ -22,7 +22,7 @@ tags: 设备互联, MCP, 远程操控, 效率工具, 开发工具, 自研协议,
 2. **UDP hello 防伪签名** — 已配对节点的发现包必须携带 HMAC 签名，冒充已知节点直接拒收（对 v4.x 旧节点保持兼容）
 3. **Web Dashboard** — 浏览器打开 `http://节点IP:端口/fleet/ui`，实时看全网拓扑、在线状态、消息流（零 CDN 依赖单文件页面）
 4. **Windows 安装器** — `scripts/install.py` 跨平台一键安装（含开机自启与防火墙规则），Windows 不再需要手敲命令
-5. **测试套件** — 61 个测试（含真实 UDP socket 验签用例），`python3 -m pytest tests/ -q` 一键回归
+5. **测试套件** — 83 个测试（含真实 UDP socket 验签用例），`python3 -m pytest tests/ -q` 一键回归
 6. **修复死锁** — 自测发现并修复 gossip 同步路径的重入死锁（v4.1 引入至今的隐蔽 bug，`Lock` → `RLock`）
 
 **v4.6 文档增强**：新增「谁需要它」适用场景、一键演示脚本 `scripts/demo.sh`（30 秒看懂双节点互联）、兼容性清单；修复历史文档中工具数描述（统一为 41 个）。
@@ -195,13 +195,13 @@ python install.py --name office-pc --port 3100
 - 已配对节点的 UDP 发现包**自动携带签名**，伪造已知节点名会被拒收并计数（`mesh` 可见）
 - 与旧版本混部不破坏网络：无签名的 v4.x 节点照常发现
 
-### 测试套件（61 个用例）
+### 测试套件（83 个用例）
 
 ```bash
-python3 -m pytest tests/ -q    # 0.8s 全量回归
+python3 -m pytest tests/ -q    # 2.6s 全量回归
 ```
 
-覆盖：加解密往返与防篡改（12）、邮箱读写与并发（24）、投递三分支与重试（6，合并在邮箱文件）、hello 验签策略与真实 UDP socket（10）、工具层（7）、双节点端到端集成（8，含密文落盘断言）。本套件在开发中真实抓出一个隐蔽死锁（见 `references/安全审计报告.md`）。
+覆盖：加解密往返与防篡改（12）、邮箱读写/并发/投递/维护压缩（40）、hello 验签策略与真实 UDP socket（10）、工具层含 mail 限流与 audit 轮转（13）、双节点端到端集成（8，含密文落盘断言）。本套件在开发中真实抓出一个隐蔽死锁（见 `references/安全审计报告.md`）。
 
 ## 通讯协议架构
 
@@ -301,7 +301,7 @@ mcp-fleet/
 │   ├── demo.sh                       # 一键演示：双节点互联 30 秒上手
 │   ├── make-offline.py               # 生成离线安装包（systemd 单元由 install.sh 运行时生成）
 │   └── mcp_agent_config.example.json # 配置模板
-├── tests/                            # v5.0 测试套件（61 用例，pytest 一键回归）
+├── tests/                            # v5.0 测试套件（83 用例，pytest 一键回归）
 │   ├── conftest.py                   # sys.path 公共配置
 │   ├── test_crypto.py                # 加解密往返 / 防篡改 / 密钥派生（12）
 │   ├── test_mail_engine.py           # 邮箱读写 / 加密落盘 / 并发 / 投递三分支（24）
