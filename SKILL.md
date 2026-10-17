@@ -6,6 +6,9 @@ tags: 设备互联, MCP, 远程操控, 效率工具, 开发工具, 自研协议,
 
 # MCP Fleet · 节点互控系统 v5.0
 
+> 软件包下载：[GitHub Release v5.0.0](https://github.com/guoxpeng/skill-mcp-fleet/releases/tag/v5.0.0) ｜
+> 全版本更新说明：[CHANGELOG.md](https://github.com/guoxpeng/skill-mcp-fleet/blob/main/CHANGELOG.md)
+
 ## 这是什么
 
 > 一句话：**让你用聊天的方式指挥家里所有设备干活** —— 手机上说一句，NAS/电脑/软路由上的 AI 就去办。
