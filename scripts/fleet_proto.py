@@ -39,6 +39,17 @@ HTTP_TIMEOUT = 6
 MAX_RETRY_ATTEMPTS = 250
 DELIVERY_BATCH_MAX = 50
 
+# v5.0.3 邮箱维护（compaction）：
+#   INBOX_KEEP_READ —— inbox 清理后保留的最近消息条数（全员已读的更旧消息移出；
+#                     保留窗口供 Dashboard 最近消息流与迟到 agent 补读）
+#   SENT_KEEP       —— sent.jsonl 截断保留条数（投递成功的历史）
+#   DEAD_KEEP       —— outbox 中 dead 消息截断保留条数（审计用途）
+#   MAINTENANCE_INTERVAL —— 维护周期（由投递循环顺带触发，不新增线程）
+INBOX_KEEP_READ = 500
+SENT_KEEP = 200
+DEAD_KEEP = 200
+MAINTENANCE_INTERVAL = 3600
+
 
 def _retry_backoff(attempts):
     """按失败次数计算下次可重试的等待秒数（见上表）。"""
@@ -441,11 +452,69 @@ class MailEngine:
             inbox = self._load_jsonl(self.inbox_path)
             outbox = self._load_jsonl(self.outbox_path)
             pending = [m for m in outbox if m.get("status") == "pending"]
+            dead = [m for m in outbox if m.get("status") == "dead"]
+            inbox_bytes = 0
+            try:
+                inbox_bytes = os.path.getsize(self.inbox_path)
+            except OSError:
+                pass
             return {
                 "inbox_total": len(inbox),
                 "outbox_pending": len(pending),
+                "outbox_dead": len(dead),          # v5.0.3: 死信数（长期离线目标）
+                "inbox_bytes": inbox_bytes,        # v5.0.3: 邮箱体积（膨胀观测）
                 "local_agents": sorted(self._agents),
             }
+
+    def maintenance(self):
+        """v5.0.3: 邮箱 compaction——长期运行防膨胀（NAS/软路由常年挂机场景）。
+
+        三个泄漏源逐一处理：
+        - inbox：总量超过 INBOX_KEEP_READ 时，从最旧开始移出「全部 agent
+          已读（id <= min(各 cursor)）」的消息，清到回到窗口大小。未读消息
+          永远保留（agent 长期未读的数据不是垃圾）；小邮箱（不超窗口）不动。
+          设计权衡：邮箱承诺的是「离线期间的消息暂存」而非永久存档；未
+          注册/从未读取的 agent 不参与 min 计算（其消息保守保留）。
+        - sent：投递成功的历史截断保留最近 SENT_KEEP 条。
+        - outbox dead：超过重试上限的死信截断保留最近 DEAD_KEEP 条。
+        持锁原子写，复用 _save_jsonl 的加密回写路径（不破坏落盘加密）。
+        返回 {"inbox": n, "sent": n, "dead": n} 清理统计。
+        """
+        cleaned = {"inbox": 0, "sent": 0, "dead": 0}
+        with self._lock:
+            # 1) inbox：总量超窗口时，从最旧开始清「全员已读」的消息；
+            #    未读消息永远保留（有 agent 长期没来读，那是数据不是垃圾）。
+            #    总量不超窗口的小邮箱不动（避免无谓的小写入）。
+            cursors = self._load_cursors()
+            min_cursor = min(cursors.values()) if cursors else 0
+            msgs = self._load_jsonl(self.inbox_path)
+            if len(msgs) > INBOX_KEEP_READ and min_cursor > 0:
+                excess = len(msgs) - INBOX_KEEP_READ
+                keep, removed = [], 0
+                for m in msgs:                      # 从旧到新
+                    if removed < excess and m.get("id", 0) <= min_cursor:
+                        removed += 1
+                        continue
+                    keep.append(m)
+                if removed:
+                    self._save_jsonl(self.inbox_path, keep)
+                    cleaned["inbox"] = removed
+            # 2) sent 截断
+            sent = self._load_jsonl(self.sent_path)
+            if len(sent) > SENT_KEEP:
+                self._save_jsonl(self.sent_path, sent[-SENT_KEEP:])
+                cleaned["sent"] = len(sent) - SENT_KEEP
+            # 3) outbox dead 截断
+            out = self._load_jsonl(self.outbox_path)
+            dead = [m for m in out if m.get("status") == "dead"]
+            if len(dead) > DEAD_KEEP:
+                keep_ids = set(m.get("msg_id") for m in dead[-DEAD_KEEP:])
+                new_out = [m for m in out
+                           if m.get("status") != "dead"
+                           or m.get("msg_id") in keep_ids]
+                self._save_jsonl(self.outbox_path, new_out)
+                cleaned["dead"] = len(dead) - DEAD_KEEP
+        return cleaned
 
     # -- 内部工具 --
     def _load_jsonl(self, path):
@@ -733,7 +802,10 @@ class MessageDelivery:
         v5.0.2: 用 outbox_retryable()（退避过滤）替代全量 pending——
         刚失败的消息按退避间隔跳过，避免死节点消息每轮阻塞循环；
         单轮最多 DELIVERY_BATCH_MAX 条，防止超大 outbox 挤占循环周期。
+        v5.0.3: 每 MAINTENANCE_INTERVAL 顺带触发一次邮箱 compaction
+        （不新增线程；维护在投递间隙执行，持锁原子写）。
         """
+        last_maint = 0.0
         while not self._stop.is_set():
             try:
                 pending = self.mail.outbox_retryable()[:DELIVERY_BATCH_MAX]
@@ -743,6 +815,13 @@ class MessageDelivery:
                         self.mail.outbox_mark_delivered(msg_id)
                     else:
                         self.mail.outbox_increment_attempt(msg_id)
+                now = time.time()
+                if now - last_maint >= MAINTENANCE_INTERVAL:
+                    try:
+                        self.mail.maintenance()
+                    except Exception:
+                        pass
+                    last_maint = now
             except Exception:
                 pass
             self._stop.wait(DELIVERY_INTERVAL)
