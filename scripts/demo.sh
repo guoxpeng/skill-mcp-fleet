@@ -32,7 +32,7 @@ call() { # call <mcp-url> <tool> [json-args]
 say "准备演示节点 demo-nas(:4100) / demo-cloud(:4200)"
 for n in nas cloud; do
   mkdir -p "$WORK/$n"
-  cp "$BASE/mcp_agent.py" "$BASE/fleet_proto.py" "$WORK/$n/"
+  cp "$BASE/mcp_agent.py" "$BASE/fleet_proto.py" "$BASE/dashboard_html.py" "$WORK/$n/"
 done
 printf '{\n  "name": "demo-nas",\n  "work_dir": "/",\n  "audit_log": true,\n  "discover_port": 34199,\n  "self_url": "http://127.0.0.1:4100/mcp"\n}\n'  > "$WORK/nas/mcp_agent_config.json"
 printf '{\n  "name": "demo-cloud",\n  "work_dir": "/",\n  "audit_log": true,\n  "discover_port": 34199,\n  "self_url": "http://127.0.0.1:4200/mcp"\n}\n' > "$WORK/cloud/mcp_agent_config.json"
