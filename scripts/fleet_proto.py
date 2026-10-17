@@ -13,6 +13,7 @@ fleet_proto -- MCP-Fleet 自研通讯协议层（零依赖，纯 Python 标准�
 
 import json, os, re, socket, threading, time, uuid, io
 import urllib.request, urllib.parse, urllib.error
+import base64, hashlib, hmac
 
 PROTO_NAME = "fleet"
 PROTO_VERSION = 1
@@ -25,6 +26,80 @@ MAX_HOPS = 5
 
 
 # ---------------------------------------------------------------------------
+# v5.0 落盘加密（标准库实现，零第三方依赖）
+#
+# 结构: enc1$<base64(salt[16] | nonce[16] | ciphertext | tag[16])>
+#   - 密钥   : PBKDF2-HMAC-SHA256(secret, salt, 100k 轮)
+#   - 密文   : 明文 XOR keystream；keystream 块 = HMAC-SHA256(key, b"enc"+nonce+counter)
+#             （HMAC 作为伪随机函数的 CTR 型结构，等价于对称流加密）
+#   - 完整性 : HMAC-SHA256(key, b"tag"+nonce+ct) 截取 16 字节
+# 威胁模型：防止 mailbox 落盘文件被直接读取（备份泄露 / 本机其他用户 / 云盘同步）。
+# 传输层另有可选 TLS（v4.5）。
+# ---------------------------------------------------------------------------
+CRYPTO_PREFIX = "enc1$"
+PBKDF2_ROUNDS = 100000
+
+
+def _derive_key(secret, salt):
+    return hashlib.pbkdf2_hmac("sha256", secret.encode("utf-8"), salt, PBKDF2_ROUNDS)
+
+
+def _keystream(key, nonce, length):
+    out = b""
+    counter = 0
+    while len(out) < length:
+        out += hmac.new(key, b"enc" + nonce + counter.to_bytes(8, "big"),
+                        hashlib.sha256).digest()
+        counter += 1
+    return out[:length]
+
+
+def encrypt_text(secret, plaintext):
+    """加密字符串 -> 'enc1$...' 形态。secret 为节点 auth_token。"""
+    salt = os.urandom(16)
+    nonce = os.urandom(16)
+    key = _derive_key(secret, salt)
+    pt = plaintext.encode("utf-8")
+    ct = bytes(a ^ b for a, b in zip(pt, _keystream(key, nonce, len(pt))))
+    tag = hmac.new(key, b"tag" + nonce + ct, hashlib.sha256).digest()[:16]
+    return CRYPTO_PREFIX + base64.b64encode(salt + nonce + ct + tag).decode("ascii")
+
+
+def decrypt_text(secret, blob):
+    """解密 'enc1$...' -> 明文字符串。验签失败抛 ValueError。"""
+    if not isinstance(blob, str) or not blob.startswith(CRYPTO_PREFIX):
+        raise ValueError("not an encrypted blob")
+    raw = base64.b64decode(blob[len(CRYPTO_PREFIX):].encode("ascii"))
+    if len(raw) < 48:
+        raise ValueError("blob too short")
+    salt, nonce, ct, tag = raw[:16], raw[16:32], raw[32:-16], raw[-16:]
+    key = _derive_key(secret, salt)
+    expect = hmac.new(key, b"tag" + nonce + ct, hashlib.sha256).digest()[:16]
+    if not hmac.compare_digest(tag, expect):
+        raise ValueError("integrity check failed")
+    pt = bytes(a ^ b for a, b in zip(ct, _keystream(key, nonce, len(ct))))
+    return pt.decode("utf-8")
+
+
+def hello_signature(token, name, port, ts):
+    """v5.0 UDP hello 防伪签名：HMAC-SHA256(节点 token, name|port|ts) 截取 32 hex。"""
+    basis = "%s|%s|%s" % (name, port, ts)
+    return hmac.new(token.encode("utf-8"), basis.encode("utf-8"),
+                    hashlib.sha256).hexdigest()[:32]
+
+
+def verify_hello_signature(token, pkt):
+    """校验 hello 包签名。返回 True=通过；False=伪造（已知 peer 签名不符）。"""
+    try:
+        expect = hello_signature(token, pkt.get("name", ""),
+                                 pkt.get("port", DEFAULT_HTTP_PORT),
+                                 pkt.get("ts", 0))
+        return hmac.compare_digest(pkt.get("sig", ""), expect)
+    except Exception:
+        return False
+
+
+# ---------------------------------------------------------------------------
 # 邮箱引擎 MailEngine -- store-and-forward 核心
 # ---------------------------------------------------------------------------
 class MailEngine:
@@ -32,7 +107,7 @@ class MailEngine:
     每个节点一个 MailEngine，管理本地邮箱。
     mailbox/inbox.jsonl + outbox.jsonl + sent.jsonl + cursor.json
     """
-    def __init__(self, base_dir, node_name):
+    def __init__(self, base_dir, node_name, secret=None):
         self.dir = os.path.join(base_dir, "mailbox")
         os.makedirs(self.dir, exist_ok=True)
         self.inbox_path = os.path.join(self.dir, "inbox.jsonl")
@@ -40,10 +115,43 @@ class MailEngine:
         self.sent_path = os.path.join(self.dir, "sent.jsonl")
         self.cursor_path = os.path.join(self.dir, "cursor.json")
         self.node_name = node_name
-        self._lock = threading.Lock()
+        # v5.0: 落盘加密密钥（节点 auth_token 派生）。None=不加密（兼容旧部署）
+        self.secret = secret or None
+        # v5.0: RLock（可重入）—— sync_summary() 等方法持锁调用 outbox_pending()
+        # 等内部加锁方法。原 Lock 不可重入，v4.1 起 gossip 同步一触发即死锁
+        # （测试套件首轮捕获，见 tests/test_mail_engine.py::TestSync）。
+        self._lock = threading.RLock()
         self._cond = threading.Condition(self._lock)
         self._agents = set([node_name])
         self._next_id = self._calc_next_id()
+
+    # -- v5.0: 落盘加密钩子 --
+    def _encrypt_field(self, msg):
+        """落盘前加密 text 字段（返回浅拷贝，不改调用方 dict）。结构字段
+        （to/from/id/topic/status）保持明文以供路由与过滤；仅内容加密。"""
+        if not self.secret:
+            return msg
+        m = dict(msg)
+        t = m.get("text")
+        if isinstance(t, str) and t and not t.startswith(CRYPTO_PREFIX):
+            try:
+                m["text"] = encrypt_text(self.secret, t)
+            except Exception:
+                pass
+        return m
+
+    def _decrypt_field(self, msg):
+        """读取后解密 text 字段。旧明文数据（无 enc1$ 前缀）原样返回。"""
+        if not self.secret:
+            return msg
+        m = dict(msg)
+        t = m.get("text")
+        if isinstance(t, str) and t.startswith(CRYPTO_PREFIX):
+            try:
+                m["text"] = decrypt_text(self.secret, t)
+            except Exception:
+                pass  # 旧密钥数据/损坏行：保留密文，不中断读取
+        return m
 
     def _calc_next_id(self):
         msgs = self._load_jsonl(self.inbox_path)
@@ -69,7 +177,7 @@ class MailEngine:
                 msg["id"] = self._next_id
                 self._next_id += 1
             with io.open(self.inbox_path, "a", encoding="utf-8") as f:
-                f.write(json.dumps(msg, ensure_ascii=False) + "\n")
+                f.write(json.dumps(self._encrypt_field(msg), ensure_ascii=False) + "\n")
             self._cond.notify_all()
 
     def inbox_read(self, agent_name, after_id=0, topic=None, mark_read=True):
@@ -109,7 +217,7 @@ class MailEngine:
             msg["attempts"] = 0
             msg["created_ts"] = time.time()
             with io.open(self.outbox_path, "a", encoding="utf-8") as f:
-                f.write(json.dumps(msg, ensure_ascii=False) + "\n")
+                f.write(json.dumps(self._encrypt_field(msg), ensure_ascii=False) + "\n")
 
     def outbox_pending(self):
         with self._lock:
@@ -131,7 +239,7 @@ class MailEngine:
             self._save_jsonl(self.outbox_path, remaining)
             if delivered:
                 with io.open(self.sent_path, "a", encoding="utf-8") as f:
-                    f.write(json.dumps(delivered, ensure_ascii=False) + "\n")
+                    f.write(json.dumps(self._encrypt_field(delivered), ensure_ascii=False) + "\n")
 
     def outbox_increment_attempt(self, msg_id):
         with self._lock:
@@ -210,6 +318,9 @@ class MailEngine:
                                 pass
             except (OSError, IOError):
                 pass
+        # v5.0: 读取时自动解密 text（旧明文数据兼容）
+        if self.secret:
+            msgs = [self._decrypt_field(m) for m in msgs]
         return msgs
 
     def _save_jsonl(self, path, msgs):
@@ -244,15 +355,22 @@ class DiscoveryLayer:
     不依赖 Tailscale / 任何外部服务。
     """
     def __init__(self, node_name, http_port, caps=None,
-                 discover_port=DEFAULT_DISCOVER_PORT, on_discover=None):
+                 discover_port=DEFAULT_DISCOVER_PORT, on_discover=None,
+                 sign_secret=None, verify_token_func=None):
         self.node_name = node_name
         self.http_port = http_port
         self.caps = caps or {}
         self.discover_port = discover_port
         self.on_discover = on_discover
+        # v5.0: hello 防伪
+        #   sign_secret       : 本节点 auth_token，用于给自己的 hello 签名
+        #   verify_token_func : f(name) -> 该 peer 的 token（配对时保存），用于验签
+        self.sign_secret = sign_secret or None
+        self.verify_token_func = verify_token_func
         self._stop = threading.Event()
         self._sock = None
         self._known = {}
+        self._rejected = 0  # 被签名校验拒绝的伪造包计数
 
     def start(self):
         self._stop.clear()
@@ -268,11 +386,33 @@ class DiscoveryLayer:
                 pass
 
     def _make_hello(self):
-        return json.dumps({
+        pkt = {
             "proto": PROTO_NAME, "ver": PROTO_VERSION,
             "name": self.node_name, "port": self.http_port,
             "caps": self.caps, "ts": time.time(),
-        }, ensure_ascii=False).encode("utf-8")
+        }
+        # v5.0: 已配对节点可用存的 token 验证本签名，防伪造已知节点
+        if self.sign_secret:
+            pkt["sig"] = hello_signature(self.sign_secret,
+                                         pkt["name"], pkt["port"], pkt["ts"])
+        return json.dumps(pkt, ensure_ascii=False).encode("utf-8")
+
+    def _verify_hello(self, pkt):
+        """v5.0 hello 验签策略（保守兼容，不破坏旧网络）：
+        - 无 sig（v4.x 旧节点）      -> 放行（兼容）
+        - 未知节点（本地无其 token）  -> 放行（首次发现走原有流程）
+        - 已知 peer 且带 sig         -> 必须验签通过，否则拒收（防冒充）
+        """
+        sig = pkt.get("sig", "")
+        if not sig or not self.verify_token_func:
+            return True
+        try:
+            token = self.verify_token_func(pkt.get("name", ""))
+        except Exception:
+            return True
+        if not token:
+            return True
+        return verify_hello_signature(token, pkt)
 
     def _broadcast_loop(self):
         while not self._stop.is_set():
@@ -317,6 +457,10 @@ class DiscoveryLayer:
                 if pkt.get("proto") != PROTO_NAME:
                     continue
                 if pkt.get("name") == self.node_name:
+                    continue
+                # v5.0: 伪造已知节点（签名不符）直接丢弃
+                if not self._verify_hello(pkt):
+                    self._rejected += 1
                     continue
                 name = pkt.get("name", "")
                 port = pkt.get("port", DEFAULT_HTTP_PORT)
