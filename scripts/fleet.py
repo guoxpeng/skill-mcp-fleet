@@ -53,6 +53,7 @@ target 写法
   python fleet.py sync cloud
 """
 import argparse
+import ipaddress
 import json
 import os
 import re
@@ -63,6 +64,7 @@ import subprocess
 import sys
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 
 # ---------------------------------------------------------------- 基础
@@ -121,20 +123,86 @@ def die(msg, code=1):
 # ---------------------------------------------------------------- MCP 客户端
 
 
-def _opener_for(url):
-    """内网/本机地址不走 http_proxy：机器上配了代理时，局域网节点会被代理成 404/超时。"""
-    import ipaddress
-    import urllib.parse
-    host = urllib.parse.urlsplit(url).hostname or ""
-    direct = host == "localhost" or host.endswith(".local")
+# 规则（v3.4.1 回迁，v4.4 重构时丢失）：
+#   1. tailnet 地址（100.64/10、fd7a:115c:a1e0::/48、*.ts.net）：
+#      有「tailnet 隧道代理」（FLEET_TAILNET_PROXY，或托管沙盒的 hatch-egress-proxy:3130）
+#      就走它；没有就直连（忽略 http_proxy）。
+#   2. 其他内网 / 本机地址：直连（忽略 http_proxy）。
+#   3. 公网：照常走系统代理。
+_TAILNET_V4 = ipaddress.ip_network("100.64.0.0/10")
+_TAILNET_V6 = ipaddress.ip_network("fd7a:115c:a1e0::/48")
+
+
+def _tailnet_proxy_url():
+    """Tailscale 内网地址要走的隧道代理；没有返回 None（= 直连）。"""
+    explicit = os.environ.get("FLEET_TAILNET_PROXY", "").strip()
+    if explicit:
+        return explicit
+    for var in ("HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy"):
+        v = os.environ.get(var, "")
+        if v and "hatch-egress-proxy" in v:
+            head, sep, _port = v.rpartition(":")
+            if sep:
+                return head + ":3130"
+    return None
+
+
+def _is_tailnet_host(host):
+    """tailnet IP（100.64/10 或 fd7a:115c:a1e0::/48）？只认 IP，不认主机名。"""
+    try:
+        ip = ipaddress.ip_address((host or "").strip("[]"))
+    except ValueError:
+        return False
+    if ip.version == 4:
+        return ip in _TAILNET_V4
+    return ip in _TAILNET_V6
+
+
+def _is_direct_host(host):
+    """内网 / 本机 / tailnet 地址：不走 http_proxy。"""
+    host = (host or "").strip("[]").lower().rstrip(".")
+    if not host:
+        return False
+    if host == "localhost" or host.endswith(".localhost") or host.endswith(".local"):
+        return True
+    if host.endswith(".ts.net"):
+        return True
+    if _is_tailnet_host(host):
+        return True
     try:
         ip = ipaddress.ip_address(host)
-        direct = direct or ip.is_private or ip.is_loopback or ip.is_link_local
     except ValueError:
-        pass
-    if direct:
-        return urllib.request.build_opener(urllib.request.ProxyHandler({}))
-    return urllib.request.build_opener()
+        return False
+    return ip.is_private or ip.is_loopback or ip.is_link_local
+
+
+_DIRECT_OPENER = None
+_DEFAULT_OPENER = None
+_TUNNEL_OPENERS = {}
+
+
+def _opener_for(url):
+    """按目标地址选 opener（规则见上）。所有 HTTP 请求都经这里，不要裸调 urlopen。"""
+    global _DIRECT_OPENER, _DEFAULT_OPENER
+    try:
+        host = (urllib.parse.urlsplit(url).hostname or "").lower().rstrip(".")
+    except ValueError:
+        host = ""
+    if _is_tailnet_host(host) or host.endswith(".ts.net"):
+        proxy = _tailnet_proxy_url()
+        if proxy:
+            op = _TUNNEL_OPENERS.get(proxy)
+            if op is None:
+                op = _TUNNEL_OPENERS[proxy] = urllib.request.build_opener(
+                    urllib.request.ProxyHandler({"http": proxy, "https": proxy}))
+            return op
+    if _is_direct_host(host):
+        if _DIRECT_OPENER is None:
+            _DIRECT_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        return _DIRECT_OPENER
+    if _DEFAULT_OPENER is None:
+        _DEFAULT_OPENER = urllib.request.build_opener()
+    return _DEFAULT_OPENER
 
 
 class MCPError(Exception):
@@ -238,7 +306,7 @@ def http_probe(base_url, timeout=8, token="", retries=3):
     last_err = None
     for attempt in range(max(1, retries + 1)):
         try:
-            with urllib.request.urlopen(req, timeout=timeout) as r:
+            with _opener_for(req.full_url).open(req, timeout=timeout) as r:
                 return json.loads(r.read().decode("utf-8", "ignore") or "{}")
         except Exception as e:
             last_err = e
@@ -320,7 +388,7 @@ def probe_anonymous(url, timeout=6):
         req = urllib.request.Request(
             url, method="POST", data=json.dumps(payload).encode("utf-8"),
             headers={"Content-Type": "application/json", "Accept": "application/json"})
-        with urllib.request.urlopen(req, timeout=timeout) as r:
+        with _opener_for(req.full_url).open(req, timeout=timeout) as r:
             body = r.read(8192).decode("utf-8", "ignore")
         return ("jsonrpc" in body) or ("serverInfo" in body)
     except urllib.error.HTTPError as e:
@@ -507,7 +575,7 @@ def fetch_directory(url=None, token=None, timeout=6):
     req = urllib.request.Request(url + "/nodes", method="GET")
     if token:
         req.add_header("X-Fleet-Token", token)
-    with urllib.request.urlopen(req, timeout=timeout) as r:
+    with _opener_for(req.full_url).open(req, timeout=timeout) as r:
         data = json.loads(r.read().decode("utf-8", "ignore") or "{}")
     return data.get("nodes") or {}
 
