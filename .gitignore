@@ -1,1 +1,8 @@
 __pycache__/
+*.pyc
+.pytest_cache/
+*.zip
+mailbox/
+data/
+*.log
+*.log.*
