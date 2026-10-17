@@ -1,7 +1,7 @@
 ---
 name: mcp-fleet
-version: 5.0.3
-description: 把闲置的NAS、云主机、办公室电脑、软路由变成一张「AI对等协作网」——设备上的AI Agent互发消息、按能力委派任务、离线不丢消息（store-and-forward邮箱），零依赖一条命令装机。自研通讯协议（UDP广播发现+HTTP消息端点+gossip同步），设备码/邀请链接安全确权，41个工具，支持TLS加密、消息落盘加密（PBKDF2派生密钥）、UDP hello防伪签名、Web Dashboard实时拓扑、Windows一键安装、83用例测试套件，不依赖任何外部服务。当用户提到：管NAS、控制家里电脑、远程操控设备、多台设备互联、让AI操作电脑、设备上的AI协作、远程执行命令、离线留言给AI、软路由排查、家里服务器管理、设备监控面板、Windows远程管理、fleet、MCP组网等需求时使用本技能。
+version: 5.0.4
+description: 把闲置的NAS、云主机、办公室电脑、软路由变成一张「AI对等协作网」——设备上的AI Agent互发消息、按能力委派任务、离线不丢消息（store-and-forward邮箱），零依赖一条命令装机。自研通讯协议（UDP广播发现+HTTP消息端点+gossip同步），设备码/邀请链接安全确权，41个工具，支持TLS加密、消息落盘加密（PBKDF2派生密钥）、UDP hello防伪签名、Web Dashboard实时拓扑、Windows/macOS一键安装（Windows计划任务+macOS launchd双守护：开机自启与崩溃自动重启）、94用例测试套件，不依赖任何外部服务。当用户提到：管NAS、控制家里电脑、远程操控设备、多台设备互联、让AI操作电脑、设备上的AI协作、远程执行命令、离线留言给AI、软路由排查、家里服务器管理、设备监控面板、Windows远程管理、fleet、MCP组网等需求时使用本技能。
 tags: 设备互联, MCP, 远程操控, 效率工具, 开发工具, 自研协议, agent协作, 离线邮箱
 ---
 
@@ -21,7 +21,7 @@ tags: 设备互联, MCP, 远程操控, 效率工具, 开发工具, 自研协议,
 1. **邮箱落盘加密** — 节点间消息（inbox/outbox/sent）以 `enc1$` 前缀密文落盘，密钥由配对 token 经 PBKDF2 派生，物理拷走硬盘也读不到明文
 2. **UDP hello 防伪签名** — 已配对节点的发现包必须携带 HMAC 签名，冒充已知节点直接拒收（对 v4.x 旧节点保持兼容）
 3. **Web Dashboard** — 浏览器打开 `http://节点IP:端口/fleet/ui`，实时看全网拓扑、在线状态、消息流（零 CDN 依赖单文件页面）
-4. **Windows 安装器** — `scripts/install.py` 跨平台一键安装（含开机自启与防火墙规则），Windows 不再需要手敲命令
+4. **跨平台安装与守护** — `scripts/install.py` 三平台一键安装：Windows 防火墙+计划任务双守护（登录自启+每分钟探活自动拉起）、macOS launchd（RunAtLoad+KeepAlive 崩溃重启）、Linux systemd（install.sh）
 5. **测试套件** — 83 个测试（含真实 UDP socket 验签用例），`python3 -m pytest tests/ -q` 一键回归
 6. **修复死锁** — 自测发现并修复 gossip 同步路径的重入死锁（v4.1 引入至今的隐蔽 bug，`Lock` → `RLock`）
 
@@ -186,8 +186,17 @@ http://<节点IP>:<端口>/fleet/ui#<你的节点token>
 python install.py --name office-pc --port 3100
 ```
 
-自动完成：文件部署 → 配置生成 → 启动脚本 → 防火墙放行 → 开机自启（Startup 文件夹）。
-卸载用 `python install.py --uninstall`（保留邮箱数据）。Linux 用户仍推荐 `install.sh`（含 systemd）。
+自动完成：文件部署 → 配置生成 → 启动脚本 → 防火墙放行 → 开机自启 → 进程保护。
+
+```bash
+# Windows：计划任务双守护（pythonw 无窗口登录自启 + 每分钟探活 /health 异常自动拉起）
+python install.py --name office-pc --auto-start
+
+# macOS：launchd（RunAtLoad 登录自启 + KeepAlive 崩溃 10s 自动重启）
+python3 install.py --name mac-mini --auto-start
+```
+
+卸载用 `python install.py --uninstall`（保留邮箱数据，自动清理计划任务/launchd 配置）。Linux 用户仍推荐 `install.sh`（systemd Restart=always + watchdog timer）。
 
 ### 邮箱加密与 hello 防伪（默认自动生效）
 
@@ -195,7 +204,7 @@ python install.py --name office-pc --port 3100
 - 已配对节点的 UDP 发现包**自动携带签名**，伪造已知节点名会被拒收并计数（`mesh` 可见）
 - 与旧版本混部不破坏网络：无签名的 v4.x 节点照常发现
 
-### 测试套件（83 个用例）
+### 测试套件（94 个用例）
 
 ```bash
 python3 -m pytest tests/ -q    # 2.6s 全量回归
@@ -288,7 +297,7 @@ mcp-fleet/
 │   ├── mcp_agent.py                  # 节点 MCP 服务器（核心，41 个工具，TLS+审计+Dashboard 路由）
 │   ├── fleet_proto.py                # 自研通讯协议层（UDP发现+store-and-forward+gossip+加密+签名）
 │   ├── dashboard_html.py             # v5.0 Web Dashboard 单文件页面（零 CDN 依赖）
-│   ├── install.py                    # v5.0 跨平台安装器（Windows/Linux/macOS）
+│   ├── install.py                    # v5.0.4 跨平台安装器 + 平台守护（schtasks/launchd/watchdog）
 │   ├── fleet.py                      # 主端统一 CLI
 │   ├── fleet_chat.py                 # AI 间消息 CLI
 │   ├── fleet_watch.py                # 保活守护
@@ -301,7 +310,7 @@ mcp-fleet/
 │   ├── demo.sh                       # 一键演示：双节点互联 30 秒上手
 │   ├── make-offline.py               # 生成离线安装包（systemd 单元由 install.sh 运行时生成）
 │   └── mcp_agent_config.example.json # 配置模板
-├── tests/                            # v5.0 测试套件（83 用例，pytest 一键回归）
+├── tests/                            # v5.0 测试套件（94 用例，pytest 一键回归）
 │   ├── conftest.py                   # sys.path 公共配置
 │   ├── test_crypto.py                # 加解密往返 / 防篡改 / 密钥派生（12）
 │   ├── test_mail_engine.py           # 邮箱读写 / 加密落盘 / 并发 / 投递三分支（24）
