@@ -1,4 +1,4 @@
-# MCP Fleet · 节点互控系统 v4.4
+# MCP Fleet · 节点互控系统
 
 > 零依赖 · 纯 Python 标准库 · 兼容 Python 3.6+ · 38 个工具（32 原有 + 6 新增增强） · 自研通讯协议
 
@@ -56,7 +56,7 @@
 - B 有 Claude/Cursor → B 的 AI agent 也可以操控 A
 - 两个 agent 可以 `msg_send` 互发消息、分工协作
 
-### 邀请链接配对（v4.4）
+### 邀请链接配对
 
 更简单的配对方式 — A 生成邀请码，B 一键安装自动连接：
 
@@ -74,6 +74,8 @@ bash install.sh --invite eyJjb2RlIjoi...
 邀请码有过期时间（默认 1 小时），使用一次后失效。
 
 ## 快速安装
+
+最快的方式就是把本项目地址丢发给ai，让本地AI使用ssh连接一次云服务器，让AI自己安装本项目。
 
 ### 一键安装（自研协议，零依赖）
 
@@ -110,7 +112,7 @@ sudo bash install.sh --name nas --port 3100 --tailnet my-tailnet --tailnet-key t
 
 Tailscale 不是必需的。如果你只需要同网段通信，不需要安装 Tailscale。如果你需要跨网段（比如 NAS 在家、云主机在公网），Tailscale 提供端到端加密的虚拟网络，fleet 在其上自动构建 agent mesh。
 
-## 通讯协议（v4.1 新增）
+## 通讯协议
 
 ### UDP 广播发现
 
