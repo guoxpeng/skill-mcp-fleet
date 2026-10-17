@@ -344,3 +344,101 @@ class TestConnectionStability:
         assert d._http_deliver(url, "", {"to": "x", "text": "t"}) is False
         assert d._http_deliver(url, "", {"to": "x", "text": "t"}) is False
         assert not d.health.is_available(url)        # 2 次失败 -> 冷却
+
+
+# ===========================================================================
+# v5.0.3 邮箱维护（compaction）：长期运行防膨胀
+# ===========================================================================
+class TestMaintenance:
+    def test_compacts_read_inbox_over_window(self, tmp_engine):
+        """超窗口（500）的已读消息被清理到窗口大小；未超窗口不动。"""
+        from fleet_proto import INBOX_KEEP_READ
+        me = tmp_engine
+        for i in range(INBOX_KEEP_READ + 300):
+            me.inbox_append({"from": "remote", "to": "agent-1", "text": "m%d" % i})
+        me.inbox_read("agent-1", after_id=0)          # cursor 到顶 -> 全员已读
+        cleaned = me.maintenance()
+        assert cleaned["inbox"] == 300                 # 清 300 回到窗口
+        left = me._load_jsonl(me.inbox_path)
+        assert len(left) == INBOX_KEEP_READ
+        assert left[-1]["text"] == "m%d" % (INBOX_KEEP_READ + 299)   # 保留最新
+
+    def test_small_inbox_untouched(self, tmp_engine):
+        """不超窗口的小邮箱不清理（避免无谓写入）。"""
+        me = tmp_engine
+        for i in range(50):
+            me.inbox_append({"from": "r", "to": "a1", "text": "m%d" % i})
+        me.inbox_read("a1", after_id=0)
+        cleaned = me.maintenance()
+        assert cleaned["inbox"] == 0
+        assert len(me._load_jsonl(me.inbox_path)) == 50
+
+    def test_keeps_unread_when_agent_behind(self, tmp_engine):
+        """未读消息永不被清：agent-2 落后时，其未读全保留，只清 agent-1 已读。"""
+        from fleet_proto import INBOX_KEEP_READ
+        me = tmp_engine
+        for i in range(INBOX_KEEP_READ + 100):        # agent-1 的消息
+            me.inbox_append({"from": "r", "to": "agent-1", "text": "m%d" % i})
+        me.inbox_read("agent-1", after_id=0)          # agent-1 cursor=600
+        for i in range(5):                            # agent-2 未读（无 cursor）
+            me.inbox_append({"from": "r", "to": "agent-2", "text": "late%d" % i})
+        cleaned = me.maintenance()
+        # 总量 605，窗口 500，excess=105：从最旧清「id<=600 且已读」-> 105 条
+        assert cleaned["inbox"] == 105
+        left = me._load_jsonl(me.inbox_path)
+        assert len([m for m in left if m["to"] == "agent-2"]) == 5   # 未读全保
+        assert len(left) == 500
+
+    def test_compaction_keeps_encryption(self, enc_engine):
+        """清理路径复用 _save_jsonl 加密回写：maintenance 后落盘仍密文（B1 交互）。"""
+        from fleet_proto import CRYPTO_PREFIX, INBOX_KEEP_READ
+        me = enc_engine                                 # secret="my-secret"
+        for i in range(INBOX_KEEP_READ + 10):
+            me.inbox_append({"from": "r", "to": "a1", "text": "m%d" % i})
+        me.inbox_read("a1", after_id=0)
+        cleaned = me.maintenance()
+        assert cleaned["inbox"] == 10
+        raw = open(me.inbox_path, encoding="utf-8").read()
+        assert CRYPTO_PREFIX in raw                     # 密文保持
+        # 且解密读取正常
+        assert len(me.inbox_read("a1", after_id=0)) == INBOX_KEEP_READ
+
+    def test_truncates_sent(self, tmp_engine):
+        """sent.jsonl 超过 SENT_KEEP 截断，保留最近。"""
+        from fleet_proto import SENT_KEEP
+        me = tmp_engine
+        with open(me.sent_path, "a", encoding="utf-8") as f:
+            for i in range(SENT_KEEP + 100):
+                f.write(json.dumps({"to": "b", "text": "s%d" % i, "id": i}) + "\n")
+        cleaned = me.maintenance()
+        assert cleaned["sent"] == 100
+        sent = me._load_jsonl(me.sent_path)
+        assert len(sent) == SENT_KEEP and sent[-1]["text"] == "s%d" % (SENT_KEEP + 99)
+
+    def test_truncates_dead_outbox(self, tmp_engine):
+        """outbox 的 dead 消息超过 DEAD_KEEP 截断；pending/delivered 不受影响。"""
+        from fleet_proto import DEAD_KEEP
+        me = tmp_engine
+        rows = [{"msg_id": "dead-%03d" % i, "status": "dead", "text": "d%d" % i,
+                 "id": i, "to": "x"} for i in range(DEAD_KEEP + 50)]
+        rows.append({"msg_id": "pend-1", "status": "pending", "text": "p", "id": 999, "to": "x"})
+        rows.append({"msg_id": "ok-1", "status": "delivered", "text": "o", "id": 998, "to": "x"})
+        me._save_jsonl(me.outbox_path, rows)
+        cleaned = me.maintenance()
+        assert cleaned["dead"] == 50
+        out = me._load_jsonl(me.outbox_path)
+        assert len([m for m in out if m["status"] == "dead"]) == DEAD_KEEP
+        assert len([m for m in out if m["status"] == "pending"]) == 1
+        assert len([m for m in out if m["status"] == "delivered"]) == 1
+
+    def test_stats_new_fields(self, tmp_engine):
+        """stats() 暴露 outbox_dead / inbox_bytes（Dashboard 与 doctor 用）。"""
+        me = tmp_engine
+        me.outbox_append({"from": "a", "to": "ghost", "text": "x"})
+        st = me.stats()
+        assert st["inbox_total"] == 0 and st["outbox_pending"] == 1
+        assert st["outbox_dead"] == 0
+        assert st["inbox_bytes"] == 0          # 空文件或不存在
+        me.inbox_append({"from": "r", "to": "a", "text": "hello"})
+        st2 = me.stats()
+        assert st2["inbox_total"] == 1 and st2["inbox_bytes"] > 0
