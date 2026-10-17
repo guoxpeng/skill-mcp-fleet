@@ -1584,6 +1584,53 @@ def cmd_pair(a):
 
 # ---------------------------------------------------------------- 入口
 
+
+def cmd_mesh(a):
+    """打印 mesh 拓扑图：本节点 + 所有 peers 的在线状态和能力摘要。"""
+    reg = load_registry()
+    nodes = reg.get("nodes", {})
+    if not nodes:
+        print(warn("[!] ") + "没有已注册的节点。用 fleet.py add / pair 添加。")
+        return 1
+    print(ok("=" * 60))
+    print(ok("  Fleet Mesh 拓扑"))
+    print(ok("=" * 60))
+    for name, info in sorted(nodes.items()):
+        url = info.get("url", "")
+        token = info.get("token", "")
+        # 探活并获取 mesh 信息
+        try:
+            c = MCPClient(url, a.timeout, token=token)
+            c.handshake()
+            text, is_err = c.call("mesh", {})
+            if is_err:
+                print(err("  [X] %-16s %s" % (name, url)))
+                continue
+            mesh = json.loads(text)
+            self_info = mesh.get("self", {})
+            caps = self_info.get("caps", {})
+            cap_str = []
+            if caps.get("docker"): cap_str.append("Docker")
+            if caps.get("gpu"): cap_str.append("GPU")
+            if caps.get("tailscale"): cap_str.append("TS:%s" % caps.get("tailscale_ip", "?"))
+            if caps.get("systemd"): cap_str.append("systemd")
+            cap_str.append("%dCPU" % caps.get("cpu_count", 1))
+            if caps.get("mem_mb"): cap_str.append("%dMB" % caps["mem_mb"])
+            print(ok("  [*] %-16s %s  [%s]" % (name, url, ", ".join(cap_str))))
+            # Peers
+            peers = mesh.get("peers", {})
+            for pname, pinfo in sorted(peers.items()):
+                online = pinfo.get("online", False)
+                ts = "tailnet" if pinfo.get("tailnet") else ""
+                if online:
+                    print("      " + ok("|- ") + "%-14s 在线 %s" % (pname, ts))
+                else:
+                    print("      " + err("|- ") + "%-14s 离线 %s" % (pname, ts))
+        except Exception as e:
+            print(err("  [X] %-16s %s  (%s)" % (name, url, e)))
+    print(ok("=" * 60))
+    return 0
+
 def build_parser():
     p = argparse.ArgumentParser(
         prog="fleet.py",
@@ -1764,6 +1811,10 @@ def build_parser():
     sp.add_argument("--clear", action="store_true", help="清除已配置的地址目录")
     sp.add_argument("--timeout", type=int, default=8)
     sp.set_defaults(func=cmd_directory)
+
+    sp = sub.add_parser("mesh", help="打印 mesh 拓扑图（节点在线状态 + 能力 + peer 关系）")
+    sp.add_argument("--timeout", type=int, default=15)
+    sp.set_defaults(func=cmd_mesh)
     return p
 
 

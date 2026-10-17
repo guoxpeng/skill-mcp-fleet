@@ -103,6 +103,8 @@ while [ $# -gt 0 ]; do
     --no-keepalive) KEEPALIVE="0"; shift ;;
     --require-auth) REQUIRE_AUTH="1"; shift ;;
     --generate-token) GEN_TOKEN="1"; shift ;;
+    --tailnet)    TAILNET="${2:-}"; shift 2 ;;
+    --tailnet-key) TAILNET_KEY="${2:-}"; shift 2 ;;
     --uninstall)  UNINSTALL="1"; shift ;;
     -h|--help)    sed -n '2,44p' "$0" 2>/dev/null || echo "(管道方式不支持 --help，请见 README)"; exit 0 ;;
     *) echo "[!] 未知参数: $1"; exit 1 ;;
@@ -136,6 +138,51 @@ Restart=always
 [Install]
 WantedBy=multi-user.target
 SVC
+
+# ---- v4.0: Tailscale 自动安装与组网 ----
+if [ -n "${TAILNET:-}" ]; then
+  echo "[+] Tailscale 自动组网: tailnet=${TAILNET}"
+  if ! command -v tailscale >/dev/null 2>&1; then
+    echo "[+] 安装 tailscale..."
+    if command -v apt-get >/dev/null 2>&1; then
+      curl -fsSL https://pkgs.tailscale.com/stable/ubuntu/$(. /etc/os-release; echo "$VERSION_CODENAME").noarmor.gpg | tee /usr/share/keyrings/tailscale-archive-keyring.gpg >/dev/null
+      echo "deb [signed-by=/usr/share/keyrings/tailscale-archive-keyring.gpg] https://pkgs.tailscale.com/stable/ubuntu/$(. /etc/os-release; echo "$VERSION_CODENAME") main" | tee /etc/apt/sources.list.d/tailscale.list
+      apt-get update -qq && apt-get install -y -qq tailscale
+    elif command -v dnf >/dev/null 2>&1; then
+      dnf install -y -q https://pkgs.tailscale.com/stable/fedora/$(. /etc/os-release; echo "$VERSION_ID")/x86_64/tailscale-latest.x86_64.rpm 2>/dev/null || \
+        curl -fsSL https://pkgs.tailscale.com/stable/tailscale-latest.tgz | tar xz -C /usr/local/bin --strip-components=1
+    else
+      curl -fsSL "https://pkgs.tailscale.com/stable/tailscale_$(uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/').tgz" | tar xz -C /usr/local/bin --strip-components=1 2>/dev/null || \
+      curl -fsSL https://tailscale.com/install.sh | sh
+    fi
+  fi
+  if command -v tailscale >/dev/null 2>&1; then
+    if [ -n "${TAILNET_KEY:-}" ]; then
+      tailscale up --authkey="${TAILNET_KEY}" --hostname="${NAME}" --accept-routes --accept-dns 2>/dev/null || true
+    else
+      tailscale up --hostname="${NAME}" --accept-routes --accept-dns 2>/dev/null || true
+    fi
+    TS_IP=$(tailscale ip -4 2>/dev/null | head -1)
+    if [ -n "$TS_IP" ]; then
+      echo "[+] Tailscale 已上线: ${TS_IP}"
+      # 写入 fleet 配置，启用自动组网
+      python3 -c "
+import json
+p='${DIR}/mcp_agent_config.json'
+d=json.load(open(p))
+d['tailnet_auto_mesh']=True
+d['tailnet_auto_trust']=True
+d['self_url']='http://${TS_IP}:${PORT}/mcp'
+json.dump(d,open(p,'w'),ensure_ascii=False)
+" 2>/dev/null || true
+    else
+      echo "[!] Tailscale 已装但未上线（可能需要登录: tailscale up）"
+    fi
+  else
+    echo "[!] tailscale 安装失败，请手动安装: https://tailscale.com/install.sh"
+  fi
+fi
+
 systemctl daemon-reload && systemctl enable --now frps
 # 5) 副端安装命令（token 已填好）：
 #    bash install.sh --name <名字> --port 3100 --tunnel --tunnel-backend frp \\

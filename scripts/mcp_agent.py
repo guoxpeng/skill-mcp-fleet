@@ -65,7 +65,7 @@ for _stream in (sys.stdout, sys.stderr):
 DEFAULT_CONFIG = {
     "name": "node",             # 副端标识（显示在状态页与 serverInfo）
     "tool_prefix": "",          # 工具名前缀，如 "nas_"；留空则用裸名（exec/read/...）
-    "version": "3.5.0",
+    "version": "4.0.0",
     "sudo_password": "",        # 留空且非 root 时会尝试免密 sudo
     "work_dir": "/",            # 默认工作目录
     "command_timeout": 120,     # 秒
@@ -102,6 +102,16 @@ DEFAULT_CONFIG = {
     "peer_tools": True,         # False = 不暴露 peers/peer_call/peer_add/peer_remove
     "peer_max_hops": 3,         # A→B→C… 最多转几跳，防止互相转发成环
     "self_url": "",             # 别的节点回连本机用的地址；留空=自动（隧道地址 > 内网 IP）
+    # ---- Tailscale 自动组网（v4.0）-----------------------------------------
+    "tailnet_auto_mesh": True,  # 启动时自动发现 tailnet 上的 fleet 节点并 peer_add
+    "tailnet_name": "",         # tailscale up --login-server 或 tailnet 名（留空=用已登录的）
+    "tailnet_scan_interval": 60,# 每 N 秒扫一次 tailnet 发现新节点
+    "tailnet_auto_trust": True, # 同 tailnet 的节点自动互信（Tailscale 端到端加密），省去逐对配 token
+    # ---- Agent 协作（v4.0）------------------------------------------------
+    "collab_tools": True,       # 暴露 caps/mesh_caps/delegate/group_* 工具
+    # ---- 安全加固 + 可观测性（v4.0）----------------------------------------
+    "audit_log": True,          # 记录 peer_call/msg_send 到 audit.log
+    "rate_limit_per_min": 120,  # 每节点入站 peer_call 每分钟上限（令牌桶）
 }
 
 
@@ -937,15 +947,32 @@ def t_peer_call(a):
     name, v = _peer_entry(a["peer"])
     if _norm_mcp_url(v.get("url")) == self_url():
         return "目标就是本机，直接调本机工具即可", True
+    # v4.0: 限流
+    if not rate_limit_allow():
+        return "限流：本节点入站 peer_call 超过每分钟上限 %d，请稍后重试" % CFG.get("rate_limit_per_min", 120), True
     args = a.get("arguments") or {}
     if isinstance(args, str):
         args = json.loads(args or "{}")
     t = int(a.get("timeoutMs") or 130000) / 1000.0
+    my_name = CFG.get("name", "node")
+    audit_log("peer_call", my_name, name, a["tool"], "calling")
     text, is_err = peer_call(_norm_mcp_url(v["url"]), v.get("token", ""), a["tool"], args, t)
+    audit_log("peer_call", my_name, name, a["tool"], "ok" if not is_err else "error")
     return "[%s → %s] %s\n%s" % (SERVER_NAME, name, a["tool"], text), is_err
 
 
 def t_peer_add(a):
+    # v4.0: tailnet 自动信任
+    _url = a.get("url", "")
+    _is_tailnet = False
+    try:
+        _h = urllib.parse.urlsplit(_url).hostname or ""
+        if _h.endswith(".ts.net") or _h.startswith("100."):
+            _is_tailnet = True
+    except Exception:
+        pass
+    if _is_tailnet and CFG.get("tailnet_auto_trust", True) and not a.get("token"):
+        a = dict(a)  # shallow copy, don't require token for tailnet peers
     name = (a.get("name") or "").strip()
     if not re.match(r"^[A-Za-z0-9_.-]{1,64}$", name):
         return "name 只能是字母数字和 _ . -（1~64 位）", True
@@ -996,6 +1023,545 @@ PEER_TOOLS = [
 PEER_FUNCS = {"peers": t_peers, "peer_call": t_peer_call, "peer_add": t_peer_add,
               "peer_remove": t_peer_remove, "peer_info": t_peer_info}
 
+
+
+# ---------------------------------------------------------------------------
+# 节点间对话邮箱（msg_send / msg_recv / msg_history）
+# AI 之间通过一个都能访问的节点互发消息；也可做 pub/sub 广播（to="*"）
+# ---------------------------------------------------------------------------
+MAIL_PATH = os.path.join(HERE, "mailbox.jsonl")
+MAIL_CUR = os.path.join(HERE, "mailbox.cursor.json")
+_MAIL_COND = threading.Condition()
+_MAIL = {"msgs": None, "cur": None}
+_MAIL_MAX_TEXT = 64000
+_NAME_RE = re.compile(r"^[A-Za-z0-9_.\-]{1,32}$")
+
+
+def _mail_load():
+    if _MAIL["msgs"] is None:
+        msgs = []
+        if os.path.exists(MAIL_PATH):
+            with io.open(MAIL_PATH, encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if line:
+                        try:
+                            msgs.append(json.loads(line))
+                        except ValueError:
+                            pass
+        _MAIL["msgs"] = msgs[-5000:]
+        cur = {}
+        if os.path.exists(MAIL_CUR):
+            try:
+                with io.open(MAIL_CUR, encoding="utf-8") as f:
+                    cur = json.load(f)
+            except ValueError:
+                cur = {}
+        _MAIL["cur"] = cur
+
+
+def _mail_name(v, field):
+    v = (v or "").strip()
+    if not _NAME_RE.match(v):
+        raise ValueError("%s 只能是 1-32 位字母/数字/_.-" % field)
+    return v
+
+
+def t_msg_send(a):
+    frm = _mail_name(a.get("from"), "from")
+    to = _mail_name(a.get("to"), "to")
+    text = a.get("text") or ""
+    topic = a.get("topic") or ""
+    if not text.strip():
+        return "text 不能为空", True
+    if len(text) > _MAIL_MAX_TEXT:
+        return "text 过长（上限 %d 字符）" % _MAIL_MAX_TEXT, True
+    with _MAIL_COND:
+        _mail_load()
+        mid = (_MAIL["msgs"][-1]["id"] + 1) if _MAIL["msgs"] else 1
+        m = {"id": mid, "ts": time.strftime("%Y-%m-%d %H:%M:%S"),
+             "from": frm, "to": to, "text": text}
+        if topic:
+            m["topic"] = topic
+        _MAIL["msgs"].append(m)
+        with io.open(MAIL_PATH, "a", encoding="utf-8") as f:
+            f.write(json.dumps(m, ensure_ascii=False) + "\n")
+        _MAIL_COND.notify_all()
+    return "已发送 #%d -> %s" % (mid, to), False
+
+
+def t_msg_recv(a):
+    me = _mail_name(a.get("me"), "me")
+    wait = max(0, min(int(a.get("wait", 0) or 0), 300))
+    peek = bool(a.get("peek"))
+    topic = a.get("topic")
+    deadline = time.time() + wait
+    with _MAIL_COND:
+        _mail_load()
+        while True:
+            after = a.get("after_id")
+            after = int(after) if after is not None else int(_MAIL["cur"].get(me, 0))
+            got = [m for m in _MAIL["msgs"]
+                   if m["id"] > after and m["to"] in (me, "*") and m["from"] != me]
+            if topic:
+                got = [m for m in got if m.get("topic") == topic]
+            left = deadline - time.time()
+            if got or left <= 0:
+                break
+            _MAIL_COND.wait(min(left, 30))
+        if got and not peek and a.get("after_id") is None:
+            _MAIL["cur"][me] = got[-1]["id"]
+            tmp = MAIL_CUR + ".tmp"
+            with io.open(tmp, "w", encoding="utf-8") as f:
+                f.write(json.dumps(_MAIL["cur"]))
+            os.replace(tmp, MAIL_CUR)
+    if not got:
+        return "（没有新消息）", False
+    return "\n\n".join("#%d [%s] %s -> %s:\n%s" % (m["id"], m["ts"], m["from"], m["to"], m["text"]) for m in got), False
+
+
+def t_msg_history(a):
+    n = max(1, min(int(a.get("lines", 20) or 20), 200))
+    topic = a.get("topic")
+    with _MAIL_COND:
+        _mail_load()
+        got = _MAIL["msgs"][-n:]
+        if topic:
+            got = [m for m in got if m.get("topic") == topic]
+    if not got:
+        return "（邮箱为空）", False
+    return "\n".join("#%d [%s] %s -> %s: %s" % (m["id"], m["ts"], m["from"], m["to"], _truncate(m["text"])[:300]) for m in got), False
+
+
+
+# ===========================================================================
+# v4.0 进化：Tailscale 自动组网 + Agent 协作 + 审计日志 + 限流 + Mesh 拓扑
+# ===========================================================================
+
+# ---------------------------------------------------------------------------
+# 审计日志
+# ---------------------------------------------------------------------------
+AUDIT_PATH = os.path.join(HERE, "audit.log")
+_audit_lock = threading.Lock()
+
+
+def audit_log(action, caller, target, tool, status="ok", detail=""):
+    """记录 peer_call / msg_send / delegate 等操作到审计日志。"""
+    if not CFG.get("audit_log", True):
+        return
+    line = "%s | %-6s | %s -> %s | %s | %s | %s\n" % (
+        time.strftime("%Y-%m-%d %H:%M:%S"), action, caller, target, tool, status, detail[:200])
+    try:
+        with _audit_lock:
+            with io.open(AUDIT_PATH, "a", encoding="utf-8") as f:
+                f.write(line)
+    except (OSError, IOError):
+        pass
+
+
+# ---------------------------------------------------------------------------
+# 限流：令牌桶（每分钟 N 次）
+# ---------------------------------------------------------------------------
+_rate_lock = threading.Lock()
+_rate_bucket = {"tokens": 0, "last": 0}
+
+
+def rate_limit_allow():
+    """检查是否允许一次入站 peer_call。令牌桶：每分钟补充 rate_limit_per_min 个。"""
+    cap = int(CFG.get("rate_limit_per_min", 120))
+    if cap <= 0:
+        return True
+    now = time.time()
+    with _rate_lock:
+        elapsed = now - _rate_bucket["last"]
+        refill = int(elapsed / 60.0 * cap)
+        if refill > 0:
+            _rate_bucket["tokens"] = min(cap, _rate_bucket["tokens"] + refill)
+            _rate_bucket["last"] = now
+        if _rate_bucket["tokens"] > 0:
+            _rate_bucket["tokens"] -= 1
+            return True
+        return False
+
+
+# ---------------------------------------------------------------------------
+# Tailscale 自动组网
+# ---------------------------------------------------------------------------
+def _tailscale_status():
+    """检测 tailscale 是否安装且在线。返回 dict 或 None。"""
+    ts = _which("tailscale")
+    if not ts:
+        return None
+    try:
+        r = subprocess.run([ts, "status", "--json"], capture_output=True, timeout=10)
+        if r.returncode == 0:
+            return json.loads(r.stdout)
+    except Exception:
+        pass
+    return None
+
+
+def _tailscale_ip():
+    """返回本机的 tailscale IP（100.64.0.0/10），没有则 None。"""
+    st = _tailscale_status()
+    if not st:
+        return None
+    self_key = st.get("Self", {}).get("UserID")
+    for peer_id, peer in st.get("Peer", {}).items():
+        if peer.get("UserID") == self_key:
+            for ip in peer.get("TailscaleIPs", []):
+                if ip.startswith("100."):
+                    return ip
+    # Fallback: check Self directly
+    for ip in st.get("Self", {}).get("TailscaleIPs", []):
+        if ip.startswith("100."):
+            return ip
+    return None
+
+
+def _tailscale_peers_online():
+    """列出 tailnet 上在线的其他设备。返回 [(hostname, ip), ...]。"""
+    st = _tailscale_status()
+    if not st:
+        return []
+    self_ip = _tailscale_ip()
+    result = []
+    for peer_id, peer in st.get("Peer", {}).items():
+        if not peer.get("Online"):
+            continue
+        ips = peer.get("TailscaleIPs", [])
+        if not ips:
+            continue
+        ip = ips[0]
+        if ip == self_ip:
+            continue
+        host = peer.get("HostName", "") or peer.get("DNSName", "").rstrip(".")
+        result.append((host, ip))
+    return result
+
+
+def _auto_discover_peers(port=3100):
+    """扫描 tailnet，发现其他 fleet 节点并自动 peer_add。
+    用 TCP connect 探测 port，通的就把对方登记为 peer。"""
+    if not CFG.get("tailnet_auto_mesh", True):
+        return []
+    peers = _tailscale_peers_online()
+    if not peers:
+        return []
+    discovered = []
+    my_name = CFG.get("name", "node")
+    my_token = CFG.get("auth_token", "")
+    my_url = CFG.get("self_url", "") or self_url()
+    existing = load_peers()
+    for host, ip in peers:
+        # 探测对方 fleet 端口
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.settimeout(2)
+            result = sock.connect_ex((ip, port))
+            sock.close()
+            if result != 0:
+                continue
+        except Exception:
+            continue
+        # 用 hostname 做 peer 名（去掉重复）
+        pname = host.split(".")[0] if host else ip
+        if pname == my_name:
+            continue
+        peer_url = "http://%s:%d/mcp" % (ip, port)
+        # 已登记就跳过
+        if pname in existing:
+            continue
+        # 自动信任：同 tailnet 不需要 token（Tailscale 端到端加密）
+        existing[pname] = {"url": peer_url, "token": "", "tailnet": True}
+        discovered.append((pname, peer_url))
+        audit_log("auto_mesh", my_name, pname, "peer_add", "discovered")
+    if discovered:
+        save_peers(existing)
+    return discovered
+
+
+def _broadcast_join():
+    """新节点上线时广播 fleet_join 事件，让已有节点发现自己。"""
+    my_name = CFG.get("name", "node")
+    my_url = CFG.get("self_url", "") or self_url()
+    my_token = CFG.get("auth_token", "")
+    ts_ip = _tailscale_ip()
+    join_msg = json.dumps({"node": my_name, "url": my_url, "tailscale_ip": ts_ip or "",
+                           "ts": time.strftime("%Y-%m-%d %H:%M:%S")})
+    peers = load_peers()
+    for pname, pinfo in peers.items():
+        try:
+            peer_call(pinfo["url"], pinfo.get("token", ""),
+                      "msg_send", {"from": my_name, "to": "*", "topic": "fleet-join",
+                                   "text": join_msg}, timeout=10)
+        except Exception:
+            pass
+
+
+# ---------------------------------------------------------------------------
+# 能力声明（capability detection）
+# ---------------------------------------------------------------------------
+def _detect_capabilities():
+    """探测本节点能力，返回 dict。"""
+    caps = {"node": CFG.get("name", "node"), "version": AGENT_VERSION}
+    # Docker
+    caps["docker"] = _which("docker") is not None
+    # GPU
+    caps["gpu"] = os.path.exists("/dev/nvidia0") or os.path.exists("/dev/dri/renderD128")
+    # systemd
+    caps["systemd"] = _which("systemctl") is not None and os.path.exists("/run/systemd/system")
+    # Tailscale
+    ts = _tailscale_status()
+    caps["tailscale"] = ts is not None
+    caps["tailscale_ip"] = _tailscale_ip() or ""
+    # 内网段
+    try:
+        r = subprocess.run(["ip", "-4", "addr"], capture_output=True, timeout=5)
+        if r.returncode == 0:
+            import re as _re
+            nets = _re.findall(r"inet (\d+\.\d+\.\d+\.\d+/\d+)", r.stdout.decode("utf-8", "replace"))
+            caps["networks"] = [n for n in nets if not n.startswith("127.")]
+    except Exception:
+        caps["networks"] = []
+    # CPU 核数
+    caps["cpu_count"] = os.cpu_count() or 1
+    # 内存
+    try:
+        with open("/proc/meminfo") as f:
+            for line in f:
+                if line.startswith("MemTotal:"):
+                    caps["mem_mb"] = int(line.split()[1]) // 1024
+                    break
+    except Exception:
+        caps["mem_mb"] = 0
+    # 已有 peers 数
+    caps["peer_count"] = len(load_peers())
+    # 工具列表
+    caps["tools"] = [t["name"] for t in TOOLS]
+    return caps
+
+
+_NODE_CAPS = None
+
+
+def get_caps():
+    global _NODE_CAPS
+    if _NODE_CAPS is None:
+        _NODE_CAPS = _detect_capabilities()
+    return _NODE_CAPS
+
+
+def t_caps(a):
+    """返回本节点的能力清单。"""
+    return json.dumps(get_caps(), ensure_ascii=False), False
+
+
+def t_mesh_caps(a):
+    """查询 mesh 内所有节点的能力清单（本机 + 所有 peers）。"""
+    result = {"self": get_caps(), "peers": {}}
+    peers = load_peers()
+    my_name = CFG.get("name", "node")
+    for pname, pinfo in peers.items():
+        try:
+            text, is_err = peer_call(pinfo["url"], pinfo.get("token", ""),
+                                     "caps", {}, timeout=15)
+            if not is_err:
+                result["peers"][pname] = json.loads(text)
+            else:
+                result["peers"][pname] = {"error": text}
+        except Exception as e:
+            result["peers"][pname] = {"error": str(e), "online": False}
+    return json.dumps(result, ensure_ascii=False), False
+
+
+# ---------------------------------------------------------------------------
+# Agent 协作：任务委派
+# ---------------------------------------------------------------------------
+def t_delegate(a):
+    """在 mesh 中广播 who_can <capability>，有能力匹配的节点应答，
+    把任务委派给它执行。"""
+    cap_query = a.get("capability", "")
+    tool = a.get("tool", "exec")
+    arguments = a.get("arguments", {})
+    timeout = int(a.get("timeout", 120))
+    my_name = CFG.get("name", "node")
+
+    # 先查本地能力
+    local_caps = get_caps()
+    if local_caps.get(cap_query):
+        # 本地就能干，直接执行
+        fn = TOOL_FUNCS.get(tool)
+        if fn:
+            return fn(arguments)
+        return "本地有 %s 但工具 %s 不存在" % (cap_query, tool), True
+
+    # 查 peers 的能力，找匹配的
+    peers = load_peers()
+    candidates = []
+    for pname, pinfo in peers.items():
+        try:
+            text, is_err = peer_call(pinfo["url"], pinfo.get("token", ""),
+                                     "caps", {}, timeout=15)
+            if not is_err:
+                pcaps = json.loads(text)
+                if pcaps.get(cap_query):
+                    candidates.append((pname, pinfo, pcaps))
+        except Exception:
+            pass
+
+    if not candidates:
+        return "mesh 中没有节点具备 %s 能力" % cap_query, True
+
+    # 委派给第一个匹配的节点
+    pname, pinfo, pcaps = candidates[0]
+    audit_log("delegate", my_name, pname, tool, "delegated")
+    try:
+        text, is_err = peer_call(pinfo["url"], pinfo.get("token", ""),
+                                 tool, arguments, timeout=timeout)
+        audit_log("delegate", my_name, pname, tool, "ok" if not is_err else "error")
+        return "【委派给 %s】\n%s" % (pname, text), is_err
+    except Exception as e:
+        audit_log("delegate", my_name, pname, tool, "failed", str(e))
+        return "委派给 %s 失败: %s" % (pname, e), True
+
+
+# ---------------------------------------------------------------------------
+# Agent 协作：多节点工作群组
+# ---------------------------------------------------------------------------
+GROUPS_PATH = os.path.join(HERE, "groups.json")
+_groups_lock = threading.Lock()
+
+
+def _load_groups():
+    try:
+        with open(GROUPS_PATH) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {}
+
+
+def _save_groups(d):
+    tmp = GROUPS_PATH + ".tmp"
+    with _groups_lock:
+        with open(tmp, "w") as f:
+            json.dump(d, f, indent=1)
+        os.replace(tmp, GROUPS_PATH)
+
+
+def t_group_form(a):
+    """创建一个多节点工作群组。"""
+    gname = a.get("name", "")
+    members = a.get("members", [])
+    purpose = a.get("purpose", "")
+    if not gname:
+        return "name 不能为空", True
+    my_name = CFG.get("name", "node")
+    if my_name not in members:
+        members.append(my_name)
+    groups = _load_groups()
+    groups[gname] = {"members": members, "purpose": purpose,
+                     "created": time.strftime("%Y-%m-%d %H:%M:%S"), "leader": my_name}
+    _save_groups(groups)
+    # 通知其他成员
+    peers = load_peers()
+    for m in members:
+        if m == my_name:
+            continue
+        if m in peers:
+            try:
+                peer_call(peers[m]["url"], peers[m].get("token", ""),
+                          "msg_send", {"from": my_name, "to": m, "topic": "group-invite",
+                                       "text": json.dumps({"group": gname, "purpose": purpose})},
+                          timeout=10)
+            except Exception:
+                pass
+    return "群组 %s 已创建，成员: %s" % (gname, ", ".join(members)), False
+
+
+def t_group_list(a):
+    """列出所有工作群组。"""
+    groups = _load_groups()
+    if not groups:
+        return "（没有群组）", False
+    lines = []
+    for gname, info in groups.items():
+        lines.append("%s [%s]: %s (成员: %s)" % (gname, info.get("leader", "?"),
+                     info.get("purpose", ""), ", ".join(info.get("members", []))))
+    return "\n".join(lines), False
+
+
+def t_group_disband(a):
+    """解散一个工作群组。"""
+    gname = a.get("name", "")
+    groups = _load_groups()
+    if gname not in groups:
+        return "群组 %s 不存在" % gname, True
+    del groups[gname]
+    _save_groups(groups)
+    return "群组 %s 已解散" % gname, False
+
+
+# ---------------------------------------------------------------------------
+# Mesh 拓扑
+# ---------------------------------------------------------------------------
+def t_mesh(a):
+    """返回 mesh 拓扑信息：本节点 + 所有 peers 的在线状态和能力摘要。"""
+    my_name = CFG.get("name", "node")
+    peers = load_peers()
+    topology = {"self": {"name": my_name, "caps": get_caps(), "online": True}}
+    topology["peers"] = {}
+    for pname, pinfo in peers.items():
+        entry = {"url": pinfo.get("url", ""), "tailnet": pinfo.get("tailnet", False)}
+        # 探活
+        try:
+            text, is_err = peer_call(pinfo["url"], pinfo.get("token", ""),
+                                     "peer_info", {}, timeout=8)
+            entry["online"] = not is_err
+            if not is_err:
+                try:
+                    entry["info"] = json.loads(text)
+                except ValueError:
+                    entry["info"] = text
+        except Exception:
+            entry["online"] = False
+        topology["peers"][pname] = entry
+    return json.dumps(topology, ensure_ascii=False), False
+
+
+# ---------------------------------------------------------------------------
+# v4.0 工具注册
+# ---------------------------------------------------------------------------
+COLLAB_TOOLS = [
+    ("caps", "返回本节点的能力清单（Docker/GPU/Tailscale/网络/工具列表等）。",
+     {"type": "object", "properties": {}}),
+    ("mesh_caps", "查询 mesh 内所有节点的能力清单（本机 + 所有 peers），用于发现谁有某能力。",
+     {"type": "object", "properties": {}}),
+    ("delegate", "在 mesh 中委派任务：指定需要的能力（如 docker/gpu），自动找到匹配的节点执行。",
+     {"type": "object", "properties": {
+         "capability": {"type": "string", "description": "需要的能力，如 docker / gpu / tailscale"},
+         "tool": {"type": "string", "description": "在对端调用的工具名，如 exec / docker_ps"},
+         "arguments": {"type": "object", "description": "传给工具的参数"},
+         "timeout": {"type": "number", "description": "超时秒数，默认 120"}},
+      "required": ["capability", "tool"]}),
+    ("group_form", "创建多节点工作群组，成员收到邀请消息。",
+     {"type": "object", "properties": {
+         "name": {"type": "string"}, "members": {"type": "array", "items": {"type": "string"}},
+         "purpose": {"type": "string"}},
+      "required": ["name"]}),
+    ("group_list", "列出所有工作群组。",
+     {"type": "object", "properties": {}}),
+    ("group_disband", "解散一个工作群组。",
+     {"type": "object", "properties": {"name": {"type": "string"}}, "required": ["name"]}),
+    ("mesh", "返回 mesh 拓扑：本节点 + 所有 peers 的在线状态和能力摘要。",
+     {"type": "object", "properties": {}}),
+]
+
+COLLAB_FUNCS = {
+    "caps": t_caps, "mesh_caps": t_mesh_caps, "delegate": t_delegate,
+    "group_form": t_group_form, "group_list": t_group_list,
+    "group_disband": t_group_disband, "mesh": t_mesh,
+}
 
 # ---------------------------------------------------------------------------
 # 工具清单（base 名，暴露时按 tool_prefix 加前缀）
@@ -1062,6 +1628,20 @@ BASE_TOOLS = [
      {"type": "object", "properties": {"job_id": {"type": "string"}}, "required": ["job_id"]}),
     ("exec_jobs", "列出当前所有后台任务（job_id / 状态 / 输出大小）。",
      {"type": "object", "properties": {}}),
+    ("msg_send", "节点间消息：给另一个 AI/节点发消息（存进本节点邮箱）。from=你的名字, to=对方名字或 *(广播), topic=可选主题。",
+     {"type": "object", "properties": {
+         "from": {"type": "string"}, "to": {"type": "string"}, "text": {"type": "string"},
+         "topic": {"type": "string", "description": "可选主题/频道，如 fleet-join, task-request"}},
+      "required": ["from", "to", "text"]}),
+    ("msg_recv", "节点间消息：收发给我的新消息；wait=秒（最多300）没有新消息时阻塞等待。topic=只收该主题。",
+     {"type": "object", "properties": {
+         "me": {"type": "string"}, "wait": {"type": "number"},
+         "after_id": {"type": "number", "description": "只取 id 大于它的消息（不改已读位置）"},
+         "peek": {"type": "boolean", "description": "只看不标记已读"},
+         "topic": {"type": "string", "description": "只收该主题的消息"}},
+      "required": ["me"]}),
+    ("msg_history", "节点间消息：查看邮箱最近 N 条（可按主题过滤）。",
+     {"type": "object", "properties": {"lines": {"type": "number"}, "topic": {"type": "string"}}}),
 ]
 
 BASE_FUNCS = {
@@ -1072,10 +1652,14 @@ BASE_FUNCS = {
     "exec_async": t_exec_async, "exec_poll": t_exec_poll,
     "exec_result": t_exec_result, "exec_kill": t_exec_kill,
     "exec_jobs": t_exec_jobs,
+    "msg_send": t_msg_send, "msg_recv": t_msg_recv, "msg_history": t_msg_history,
 }
 if CFG.get("peer_tools", True):
     BASE_TOOLS += PEER_TOOLS
     BASE_FUNCS.update(PEER_FUNCS)
+if CFG.get("collab_tools", True):
+    BASE_TOOLS += COLLAB_TOOLS
+    BASE_FUNCS.update(COLLAB_FUNCS)
 
 # 对外暴露的工具（含前缀）
 TOOLS = []
@@ -1436,6 +2020,31 @@ def main():
         print("  " + "!" * 68)
     if nets:
         print("  来源白名单      : %s" % ", ".join(str(n) for n in nets))
+    # ---- v4.0: Tailscale 自动组网 ----
+    if CFG.get("tailnet_auto_mesh", True):
+        ts_ip = _tailscale_ip()
+        if ts_ip:
+            print("  Tailscale       : 在线 (%s)" % ts_ip)
+            discovered = _auto_discover_peers(args.port)
+            if discovered:
+                print("  自动发现        : %d 个 fleet 节点 -> %s" %
+                      (len(discovered), ", ".join(n for n, _ in discovered)))
+            else:
+                print("  自动发现        : tailnet 上暂无其他 fleet 节点")
+            # 启动后台线程：定期扫描 + 上线广播
+            def _mesh_daemon():
+                _broadcast_join()
+                while True:
+                    time.sleep(int(CFG.get("tailnet_scan_interval", 60)))
+                    try:
+                        _auto_discover_peers(args.port)
+                    except Exception:
+                        pass
+            t = threading.Thread(target=_mesh_daemon, daemon=True)
+            t.start()
+        else:
+            print("  Tailscale       : 未安装或未登录（--tailnet 安装时自动配置）")
+
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:

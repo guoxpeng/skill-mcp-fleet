@@ -1,638 +1,269 @@
-# MCP Fleet · 节点互控安装包
+# MCP Fleet · 节点互控系统 v4.0
+
+> 零依赖 · 纯 Python 标准库 · 兼容 Python 3.6+ · 32 个工具
 
 给你的设备集群（NAS / 飞牛 OS / 树莓派 / 云主机 / 容器 / 手机…）每台装一个「节点」，即可被**任意支持 MCP 的 AI agent / 客户端**远程操控 —— WorkBuddy、Claude Desktop、Claude Code、Cursor、Cline、Cherry Studio、Codex 或你自己写的 agent 都行，不绑定某一家。
 
-**v3.5 起不分主端副端**：每个节点既能被控制，也能去控制别的节点（自带 `fleet` 命令和 `peer_call` 工具）。谁发起连接，谁就是这一次的控制方；两台节点 `fleet pair` 一下就能**双向互控**。下文沿用的「主端 / 副端」只是指**这一次连接里的控制方 / 被控方**，不是固定身份。
+**v4.0 不分主端副端**：每个节点既能被控制，也能去控制别的节点。谁发起连接，谁就是这一次的控制方；两台节点 `fleet pair` 一下就能**双向互控**。
 
-## 一、这是什么
+## v4.0 五大进化
+
+| # | 进化方向 | 核心能力 |
+|---|---------|----------|
+| 1 | **Tailscale 自动组网** | `--tailnet` 一键加入 tailnet，新设备上线自动发现全网节点，零配置互连 |
+| 2 | **Agent 协作协议** | 节点自动声明能力（Docker/GPU/网络），按能力委派任务，多节点临时组队 |
+| 3 | **消息总线** | pub/sub 广播 + topic 过滤 + 持久化邮箱，agent 间异步通信不丢消息 |
+| 4 | **安全加固** | tailnet 内自动互信（端到端加密）、审计日志、令牌桶限流 |
+| 5 | **Mesh 拓扑可视化** | `fleet mesh` 一键打印全网拓扑图（谁连谁、谁在线、各节点能力） |
+
+## 架构
 
 ```
 控制方（任意 MCP 客户端 / agent，或任意一个节点自带的 fleet）
-  └── 该客户端自己的 MCP 配置（例：WorkBuddy 的 ~/.workbuddy/mcp.json、
-      Claude Desktop 的 claude_desktop_config.json、Cursor 的 .cursor/mcp.json …）
-        ├── nas      → http://192.168.1.10:3100/mcp   副端·远程
-        └── fnos     → http://192.168.1.11:3100/mcp   副端·远程（待装）
-              │
-节点（各台 Linux / Termux / Windows 设备，各跑一个 mcp_agent.py，开机自启）
+  └── MCP 配置
+        ├── nas      → http://100.64.1.10:3100/mcp   (Tailscale)
+        ├── cloud    → http://100.64.2.5:3100/mcp    (Tailscale)
+        └── pi       → http://100.64.3.20:3100/mcp   (Tailscale)
+
+节点（各台设备，各跑一个 mcp_agent.py，开机自启）
   ├── 命令在设备本机执行，不经 SSH —— 更快、更稳
-  └── 节点之间可互相调用（peer_call），A ⇄ B 双向，也能 A → B → C 多跳进内网
+  ├── 节点之间 peer_call 互控，A ⇄ B 双向，A → B → C 多跳进内网
+  ├── msg_send/msg_recv 异步消息总线，topic 广播
+  ├── caps 能力声明，delegate 按能力委派任务
+  └── Tailscale tailnet 端到端加密，自动发现自动互信
 ```
 
-副端就是一个**标准的 MCP 服务器**（Streamable HTTP，端点 `/mcp`，可选 `Authorization: Bearer <token>` 鉴权），不依赖任何特定客户端。主端是谁都行，只要它能连 HTTP 类型的 MCP 服务器；只支持 stdio 的客户端可以用 `npx mcp-remote <url>` 桥接一下。下文的示例以 WorkBuddy 为主，换成别的客户端只是**配置文件位置不同**，内容一样。
+## 节点工具清单（32 个）
 
-**每个节点 22 个工具**（主端看到的工具名 = `<服务名>__<工具名>`，如 `nas__exec`）：
+| 类别 | 工具 | 作用 |
+|------|------|------|
+| **执行** | `exec` | 执行 shell 命令，`sudo:true` 可提权 |
+| | `exec_async` / `exec_poll` / `exec_result` / `exec_kill` / `exec_jobs` | 后台任务：启动→取增量→等待完成→终止→列表 |
+| **文件** | `read` / `write` / `edit` / `list_dir` | 读文件（可按行）/ 写追加 / 文本块替换 / 列目录 |
+| **Docker** | `docker_ps` / `docker_logs` / `docker_restart` | 容器列表 / 日志 / 重启 |
+| **系统** | `systemctl` / `service_logs` / `sysinfo` / `http_get` | 服务启停 / 日志 / 系统概览 / 本机 HTTP |
+| **Peer Mesh** | `peers` / `peer_info` | 列出对等节点（探活）/ 本节点信息 |
+| | `peer_call` | 经本节点调另一个节点的任意工具，可多跳转发 |
+| | `peer_add` / `peer_remove` | 增删对等节点 |
+| **消息总线** | `msg_send` | 发消息（to=* 广播，topic=主题过滤） |
+| | `msg_recv` | 收消息（wait 阻塞等待，topic 过滤，peek 只看） |
+| | `msg_history` | 查看邮箱历史（可按 topic 过滤） |
+| **Agent 协作** | `caps` | 返回本节点能力清单（Docker/GPU/Tailscale/网络/工具） |
+| | `mesh_caps` | 查询 mesh 内所有节点能力（发现谁有某能力） |
+| | `delegate` | 按能力委派任务（自动找匹配节点执行） |
+| | `group_form` / `group_list` / `group_disband` | 多节点工作群组 |
+| **Mesh 拓扑** | `mesh` | 全网拓扑：本节点 + 所有 peers 的在线状态和能力 |
 
-| 工具 | 作用 |
-|---|---|
-| `exec` | 执行 shell 命令，`sudo:true` 可提权 |
-| `exec_async` / `exec_poll` / `exec_result` / `exec_kill` / `exec_jobs` | 后台任务：启动→取增量输出→等待完成→终止→列表（长任务不阻塞，v3.2+） |
-| `read` / `write` / `edit` | 读文件（可按行）、写/追加、文本块替换 |
-| `list_dir` | 列目录 |
-| `docker_ps` / `docker_logs` / `docker_restart` | 容器列表 / 日志 / 重启 |
-| `systemctl` / `service_logs` | 服务启停状态 / 服务日志（journalctl） |
-| `sysinfo` | 主机/负载/内存/磁盘/CPU TOP5 |
-| `http_get` | 在设备本机发 HTTP（测本机服务） |
-| `peers` / `peer_info` | 列出本节点认识的对等节点（`check:true` 顺带探活）/ 本节点名字与回连地址（v3.5） |
-| `peer_call` | 经本节点调用另一个节点的任意工具，可多跳转发（v3.5） |
-| `peer_add` / `peer_remove` | 增删对等节点（名字 + 地址 + 令牌）（v3.5） |
+## 一、安装
 
-## 二、下载并安装（在**副设备**上）
-
-### 方式 A：两条命令（推荐，最稳）
+### 方式 A：一键安装 + Tailscale 自动组网（推荐）
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/guoxpeng/skill-mcp-fleet/main/install.sh -o install.sh
-sudo bash install.sh --name fnos --port 3100
+curl -fsSL https://raw.githubusercontent.com/guoxpeng/skill-mcp-fleet/main/scripts/install.sh -o install.sh
+sudo bash install.sh --name nas --port 3100 --tailnet my-tailnet --tailnet-key tskey-xxx
 ```
 
-### 方式 B：一条命令（下载即装，需当前为 root）
+装完后自动完成：安装 Tailscale → 加入 tailnet → 启动 MCP agent → 发现其他 fleet 节点 → 自动互连
+
+### 方式 B：普通安装（内网，不需要 Tailscale）
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/guoxpeng/skill-mcp-fleet/main/install.sh | sudo bash -s -- --name fnos --port 3100
+curl -fsSL https://raw.githubusercontent.com/guoxpeng/skill-mcp-fleet/main/scripts/install.sh -o install.sh
+sudo bash install.sh --name nas --port 3100
 ```
 
-> 管道方式下脚本自己会用 `sudo bash -s --` 承接参数；若当前用户非 root 且未加 `sudo`，脚本会给出明确提示而不是卡住。
-
-### 下载不到 github 时换镜像（任选一条，内容完全一致）
+### 方式 C：公网隧道
 
 ```bash
-# jsDelivr CDN
-curl -fsSL https://cdn.jsdelivr.net/gh/guoxpeng/skill-mcp-fleet@main/install.sh -o install.sh
-
-# ghfast.top 加速
-curl -fsSL https://ghfast.top/https://raw.githubusercontent.com/guoxpeng/skill-mcp-fleet/main/install.sh -o install.sh
-
-# ghproxy.net 加速
-curl -fsSL https://ghproxy.net/https://raw.githubusercontent.com/guoxpeng/skill-mcp-fleet/main/install.sh -o install.sh
-
-# gh-proxy.com 加速
-curl -fsSL https://gh-proxy.com/https://raw.githubusercontent.com/guoxpeng/skill-mcp-fleet/main/install.sh -o install.sh
-
-# GitHub API（返回 base64，大陆通常可达；公开仓库可省略 Token）
-curl -fsSL https://api.github.com/repos/guoxpeng/skill-mcp-fleet/contents/install.sh \
-  | python3 -c "import sys,json,base64;open('install.sh','wb').write(base64.b64decode(json.load(sys.stdin)['content']))"
-
-# 下载后照方式 A 安装
-sudo bash install.sh --name fnos --port 3100
+sudo bash install.sh --name phone --port 3100 --tunnel --generate-token --require-auth
 ```
-
-各通道内容一致，MD5 `e741f3b82ca100acddd161639e8645d5`（227169 B，v3.5）。
-
-### 方式 C：完全离线 · 粘贴即装（副设备连不上网 / 下载不到时）
-
-用仓库里的 [`install-offline.paste.txt`](install-offline.paste.txt)：它是一整段文本，里面用二进制编码（base64）内嵌了完整的 `install.sh`。
-
-1. 打开 `install-offline.paste.txt`，**从第一行到最后一行全部复制**（约 58 KB）
-2. 粘贴到副设备终端里，回车
-3. 它会自动：解码 → 校验 md5 → 安装（root 直接装，非 root 自动 `sudo`，Termux 直接装）
-
-默认名字 = 主机名、端口 = 3100。要改有两种办法：
-
-```bash
-# 办法一：粘贴前先执行这一行，再粘贴
-export FLEET_NAME=nas FLEET_PORT=3100
-# 办法二：粘贴前把文件第 3 行里的默认值改掉
-```
-
-要点：
-
-- **不需要网络**，也不需要往副设备传文件；有 `base64` + `gzip`（coreutils）就能解，没有时自动改用 python3
-- 校验不过会打印「校验失败 …… 请整段重新复制」并停下，**不会装半截**（通常是没复制全）
-- 全程不用 `exit`，粘贴进交互终端也不会把窗口关掉
-- 需要带隧道 / 令牌等更多参数时，用方式 A 或下面的 `install-offline.sh`：
-  `sudo bash install-offline.sh --name nas --port 3100 --tunnel --generate-token --require-auth`
-- 其他离线形态（单文件自解压、纯 base64、分片）的用法见 [`install-offline.README.txt`](install-offline.README.txt)
-
-### 节点双向互控（v3.5，不分主副）
-
-装完的每个节点都自带控制端 `fleet` 命令（Termux 装在 `$PREFIX/bin`，Linux 装在 `/usr/local/bin`），以及 `peers` / `peer_call` 等 MCP 工具。两台节点**配对一次**，之后谁都能控制谁：
-
-```bash
-# 在节点 A 上执行（B 的地址和令牌在 B 安装完成时会打印）
-fleet pair http://<B的IP>:3100/mcp --token <B的令牌>
-```
-
-`pair` 会依次：把 B 登记到 A → 让 B 把 A 登记过去（用 A 的地址和令牌）→ 让 B 回连 A 验证。看到「双向验证通过」就好了：
-
-```bash
-fleet exec nas 'uptime'          # 在 A 上控制 B
-fleet exec phone 'uptime'        # 在 B 上控制 A
-fleet list                       # 看本节点认识谁
-```
-
-AI 那边同样适用：MCP 客户端只要连上**任意一个**节点，就能用 `peer_call` 控制它认识的其他节点，例如
-`peer_call {peer: "nas", tool: "exec", arguments: {command: "docker ps"}}`；还能多跳（A → B → C）进入 A 直接够不着的内网。
-
-要点：
-
-- **对等节点表**存在各节点的 `<安装目录>/peers.json`（权限 0600），`fleet` 命令和 `peer_*` 工具共用这一份；重装不会丢
-- **回连地址**：默认用本机隧道地址（`current_url.txt`），没有隧道就用内网 IP:端口；对方够不着时用 `fleet pair … --self-url <对方能访问的地址>`，或在配置里写 `self_url`
-- **防成环**：转发经过的跳数由请求头 `X-Fleet-Hops` 计数，超过 `peer_max_hops`（默认 3）直接拒绝
-- 内网 / 本机地址的对等调用**不走 http_proxy**，避免设备上配了代理时局域网节点连不上
-- 只想单向（例如对方不该反过来控制你）：`fleet pair … --one-way`；整个关掉对等功能：配置里 `"peer_tools": false`
-- 安全提醒：持有某节点令牌的人，能经它的 `peer_call` 使用它保存的其他节点令牌。**互相配对的节点等于同一个信任域**，令牌要保管好，公网节点务必开 `--require-auth`
-- 没装节点的纯控制端（比如只装了 WorkBuddy 的 Windows 电脑）照旧用仓库里的 `fleet.py`，`pair` 会自动降级为单向登记
-
-### 从旧版本升级到 v3.4（修复副端掉线）
-
-**在每台副端上把原来的安装命令（方式 A / B / C 任一）重新跑一遍即可**，配置文件、令牌、隧道设置都会保留，不会被覆盖。重跑后会自动重启服务换成新代码。
-
-v3.4 修了这些导致「副端掉线 / 假在线」的问题：
-
-- **保活改成真实探活**：以前只看进程在不在，进程卡死也算「活着」。现在每轮真的 HTTP 请求 `/health`：agent 连续 2 轮不通就重启；公网地址连续 3 轮不通就重建隧道；本机都不通时只修 agent，不误重建隧道
-- **连接空闲超时**（默认 300 秒）+ TCP keepalive：半开的死连接不再永久占线
-- `exec` 超时 / `exec_kill` **杀整个进程组**，不再留孤儿进程
-- SSE 长连接发完即清队列，避免内存越积越多
-- 主循环异常以非零状态退出，交给 systemd / 守护壳自动重启
-- `GET /mcp` 改回规范的 405（以前 404 会让部分客户端误判服务不存在）
-- 非 root 自动 `sudo` 重新执行时，`--name`、`--port` 等参数不再丢失
-- Termux 启动时自动 `termux-wake-lock`，减少手机息屏后掉线
-
-### v3.3+：一键环境自举 + 多隧道后端
-
-安装脚本会自动识别系统并装好依赖，不用再手工 `apt install python3`：
-
-- **包管理器自动识别**：apt-get / dnf / yum / apk / pacman / pkg（Termux）
-- **Termux（Android 手机）**：自动进手机模式，安装目录改到 `$PREFIX/opt`，无 systemd 时用 nohup 守护
-- 非 root 在 Termux 下可直接装（会提示权限范围）；Linux 下自动 `sudo` 提权
-
-公网隧道不再只有 cloudflared（`--tunnel-backend` 三选一）：
-
-```bash
-# 默认：cloudflared 快隧（地址临时，重启会变）
-bash install.sh --name phone --port 3100 --tunnel --generate-token --require-auth
-
-# frp：经你自己的 VPS，地址恒定 http://<VPS>:13100（推荐长期用）
-# 先在 VPS 上：bash install.sh --print-frps   # 打印 frps 一键配置
-bash install.sh --name phone --port 3100 --tunnel --tunnel-backend frp \
-  --frp-server <VPS地址> --frp-token <与frps一致> --generate-token --require-auth
-
-# ssh：autossh 反向隧道经你 VPS，地址恒定，无需额外装服务端
-# VPS 的 sshd 需开 GatewayPorts yes；首次运行会打印公钥，按提示加入 VPS 即可
-bash install.sh --name phone --port 3100 --tunnel --tunnel-backend ssh \
-  --ssh-dest root@<VPS地址> --generate-token --require-auth
-```
-
-`bash <安装目录>/mcp-tunnel.sh` 会按配置的后端自动重建隧道；保活守护共用同一套 pid/地址文件。
-下载后建议核对一遍：`md5sum install.sh`。
-
-看到 `服务状态: active`（systemd 机型）或 `已启动`（容器机型）加 `本机自检通过` 就成了。
 
 ### 参数
 
 | 参数 | 说明 | 默认 |
-|---|---|---|
-| `--name` | 副端标识（决定服务名、主端里的服务名） | 主机名 |
+|------|------|------|
+| `--name` | 节点标识 | 主机名 |
 | `--port` | 监听端口 | `3100` |
-| `--dir` | 安装目录 | `/opt/<name>_mcp` |
-| `--prefix` | 工具名前缀（一般不用填） | 空 |
-| `--sudo-pass` | 需要 sudo 提权时写入配置的密码 | 空（自动用免密 sudo） |
-| `--mode` | 托管方式：`auto` / `systemd` / `nohup` | `auto` |
-| `--tunnel` | 装完顺带起一条公网隧道（云容器/无内网入口时用） | 关 |
-| `--auth-token` | 访问令牌（Bearer）。留空=不鉴权；开隧道时脚本会自动补一个 | 空 |
-| `--allow-ips` | IP/CIDR 白名单，逗号分隔，如 `'10.0.0.0/8,203.0.113.7'` | 空（不限来源） |
-| `--directory` | 地址目录地址，如 `http://192.168.1.10:8790`；填了保活守护会上报隧道地址 | 空 |
-| `--directory-token` | 地址目录的 `X-Fleet-Token` | 空 |
-| `--no-keepalive` | 不装保活守护（默认装：systemd timer 或常驻进程） | 关 |
-| `--uninstall` | 卸载（停服务+删单元+删目录+清隧道进程） | — |
+| `--tailnet` | Tailscale tailnet 名，自动安装并加入 | 空（不组网） |
+| `--tailnet-key` | Tailscale auth key（免交互登录） | 空（交互登录） |
+| `--tunnel` | 起公网隧道 | 关 |
+| `--auth-token` | 访问令牌 | 空 |
+| `--generate-token` | 自动生成令牌 | 关 |
+| `--require-auth` | 强制鉴权 | 关 |
+| `--allow-ips` | IP/CIDR 白名单 | 空 |
+| `--uninstall` | 卸载 | — |
 
-### 常见场景
+## 二、接入主端
 
-```bash
-# 飞牛 OS（fnOS）—— 本身就是 Debian，直接跑
-sudo bash install.sh --name fnos --port 3100
-
-# 设备上 sudo 需要密码（配置进去，docker/systemctl 才能用）
-sudo bash install.sh --name fnos --port 3100 --sudo-pass '你的密码'
-
-# 装第二个副端，端口错开
-sudo bash install.sh --name pi --port 3101
-
-# 卸载
-sudo bash install.sh --name fnos --port 3100 --uninstall
-```
-
-**重复执行同一命令是安全的**（幂等）：会更新代码并重启服务，但**不会覆盖你已改过的配置文件**。
-
-### 没有 systemd 的环境（Docker / PAI-DSW / Colab / 云容器）
-
-脚本会自动降级为**守护进程模式**：功能完全一样（12 个工具照用），只是不走服务托管。安装目录里会多出一套自包含的控制脚本：
+### 用 fleet.py（零依赖统一 CLI）
 
 ```bash
-bash /opt/<name>_mcp/mcp-ctl.sh status     # 状态 + 健康检查
-bash /opt/<name>_mcp/mcp-ctl.sh start      # 启动
-bash /opt/<name>_mcp/mcp-ctl.sh stop       # 停止
-bash /opt/<name>_mcp/mcp-ctl.sh restart    # 重启
-bash /opt/<name>_mcp/mcp-ctl.sh log 50     # 最近 50 行日志
-bash /opt/<name>_mcp/mcp-ctl.sh tunnel     # 起公网隧道
+python scripts/fleet.py add --name nas --ip 100.64.1.10 --port 3100    # Tailscale 地址
+python scripts/fleet.py list                    # 列已注册节点
+python scripts/fleet.py mesh                    # 打印 mesh 拓扑图
+python scripts/fleet.py exec nas "uptime"       # 在节点执行命令
+python scripts/fleet.py call nas --tool caps    # 查节点能力
+python scripts/fleet.py call nas --tool mesh_caps  # 查全网能力
+python scripts/fleet.py pair nas                # 双向配对
+python scripts/fleet.py health --deep           # 全网体检
 ```
 
-内部带一个 `_supervisor.sh` 守护壳，进程崩了 3 秒自动拉起（等价于 systemd 的 `Restart=always`）。**区别只有一个：容器重启后需要手动 `mcp-ctl.sh start`**（或把这条命令写进平台的启动钩子）。
-
-> 手动指定也行：`--mode nohup` 强制守护进程模式；`--mode systemd` 在真 systemd 机型上强制走服务。
-
-## 二之二、云容器怎么连上？（公网隧道）
-
-容器/云主机通常**没有**能被你家内网直接访问的 IP，此时用内置的 cloudflared 快速隧道：
-
-```bash
-bash /opt/<name>_mcp/mcp-tunnel.sh
-```
-
-它会自动下载 `cloudflared` 并打印一个 `https://xxx.trycloudflare.com` 地址，主端 `mcp.json` 就填 `<该地址>/mcp`。装的时候一步到位：`--tunnel`。
-
-注意事项：
-
-- 地址是**临时的**，隧道重启就变，换了要同步改主端的 MCP 配置再重启主端客户端。脚本默认**复用已在运行的隧道**（地址不变，也避免撞限流）；要强制重建用 `CF_FORCE=1 bash mcp-tunnel.sh`。
-- 隧道脚本末尾的「公网访问：xxx」是**从副端本机发起**的 curl，只作参考。**容器里常出现 `000`，但隧道其实是通的**——云容器出网多有限制，本机连不上 Cloudflare 边缘，而 cloudflared 走的 UDP 7844 不受影响。判定以主端为准：
-
-  ```bash
-  # 在主端电脑上跑，返回 200 就是好的
-  curl -s -o /dev/null -w '%{http_code}\n' https://xxx.trycloudflare.com/
-  ```
-- **别反复重开隧道**：trycloudflare 对新建快隧有频率限制，短时间建太多会出现「隧道连上了但域名一直不解析」，等 10~30 分钟再试。脚本默认**复用已有隧道**，保活守护的铁律也是「能复用绝不重建」，正常不会触发。
-- QUIC 被网络设备干扰时（日志刷 `no recent network activity`、访问间歇 502）换协议：`CF_PROTO=http2 bash mcp-tunnel.sh`。**这一步脚本会自动做**：起隧道后 36 秒内轮询日志，命中 QUIC 报错就杀掉、记下 `.tunnel_proto=http2` 并自动重启为 http2，下次直接沿用。
-- **开隧道前必须设 token**：脚本检测到 `auth_token` 为空会自动生成 32 字节随机 token、写进配置、重启副端，并打印主端该加的 `headers`。见「六、安全说明」。
-- 公网隧道**用完就关**：`kill $(cat /opt/<name>_mcp/tunnel.pid)`。要长期用就上固定隧道（自有域名 + `cloudflared tunnel create`，地址恒定，配 `CF_TOKEN` 走 named tunnel）或端口映射/frp。
-- 地址变了不用手工改 mcp.json —— 配「地址目录」让主端自动跟随，见「八之二」。
-
-## 三、接入主端（在**主端电脑**上）
-
-### 推荐：用 `fleet.py`（零依赖统一 CLI）
-
-`fleet.py` 直接按 MCP 协议访问副端，**改完配置立刻可用，不需要重启 agent**：
-
-```bash
-python fleet.py add --name fnos --ip 192.168.1.11 --port 3100          # 内网
-python fleet.py add --name cloud --url https://xxx.trycloudflare.com/mcp --token <令牌>   # 公网隧道
-python fleet.py list                    # 列已注册副端
-python fleet.py probe fnos              # 握手 + 列工具 + 真调一次 exec（探活失败自动重试 3 次）
-python fleet.py health                  # 全部节点健康总览
-python fleet.py exec fnos "uptime"      # 在副端执行命令
-python fleet.py exec-async fnos "apt upgrade -y"   # 后台启动，立即返回 job_id
-python fleet.py exec-poll fnos <job_id>             # 取增量输出（--offset 续取）
-python fleet.py exec-result fnos <job_id> --wait 120 # 等待完成取全量输出
-python fleet.py exec-kill fnos <job_id>              # 终止后台任务
-python fleet.py exec-jobs fnos                       # 列后台任务
-python fleet.py sync                    # 按地址目录刷新（隧道换域名后自动跟随）
-```
-
-`python fleet.py --help` 看全部子命令。
-
-### 或者用 `add_fleet_node.py`（只负责写 mcp.json）
-
-```bash
-python add_fleet_node.py --name fnos --ip 192.168.1.11 --port 3100          # 内网
-python add_fleet_node.py --name cloud --url https://xxx.trycloudflare.com/mcp   # 公网隧道
-```
-
-脚本会探测连通性、按 MCP 规范握手后真实调一次 `exec`，然后自动写进 `~/.workbuddy/mcp.json`（WorkBuddy 的配置位置；用别的客户端时，照下面的 JSON 手动加到它自己的配置里即可）。
-
-其它用法：
-
-```bash
-python add_fleet_node.py --list                              # 看已注册的副端
-python add_fleet_node.py --name fnos --ip 1.2.3.4 --remove   # 移除
-python probe_fleet.py http://192.168.1.11:3100/mcp           # 纯诊断：握手+列工具+调工具
-python call_node.py  http://192.168.1.11:3100/mcp 'uname -a' # 免重启直接调一次工具
-```
-
-也可以手改配置。大多数客户端都是同一种 `mcpServers` 写法，只是文件位置不同：
+### 手动配置 MCP 客户端
 
 ```json
 {
   "mcpServers": {
-    "fnos": {
+    "nas": {
       "type": "http",
-      "url": "http://192.168.1.11:3100/mcp",
-      "headers": { "Authorization": "Bearer <你的令牌，未开鉴权可删掉这行>" }
+      "url": "http://100.64.1.10:3100/mcp",
+      "headers": { "Authorization": "Bearer <令牌>" }
     }
   }
 }
 ```
 
-| 主端客户端 | 配置位置（常见） |
-|---|---|
-| WorkBuddy | `~/.workbuddy/mcp.json` |
-| Claude Desktop | 设置 → 开发者 → 编辑配置（`claude_desktop_config.json`） |
-| Claude Code | `claude mcp add --transport http fnos http://192.168.1.11:3100/mcp` |
-| Cursor | `~/.cursor/mcp.json` 或项目内 `.cursor/mcp.json` |
-| Cline / Cherry Studio 等 | 各自的「MCP 服务器」设置里添加 HTTP 类型服务器 |
-| 只支持 stdio 的客户端 | `"command": "npx", "args": ["mcp-remote", "http://192.168.1.11:3100/mcp"]` |
+## 三、Agent 协作示例
 
-各客户端的字段名可能略有差异（如 `type` 写成 `streamableHttp` / `transport`），以该客户端文档为准。
+### 按能力委派任务
 
-**最后一步：重启主端客户端**（或重载 MCP 配置）。MCP 配置改完通常不会自动生效。
-
-## 四、自建内网分发（可选，设备多时省事）
-
-在任一台机器上放一份静态服务：
-
-```bash
-sudo python3 -m http.server 8099 --directory /opt/fleet_agent --bind 0.0.0.0
+```
+Agent A (无 Docker):
+  → delegate(capability="docker", tool="docker_ps", arguments={})
+  → 自动发现 Agent B 有 Docker
+  → Agent B 执行 docker_ps
+  → 结果返回给 Agent A
 ```
 
-之后每台设备只需：
+### 多节点组队
 
-```bash
-curl -fsSL http://192.168.1.10:8099/install.sh -o install.sh && sudo bash install.sh --name <名字> --port 3100
+```
+Agent A:
+  → group_form(name="deploy-team", members=["nas", "cloud", "pi"], purpose="蓝绿部署")
+  → 三个节点收到邀请
+  → A 委派编译给 cloud（8CPU），测试给 pi，部署给 nas
+  → group_disband(name="deploy-team")
 ```
 
-仓库里附了现成的 `fleet-http.service`（systemd 单元），改好路径后 `systemctl enable --now fleet-http` 即可常驻。
+### 消息总线
 
-## 五、日常运维（副端上）
+```
+Agent A:
+  → msg_send(from="a", to="*", topic="alert", text="磁盘空间不足")
+  → 所有节点收到 alert 主题消息
 
-**systemd 机型：**
-
-```bash
-systemctl status <name>-mcp      # 状态
-journalctl -u <name>-mcp -f      # 实时日志
-systemctl restart <name>-mcp     # 改完配置重启
+Agent B:
+  → msg_recv(me="b", topic="alert", wait=60)
+  → 收到 A 的广播
 ```
 
-**容器机型（无 systemd）：**
+## 四、Mesh 拓扑可视化
 
 ```bash
-bash /opt/<name>_mcp/mcp-ctl.sh {start|stop|restart|status|log|tunnel}
+python scripts/fleet.py mesh
 ```
 
-查不到机型就统一用 `bash /opt/<name>_mcp/mcp-ctl.sh status`，它会自己判断。
+输出示例：
+```
+============================================================
+  Fleet Mesh 拓扑
+============================================================
+  [*] nas              http://100.64.1.10:3100/mcp  [Docker, GPU, TS:100.64.1.10, systemd, 4CPU, 8192MB]
+      |- cloud           在线 tailnet
+      |- pi              在线 tailnet
+  [*] cloud             http://100.64.2.5:3100/mcp   [Docker, TS:100.64.2.5, systemd, 8CPU, 32768MB]
+      |- nas             在线 tailnet
+      |- pi              在线 tailnet
+============================================================
+```
+
+## 五、安全
+
+### Tailscale 自动信任
+
+同一 tailnet 的节点自动互信——Tailscale 提供 WireGuard 端到端加密，不需要逐对配 token。跨 tailnet 的连接仍需显式 token。
+
+### 审计日志
+
+每次 `peer_call` / `delegate` 自动记录到 `audit.log`：
+```
+2026-10-17 08:30:15 | peer_call | nas -> cloud | docker_ps | ok
+2026-10-17 08:30:20 | delegate | nas -> cloud | exec | delegated
+```
+
+### 限流
+
+每节点入站 `peer_call` 默认限 120 次/分钟（令牌桶），防过载。可配置 `rate_limit_per_min`。
+
+## 六、配置
 
 配置文件：`/opt/<name>_mcp/mcp_agent_config.json`
 
 ```json
 {
-  "name": "fnos",
-  "tool_prefix": "",
-  "sudo_password": "",
-  "work_dir": "/",
-  "command_timeout": 120,
-  "max_output_bytes": 200000,
-  "allowed_roots": ["/"],
-  "enable_docker": true,
-  "login_shell": true
+  "name": "nas",
+  "version": "4.0.0",
+  "auth_token": "",
+  "peer_tools": true,
+  "tailnet_auto_mesh": true,
+  "tailnet_auto_trust": true,
+  "collab_tools": true,
+  "audit_log": true,
+  "rate_limit_per_min": 120
 }
 ```
 
-改完 `systemctl restart <name>-mcp`（容器用 `mcp-ctl.sh restart`）生效。
-
-> 用 `install.sh` 再装一次也会自动重启（配置文件保留）；隧道默认**复用已有地址**，`--tunnel` 重装不会换地址（要换得先 `CF_FORCE=1` 或先卸载）。
-
-- 设备**没有 Docker** → 把 `enable_docker` 设为 `false`，docker 工具会直接返回友好提示。
-- 想限制文件读写范围 → 改 `allowed_roots`，例如 `["/opt", "/home"]`。
-- **命令输出前面总有一堆欢迎横幅**（PAI-DSW 等容器会在 `/etc/profile.d/` 里打印 ASCII 图）→ 设 `"login_shell": false`。它把执行方式从 `bash -lc`（登录 shell，会 source `/etc/profile`）换成 `bash -c`，输出干净；不影响 PATH（docker / python3 照样能找到）。默认 `true` 是为了兼容老设备。
-
-## 六、安全说明
-
-### 6.1 访问控制（v3.0）
-
-副端以 **root** 运行，`exec` 工具等于**把 root shell 挂出去**。v3.0 起加了两道闸：
-
-| 配置 | 作用 |
-|---|---|
-| `auth_token` | Bearer 令牌。请求要带 `Authorization: Bearer <token>` 或 `X-Fleet-Token`。**留空 = 完全不鉴权** |
-| `allow_ips` | IP/CIDR 白名单。**非空即生效**，不在名单内直接 403（在鉴权之前判） |
-
-另外还有**暴力破解节流**：同一 IP 连续失败 10 次 / 60 秒窗口后，每次鉴权失败
-额外 `sleep 1s`。令牌比对用 `hmac.compare_digest`（常数时间，防时序侧信道）。
-
-### 6.2 v3.1 的加固（默认值改安全）
-
-v3.0 的问题不在「有没有闸」，而在**默认值全是反的**：默认无鉴权、默认绑 `0.0.0.0`、
-默认 `allowed_roots=["/"]`。v3.1 把默认值调正，并补了几个可被外部触发的洞：
-
-| 改动 | 之前 | 现在 |
-|---|---|---|
-| 监听地址 | 默认 `0.0.0.0` | 默认 `127.0.0.1`，要对外必须显式 `--host 0.0.0.0` |
-| CORS | 每个响应都回 `Access-Control-Allow-Origin: *` | 默认**不发**任何 CORS 头；要跨域就填 `cors_allow_origins` |
-| 状态页 `GET /` | 谁都能看到工具清单 / 是否 root / 是否开鉴权 | 只有**配了 token 且校验通过**才返回完整信息 |
-| 请求体 | `Content-Length` 无上限 | 超 `max_body_bytes`（1 MB）或为负 → **413** |
-| `/sse` 并发 | 无上限，每连接常驻一线程 | 超 `max_sse_conns`（16）→ **429** |
-| 非 ASCII 凭据 | `compare_digest` 抛 `TypeError`（未捕获） | 按 bytes 比，正常返回 **401** |
-| `allowed_roots` | `abspath`，软链可逃逸 | `realpath`；且文档写明**不约束 `exec`** |
-| 配置权限 | 只在首次安装时 `chmod 600` | `save_config()` 每次写都**无条件** 0600 |
-
-新增两个开关：`--require-auth`（没配 token 就**拒绝启动**，exit 2）和
-`--generate-token`（现场生成 32 字节随机令牌）。公网 / 隧道场景建议两个都用上。
-
-> ⚠️ 别把 `allowed_roots` 当成沙箱：它只作用于 `read` / `write` / `edit` / `list_dir`，
-> 而 `exec` 本来就能读一切。真正的门禁只有 `auth_token`。
-
-启动时如果 `auth_token` 为空，日志会打印一段醒目警告：
+## 七、目录结构（标准 Skill 格式）
 
 ```
-鉴权            : [!] 未开启
-[!] 未设置 auth_token：任何能访问本端口的人都等于拿到本机 shell。
-[!] 仅限内网使用；一旦开公网隧道（mcp-tunnel.sh），请务必先设置：
+skill-mcp-fleet/
+├── SKILL.md                          # AgentSkill 规范
+├── README.md                         # 本文件
+├── mcp_agent_config.example.json     # 配置模板
+├── scripts/
+│   ├── mcp_agent.py                  # 节点 MCP 服务器（核心）
+│   ├── fleet.py                      # 主端 CLI
+│   ├── fleet_chat.py                 # 消息 CLI
+│   ├── fleet_watch.py                # 保活守护
+│   ├── fleet-directory.py            # 地址目录
+│   ├── install.sh                    # 安装脚本
+│   └── ...
+└── references/
+    ├── 加固操作手册.md
+    ├── 安全审计报告.md
+    └── 云服务器-副端安装-一条命令.md
 ```
 
-**开隧道时脚本会兜底**：`mcp-tunnel.sh` 检测到 `auth_token` 为空，会
-自动生成 32 字节随机 token、写进配置、重启副端，然后打印 token 和主端该加的
-`headers` 片段。确实不要这层保护（只在完全可信的内网里用）才用
-`FLEET_NO_AUTH=1 bash mcp-tunnel.sh`（会大声警告）。
+## 八、日常运维
 
 ```bash
-# 安装时就指定
-sudo bash install.sh --name fnos --port 3100 --auth-token '一串随机'
+# systemd 机型
+systemctl status <name>-mcp
+journalctl -u <name>-mcp -f
 
-# 或只允许内网网段（此时不要开隧道）
-sudo bash install.sh --name fnos --port 3100 --allow-ips '192.168.1.0/24,10.0.0.0/8'
+# 容器机型
+bash /opt/<name>_mcp/mcp-ctl.sh status
+
+# 查审计日志
+tail -f /opt/<name>_mcp/audit.log
+
+# 查消息邮箱
+cat /opt/<name>_mcp/mailbox.jsonl
 ```
 
-> `allow_ips` 和公网隧道**基本互斥** —— 走隧道时来源是 cloudflared 本机地址。
-> 要公网访问就用 token。
+## 从旧版本升级
 
-### 6.2 其他
-
-- 建议用防火墙限制来源：`ufw allow from 192.168.1.0/24 to any port 3100`。
-- `allowed_roots` 是文件读写的安全边界，默认 `/`（不限制）。按需收紧。
-- `install.sh` 不含任何硬编码密码，`--sudo-pass` 由你在安装时传入，明文存于配置文件（root 可读）。
-- 公网隧道**用完就关**：`kill $(cat /opt/<name>_mcp/tunnel.pid)`。
-
-## 七、常见问题（FAQ）
-
-**Q：`bash: install.sh: 没有那个文件或目录`**
-文件没下载到本机。先 `curl -fsSL <URL> -o install.sh && ls -l install.sh` 确认落地再安装。注意从聊天工具里「下载附件」得到的是**本地电脑**上的文件，远端服务器上并不存在。
-
-**Q：装好了，主端连不上**
-先在主端确认网络可达：`curl -s http://<副端IP>:3100/`。云服务器/容器通常还要在**安全组或平台侧放行端口**，否则主端无法连接。
-
-**Q：端口被占用**
-换 `--port 3101` 等空闲端口，主端配置同步改。
-
-**Q：装的时候报 `System has not been booted with systemd as init system (PID 1). Can't operate.`**
-容器里装了 `systemctl` 二进制但 PID 1 不是 systemd（Docker / PAI-DSW / Colab 都这样）。v2.0 已修：脚本改为探测 `/run/systemd/system` + `/proc/1/comm`，这种情况自动走守护进程模式，不再报错。老版本请重新下载 `install.sh`。
-
-**Q：改了 `mcp_agent.py` 后装出去的还是老代码**
-内嵌代码需要重新生成：`python build_installer.py`，再重新执行 `install.sh`。
-
-**Q：装完 `systemctl` 里看不到服务**
-确认是不是容器环境——容器里本就没有服务单元，用 `mcp-ctl.sh` 管理。
-
-**Q：每次工具返回的内容前面都跟着一大段欢迎横幅 / ASCII 图**
-容器（如阿里云 PAI-DSW）在 `/etc/profile.d/` 里写了登录提示。把配置里的 `login_shell` 设为 `false` 再重启服务即可。示例：
+重跑安装命令即可，配置文件保留不会被覆盖：
 
 ```bash
-python3 - <<'PY'
-import json
-p="/opt/fnos_mcp/mcp_agent_config.json"
-d=json.load(open(p)); d["login_shell"]=False
-json.dump(d, open(p,"w"), ensure_ascii=False)
-PY
-bash /opt/fnos_mcp/mcp-ctl.sh restart
+sudo bash install.sh --name nas --port 3100 --tailnet my-tailnet
 ```
 
-**Q：隧道地址主端已能访问（curl 返回 200），但副端自检显示「公网访问 000」**
-正常，忽略即可。容器出网受限导致本机连不上 Cloudflare 边缘，与隧道能否被外部访问无关。
+## 变更日志
 
-## 八、文件清单
-
-| 文件 | 用途 |
-|---|---|
-| `install.sh` | **一键安装脚本**（自包含，已内嵌服务器代码）——拷这一个文件就够了 |
-| `fleet.py` | **统一控制端 CLI**（零依赖）：列节点 / 体检 / 执行命令 / 调工具 / 注册 / 地址跟随 / `pair` 双向配对。v3.5 起每个节点都自带一份（`fleet` 命令）；纯控制端电脑直接用仓库里这份 |
-| `peers.json`（安装后生成） | 本节点的对等节点表（名字 / 地址 / 令牌），`fleet` 命令与 `peer_*` 工具共用，0600 |
-| `install-offline.paste.txt` | **粘贴即装**：整段复制进副设备终端回车，自动解码 + 校验 md5 + 安装（内嵌 `base64(gzip(install.sh))`） |
-| `install-offline.sh` | **自解压安装脚本**，内嵌了 install.sh，只需传这一个文件 |
-| `install-offline.b64` | 离线载荷 = `base64(zlib(install.sh))`，**纯 base64 无注释行**（**不是 tar 包**，只需 python3） |
-| `install-offline.partNN.txt` | 同一载荷的分片（默认每片 4000 字符），**纯 base64**，`cat` 拼即可 |
-| `install-offline.README.txt` | 离线包的使用说明（三条路径的命令、校验值、注意事项） |
-| `install-offline.sha256` | 全部产物的 md5 校验和 |
-| `make-offline.py` | 由 `install.sh` 生成上面几个离线文件；`--check` 逐字节校验一致性 |
-| `fleet-directory.py` | **地址目录服务**：副端上报隧道地址、主端按名字查最新地址 |
-| `mcp_agent.py` | 副端服务器源码（与内嵌版一致，便于阅读/改） |
-| `add_fleet_node.py` | 主端注册工具（探测 + 测试 + 写 mcp.json） |
-| `build_installer.py` | 改完 `mcp_agent.py` 后重新生成 `install.sh` |
-| `fleet-http.service` | 内网静态分发服务的 systemd 单元 |
-| `mcp_agent_config.example.json` | 配置样例 |
-| `probe_fleet.py` | 纯诊断脚本（握手 + 列工具 + 调工具），连不上时先用它定位 |
-| `call_node.py` | 直接调用副端工具（不必重启主端客户端），`--list` 列工具、`--tool` 调任意工具 |
-| `.gitattributes` | 强制全仓库 LF 换行，防止 Windows 上 clone 后 shell 脚本被转成 CRLF |
-
-> 改了 `mcp_agent.py` 要按顺序重新生成：`python3 build_installer.py && python3 make-offline.py`。
-> 只跑前者的话 `install-offline.*` 还是旧的 —— 跑 `python3 make-offline.py --check` 能发现。
-
-安装完成后，副端目录里还会生成：
-
-| 文件 | 用途 |
-|---|---|
-| `mcp-ctl.sh` | 控制脚本（无 systemd 环境使用，两种机型都能看状态） |
-| `_supervisor.sh` | 守护壳，崩溃 3 秒自动重启 |
-| `_portkill.py` | 零依赖按端口清理僵尸进程（替代 `fuser`） |
-| `mcp-tunnel.sh` | cloudflared 公网隧道（自动补 token、QUIC 自动回退） |
-| `mcp-watchdog.sh` | **保活守护**（`--once` 或常驻循环） |
-| `unit.txt` | 记录 systemd 单元名 |
-| `.want_tunnel` / `.no_keepalive` / `.tunnel_proto` | 标记：要隧道 / 关保活 / 选定的隧道协议 |
-| `current_url.txt` | 当前可用的公网地址（保活守护持续刷新） |
-| `port.txt` / `agent.pid` / `watchdog.pid` / `tunnel.pid` / `agent.log` / `tunnel.log` / `watchdog.log` | 运行时文件 |
-
-## 八之二、保活与地址自动跟随（v3.0）
-
-### 保活：让主端「随时可连」
-
-副端可能因为 OOM、容器重启、隧道进程掉线而失联。保活守护每 60 秒做三件事：
-
-1. **agent 不通 → 拉起来**（v3.4 起是真实 HTTP 探活 `/health`，不只看进程在不在；连续 2 轮不通才重启。systemd 机型走 `systemctl restart`，容器机型走 `mcp-ctl.sh start`）
-2. **隧道不通 → 重建**（进程没了立刻重建；进程还在但公网地址连续 3 轮探活失败也重建；本机 agent 都不通时不动隧道，避免撞 trycloudflare 限流）
-3. **把当前地址写进 `current_url.txt`，并上报「地址目录」**
-
-systemd 机型用 oneshot service + timer，不占常驻进程：
-
-```bash
-systemctl status <name>-mcp-watchdog.timer
-systemctl start  <name>-mcp-watchdog.service    # 立刻跑一轮
-cat /opt/<name>_mcp/watchdog.log
-```
-
-容器机型用常驻循环（`mcp-ctl.sh start` 会自动拉起）：
-
-```bash
-bash /opt/<name>_mcp/mcp-ctl.sh watchdog    # 跑一轮 + 看守护状态
-bash /opt/<name>_mcp/mcp-ctl.sh wdlog 50    # 看保活日志
-bash /opt/<name>_mcp/mcp-ctl.sh keepalive off   # 关掉
-```
-
-### 地址目录：隧道换域名也不用改 mcp.json
-
-副端重启会换 trycloudflare 域名，主端写死的地址立刻失效。两步解决：
-
-```bash
-# 1) 在一台 7x24 的机器上跑目录服务（NAS 就行）
-python3 fleet-directory.py --port 8790 --token <一串随机>
-
-# 2) 副端安装时告诉它目录在哪
-sudo bash install.sh --name cloud --port 3100 --tunnel \
-  --directory http://192.168.1.10:8790 --directory-token <同一串>
-
-# 3) 主端登记目录
-python3 fleet.py directory --url http://192.168.1.10:8790 --token <同一串>
-```
-
-之后主端在地址不通时会自动问一次目录、换成新地址并回写登记表：
-
-```bash
-python3 fleet.py sync              # 手动刷一遍
-python3 fleet.py exec cloud "uptime"   # 地址失效时自动纠正后重试
-```
-
-目录服务接口：`POST /register`（上报）、`GET /nodes`、`GET /resolve?name=<n>`、
-`DELETE /nodes?name=<n>`。零依赖，落盘 `~/.mcp-fleet/directory.json`。
-
-## 九、已踩过的坑（别重犯）
-
-### v3.5 新增踩过的坑
-
-1. **配置文件里的 `version` 不能当真实版本**——配置重装时不覆盖，旧值会一直留着，状态页显示成老版本，让人以为没升级。现在版本号以代码为准。
-2. **对等调用要绕开代理**——设备上设了 `http_proxy` 时，`urllib` 会把 `http://192.168.x.x` 也丢给代理，返回莫名其妙的 404。内网/本机地址一律直连。
-3. **互相转发必须限跳数**——A 的 `peer_call` 调 B 的 `peer_call` 再调回 A……没有上限就会把两边线程耗光。
-
-### v3.4 新增踩过的坑
-
-1. **「进程还在」≠「服务可用」**——agent 卡死、端口半开时 `pgrep` 照样有结果，旧保活永远不触发，表现就是副端「掉线」。保活必须真的发 HTTP 请求去探活。
-2. **没有空闲超时的 HTTP 服务会被死连接拖死**——客户端断网后连接半开，线程一直挂着。现在默认 300 秒空闲断开 + TCP keepalive。
-3. **参数解析会把 `$@` shift 空**——非 root 自动 `sudo bash "$0" "$@"` 重执行时 `--name`/`--port` 因此全丢，装出来的是默认名字。要在解析前先存一份 `ORIG_ARGS=("$@")`。
-4. **离线包是生成物**——改了 `install.sh` 必须 `python3 make-offline.py`（含 `install-offline.paste.txt`），再 `--check`。
-
-1. **别用 `pkill -f xxx` 杀自己的服务**——命令行里含关键字会把执行该命令的 shell 一起杀掉。脚本改用「按端口 scan `/proc/net/tcp` 找 pid」的 `_portkill.py`（不依赖 `fuser`，容器里常没装 psmisc）。
-2. **Python 拼命令不要用 `%` 格式化**——`docker ps --format '{{.Names}}'` 里的 `{{...}}` 会被 `%` 吃掉。代码里已全部改成字符串拼接。
-3. **`sudo -S` 要预喂密码**——`printf '%s\n' <密码> | sudo -S bash -lc <命令>`，否则卡住等输入。
-4. **配置改动不重启不生效**——`systemctl restart <name>-mcp` 或 `mcp-ctl.sh restart`。
-5. **主端 MCP 配置改完必须重启主端客户端**（WorkBuddy、Claude Desktop、Cursor 等都一样）。
-6. **`curl | bash` 时 `$0` 不是文件**——脚本内的 `exec sudo bash "$0"` 会失效，已在 v1.0 修正为检测并提示正确用法。
-7. **别用 `command -v systemctl` 判断有没有 systemd**（v2.0 修复）——容器里这个二进制通常存在，但 PID 1 不是 systemd，`systemctl daemon-reload` 必炸；且 `set -e` 会让整个安装脚本在那里静默中止，前面写的文件全白装。
-8. **不要用 `$!` 记 `setsid nohup ... &` 的 pid**——`setsid` 在「调用者已是进程组长」时会 fork，`$!` 拿到的是马上退出的中间进程，pidfile 直接失效（表现为卸载后隧道/agent 进程残留）。正确做法是让被守护的进程自己写 pidfile，或用 `pgrep -f` 事后回查真实 pid。
-9. **副端自检里的「公网访问」数值不能当判决**——容器出网受限时本机 curl 返回 `000`，但隧道对外其实完全可用。别据此反复重开隧道（会撞上 trycloudflare 的频率限制，越试越坏）。判定只看主端那一次 curl。
-10. **登录 shell 会把容器的欢迎横幅塞进每一次工具返回**——`bash -lc` 会 source `/etc/profile`，PAI-DSW 这类镜像在那里打印 ASCII 图。用配置项 `login_shell: false` 切成 `bash -c` 解决。
-11. **Windows 上做语法检查别直接敲 `bash`**——可能解析到 `C:\Windows\System32\bash.exe`（WSL 桩），在有安全策略的机器上会被拦且报错莫名其妙。用系统里真实 Git Bash 的绝对路径。
-12. **重装不等于更新（v2.2 修复）**——老版本再装一次会打印「已在运行 (pid xxx)」直接跳过，**跑的还是老代码**，你会以为改动没生效。现在：nohup 分支检测到旧实例自动 `restart`，systemd 分支把 `enable --now` 拆成 `enable` + `restart`（`enable --now` 对已 active 的单元不会重启）。配置文件仍然保留、不覆盖。
-
-### v3.1 新增踩过的坑
-
-17. **源码比安装包新，仓库里出现「源码 v3.1 / 安装器 v3.0」**——改完 `mcp_agent.py` 忘了跑 `build_installer.py`，本地看着是新的，用户 `curl` 下来装出来的还是旧版。发布脚本现在会比对 `mcp_agent.py` 与 `install.sh` **内嵌**的 version，不一致就**不上传** `mcp_agent.py` 并提示重跑构建，避免把这种漂移发出去。
-
-18. **GitHub 仓库改名后，旧名字会「假成功」**——`mcp-fleet` 改名成 `skill-mcp-fleet` 之后，对旧名的 API 调用会被 GitHub 重定向、照样返回 200；于是 `POST /user/repos` 用旧名又建出一个**空壳副本**，两边内容还不一样。发布脚本里仓库名写死新名字，**别再建旧的**。
-
-19. **判断「远端是否已是最新」不能用文件大小**——离线分片固定每片 4000 字符，内容变了大小还是 4001 B，按大小跳过会把旧载荷永远留在仓库里。要用 git blob sha：`sha1("blob <len>\0" + content)`，与 Contents API 返回的 `sha` 一致。
-
-### v3.0 新增踩过的坑
-
-13. **`pkill -f <关键字>` 会杀掉自己**——这条在开发 v3.0 时又踩了两次：`pkill -f fleet-directory.py` 会把执行该命令的 shell 一起杀掉（因为它的命令行里也含这个字符串），表现是**整条命令毫无输出**。要么用 `pkill -f '[f]leet-directory.py'` 这种方括号技巧，要么把 pkill 写进脚本文件里（脚本自己的命令行只有脚本路径）。
-14. **重装换模式时老的 `_supervisor.sh` 会和 systemd 抢端口**——先用 nohup 装、再用 systemd 装（或反过来），老 supervisor 还在每 3 秒拉起 `mcp_agent.py`，日志里只见 `OSError: [Errno 98] Address already in use` 反复刷，但 `systemctl status` 看起来又是好的。v3.0 起 `install.sh` 在启动前会 `systemctl stop` + 按安装目录 `pkill` 清干净。
-15. **`--auth-token` 在重装时被静默忽略**——配置文件「已存在则不覆盖」是好事（保住你的调参），但副作用是命令行给的 `--auth-token` / `--allow-ips` / `--directory` 全不生效，表现为「我明明传了 token，副端却还在用旧的」。v3.0 起这些参数会**合并进**已有配置（不带则保留原值）。
-16. **`mcp-ctl.sh status` 说「未运行」但服务是好的**——老脚本只看 `agent.pid`，systemd 机型根本没这个文件。v3.0 起先问 `systemctl is-active`，输出 `运行中（systemd: xxx，状态 active）`，并带上保活定时器和当前隧道地址。
-17. **自解压脚本别用 heredoc 喂给 python**——`python3 -c '...' "$TMP" <<'EOF' ... EOF` 在 Git-Bash + 原生 Windows Python 下 stdin 拿不到数据（解出 0 字节）。`make-offline.py` 生成的脚本改成「让 python 读脚本自己、按 `FLEET_PAYLOAD_BEGIN/END` 标记切出载荷」，任何平台都稳，且载荷行前缀 `#` 所以 `bash -n` 也能过。
-18. **探测死地址抛异常会盖住真正的成功**——`urlopen` 对死地址抛 `URLError`。如果不吞掉，用户看到的是「连不上」，而不是「自动纠正到新地址后成功了」。所有探活调用都要 `try/except`。
-19. **改了 `install.sh` 忘了重新生成离线包**——`install-offline.*` 是**生成物**，不会自动跟着变。跑 `python3 make-offline.py --check` 会逐字节比对三个产物与 `install.sh`，不一致就报错。发布前务必跑一次。
-20. **离线载荷文件里绝不能写注释说明**——`install-offline.b64` 和 `install-offline.partNN.txt` 原本各带一个 `# ... 第 1/9 片` 的说明头。看起来无害，实际是致命的：头里的 `MCP`、`install`、`sh`、`1/9` **全都在 base64 字母表内**，`b64decode` 不会丢弃它们，而是当成数据插进流里 → `zlib.error: incorrect header check`。而文档给用户的命令恰恰是「整文件解码」和「`cat` 拼接」，所以用户照着做必然失败。现在这两个文件只放纯 base64，说明文字统一挪到 `install-offline.README.txt`。
-21. **校验脚本不能自己「帮」用户预处理**——上面的 bug 之所以一直没被发现，是因为 `make-offline.py --check` 里**自己先剥掉了 `#` 注释行**再去解码，于是永远绿。校验必须用**用户实际会敲的那条命令**（整文件 `b64decode`、朴素 `cat`）去跑，否则校验通过 ≠ 用户能跑通。现在 `--check` 还会检查载荷里有没有 base64 字母表之外的字符。
-22. **`--uninstall` 漏删保活定时器**——早先卸载只删 `${UNIT}.service`，忘了 `${UNIT}-watchdog.timer` / `.service`。而 timer 是 `enabled` + `active` 的，安装目录被 `rm -rf` 之后它仍会**每 60 秒**触发一次 oneshot，单元里的 `WorkingDirectory=$DIR` 已不存在，于是 journal 里永远刷：
-    ```
-    Failed at step CHDIR spawning /bin/bash: No such file or directory
-    nasbeta-mcp-watchdog.service: Failed with result 'exit-code'.
-    ```
-    现在卸载会**先** `disable --now` 掉 timer、停掉 service、删掉两个单元文件，再删目录。遇到老版本装出来的机器，手工清一下：
-    ```bash
-    systemctl disable --now <name>-mcp-watchdog.timer
-    rm -f /etc/systemd/system/<name>-mcp-watchdog.{timer,service}
-    systemctl daemon-reload
-    ```
+| 版本 | 变更 |
+|------|------|
+| v4.0 | Tailscale 自动组网 + Agent 协作协议 + 消息总线 + 安全加固 + Mesh 拓扑 |
+| v3.5 | 节点不分主副，双向互控，peer_call/peer_add/peer_remove |
+| v3.4 | 保活真实探活 + 连接超时 + 孤儿进程清理 |
+| v3.1 | 默认值改安全 + 请求体限制 + SSE 并发限制 |
+| v3.0 | Bearer 鉴权 + IP 白名单 + 暴力破解节流 |
