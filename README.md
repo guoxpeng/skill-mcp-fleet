@@ -1,10 +1,13 @@
 # MCP Fleet · 参赛作品提交包（v5.0）
 
-![Stars](https://img.shields.io/github/stars/guoxpeng/skill-mcp-fleet) ![License](https://img.shields.io/badge/license-MIT-blue) ![Python](https://img.shields.io/badge/python-3.6%2B-blue) ![Tests](https://img.shields.io/badge/tests-61%20passed-brightgreen)
+![Release](https://img.shields.io/github/v/release/guoxpeng/skill-mcp-fleet) ![Stars](https://img.shields.io/github/stars/guoxpeng/skill-mcp-fleet) ![License](https://img.shields.io/badge/license-MIT-blue) ![Python](https://img.shields.io/badge/python-3.6%2B-blue) ![Tests](https://img.shields.io/badge/tests-61%20passed-brightgreen)
 
 > **2026 华为开发者大赛 · 小红书 Skill 创新赛**
 > 赛道：**通用赛道 · 开发工具**
 > 作者：guoxpeng ｜ 开源仓库：https://github.com/guoxpeng/skill-mcp-fleet
+>
+> **软件包下载**：[GitHub Release v5.0.0](https://github.com/guoxpeng/skill-mcp-fleet/releases/tag/v5.0.0)（`mcp-fleet-v5.0.0.zip`）
+> **版本历史**：[CHANGELOG.md](https://github.com/guoxpeng/skill-mcp-fleet/blob/main/CHANGELOG.md)（13 个版本演进，git tag 与参赛版本号对齐）
 >
 > 觉得有用？欢迎去仓库点一个 **Star** ⭐ —— 你的star会让更多人看到这张「AI 协作网」。
 
@@ -129,3 +132,4 @@ fleet.py pair nas-a3f2@http://192.168.1.10:3100/mcp
 - 提交包文件数：**30**（≤ 30 ✓）
 - 提交包大小：约 **1 MB**（≤ 40MB ✓）
 - 全部代码基于 MIT 许可开源，纯标准库零第三方依赖。
+- **版本对齐**：代码 `version=5.0.0` ＝ git tag `v5.0.0` ＝ GitHub Release `v5.0.0` ＝ 本提交包；全版本演进见仓库 [CHANGELOG.md](https://github.com/guoxpeng/skill-mcp-fleet/blob/main/CHANGELOG.md)（v3.0 → v5.0.0 共 13 个里程碑，每个版本附更新说明）。
