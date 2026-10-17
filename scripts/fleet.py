@@ -709,18 +709,18 @@ def cmd_doctor(a):
     try:
         s = socket.create_connection((host, port), timeout=a.timeout)
         s.close()
-        print(ok("  [1/6] TCP ") + "%s:%d 通（%.0f ms）" % (host, port, (time.time() - t0) * 1000))
+        print(ok("  [1/7] TCP ") + "%s:%d 通（%.0f ms）" % (host, port, (time.time() - t0) * 1000))
     except Exception as e:
-        print(err("  [1/6] TCP ") + "%s:%d 不通：%r" % (host, port, e))
+        print(err("  [1/7] TCP ") + "%s:%d 不通：%r" % (host, port, e))
         fails.append("TCP 不通：云主机/容器要在安全组或平台侧放行该端口；内网确认 IP 与防火墙。")
 
     # 2 HTTP
     try:
         info = http_probe(url, token=meta.get("token", ""))
-        print(ok("  [2/6] HTTP") + " 200，server=%s v%s，tools=%s，root=%s"
+        print(ok("  [2/7] HTTP") + " 200，server=%s v%s，tools=%s，root=%s"
               % (info.get("server"), info.get("version"), info.get("tools"), info.get("root")))
     except Exception as e:
-        print(err("  [2/6] HTTP") + " 失败：%r" % (e,))
+        print(err("  [2/7] HTTP") + " 失败：%r" % (e,))
         fails.append("HTTP 探活失败：副端进程可能没起。容器里跑 "
                      "`bash /opt/%s_mcp/mcp-ctl.sh status`；systemd 机器跑 "
                      "`systemctl status %s-mcp`。" % (a.target, a.target))
@@ -730,9 +730,9 @@ def cmd_doctor(a):
     try:
         c.handshake()
         tools = c.list_tools()
-        print(ok("  [3/6] MCP ") + "握手 OK，%d 个工具" % len(tools))
+        print(ok("  [3/7] MCP ") + "握手 OK，%d 个工具" % len(tools))
     except MCPError as e:
-        print(err("  [3/6] MCP ") + "失败：%s" % e)
+        print(err("  [3/7] MCP ") + "失败：%s" % e)
         fails.append("MCP 协议层失败：用 `python scripts/probe_fleet.py %s` 交叉验证；"
                      "若它通而 agent 不通，是 agent 侧配置/版本问题。" % url)
         tools = []
@@ -743,12 +743,12 @@ def cmd_doctor(a):
             text, iserr = c.call("exec", {"command": "echo MCP_E2E_OK; hostname"}, timeout=a.timeout)
             code, out, _ = parse_exec(text)
             mark = err if (iserr or code) else ok
-            print(mark("  [4/6] E2E ") + "exit=%d  %s" % (code, out.replace("\n", " / ")[:110]))
+            print(mark("  [4/7] E2E ") + "exit=%d  %s" % (code, out.replace("\n", " / ")[:110]))
             if iserr or code:
                 fails.append("exec 返回非 0：看上面输出。命令超时就把 mcp_agent_config.json "
                              "里的 command_timeout 调大。")
         except MCPError as e:
-            print(err("  [4/6] E2E ") + "失败：%s" % e)
+            print(err("  [4/7] E2E ") + "失败：%s" % e)
             fails.append("工具调用失败：检查副端日志（mcp-ctl.sh log 50 / journalctl -u %s-mcp）。" % a.target)
 
         # 5 环境
@@ -760,7 +760,7 @@ def cmd_doctor(a):
             lines = [x.strip() for x in out.splitlines() if x.strip()]
             uid = lines[0] if lines else "?"
             docker = lines[1] if len(lines) > 1 else "?"
-            print(ok("  [5/6] 环境") + " uid=%s，docker=%s" % (uid, docker))
+            print(ok("  [5/7] 环境") + " uid=%s，docker=%s" % (uid, docker))
             if uid != "0":
                 fails.append("副端不是 root 运行：sudo 类工具会失败。配置里填 sudo_password，"
                              "或用 root 重装。")
@@ -774,7 +774,7 @@ def cmd_doctor(a):
         try:
             raw, _ = c.call("read", {"filePath": inst + "/mcp_agent_config.json"}, timeout=a.timeout)
             cfg = json.loads(raw[raw.index("{"):raw.rindex("}") + 1])
-            print(ok("  [6/6] 配置") + " %s" % inst)
+            print(ok("  [6/7] 配置") + " %s" % inst)
             ls = cfg.get("login_shell", True)
             print("        login_shell=%s%s  enable_docker=%s  allowed_roots=%s  timeout=%ss"
                   % (ls, dim("（缺省即 true）") if "login_shell" not in cfg else "",
@@ -791,6 +791,34 @@ def cmd_doctor(a):
                     fails.append("登录 shell 在每次返回前打印横幅：把配置 login_shell 改成 false 再重启服务。")
         except Exception:
             pass
+
+        # 7 协议层（v5.0.3：邮箱积压 / 死信 / peer 熔断冷却——链路体检全绿
+        #   但「消息发不出去」时，答案通常在这里）
+        try:
+            req = urllib.request.Request(base.rstrip("/") + "/fleet/ui/data")
+            if meta.get("token"):
+                req.add_header("Authorization", "Bearer " + meta["token"])
+            with urllib.request.urlopen(req, timeout=a.timeout) as r:
+                d = json.loads(r.read().decode("utf-8"))
+            mb = d.get("mailbox") or {}
+            print(ok("  [7/7] 协议") + " inbox=%s 待投=%s 死信=%s 邮箱=%.0fKB 版本=%s"
+                  % (mb.get("inbox_total"), mb.get("outbox_pending"),
+                     mb.get("outbox_dead"), (mb.get("inbox_bytes") or 0) / 1024.0,
+                     d.get("version")))
+            cds = [p for p in (d.get("peers") or []) if p.get("cooldown")]
+            if cds:
+                names = ", ".join("%s(%ss)" % (p.get("name"), p["cooldown"]) for p in cds[:5])
+                print(warn("        [!] %d 个 peer 熔断冷却中: %s" % (len(cds), names)))
+                fails.append("有 peer 处于熔断冷却（近期连接连续失败）：正常离线设备会自动"
+                             "探测恢复；持续冷却请到该设备上排查服务状态。")
+            if (mb.get("outbox_dead") or 0) > 0:
+                print(warn("        [!] 死信 x%s（超重试上限已放弃，详见 outbox.jsonl 的 dead 记录）"
+                           % mb.get("outbox_dead")))
+            if (mb.get("outbox_pending") or 0) > 50:
+                fails.append("待投递消息积压 %s 条：多数是目标节点长期离线；上线后会自动补投，"
+                             "死信可在 outbox.jsonl 审计。" % mb.get("outbox_pending"))
+        except Exception as e:
+            print(err("  [7/7] 协议") + " 拉取失败: %r（v5.0.3 以下旧节点无此端点属正常）" % (e,))
 
     print()
     if fails:
