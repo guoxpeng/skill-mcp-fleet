@@ -6,6 +6,46 @@
 
 ---
 
+## [5.0.4] — 2026-10-17 · 三平台守护对齐版本（git tag: v5.0.4）
+
+**补齐 Windows / macOS 的开机自启与进程保护，三平台守护矩阵对齐 Linux 既有水位。**
+**开发中发现并修复一个看门狗致命误判（鉴权节点匿名探活 401 → 无限重启风暴）。**
+
+### 新增
+- **macOS launchd 守护**：`install.py --auto-start` 生成
+  `~/Library/LaunchAgents/com.mcp-fleet.<name>.plist`——`RunAtLoad`（登录自启）
+  + `KeepAlive`（崩溃自动重启）+ `ThrottleInterval` 10s（防崩溃风暴），
+  一个系统机制同时覆盖「开机启动」与「进程保护」，`launchctl load -w` 托管；
+  卸载自动 unload 并清理（marker 文件定位，同 install.sh 的 unit.txt 模式）。
+- **Windows schtasks 双任务守护**：`ONLOGON` 登录自启（pythonw 无窗口，
+  替代 v5.0.3 及以前会闪窗的 Startup .bat，升级时自动清理旧启动项防双启动）
+  + `MINUTE` 每分钟看门狗（探活 `/health`，异常清残留端口并拉起）——
+  与 Linux 的 systemd + watchdog timer 架构对称，用户级零提权零依赖。
+- **跨平台看门狗**：`install.py --watchdog` 单次模式（schtasks 每分钟调用）：
+  探活通过零动作退出；不通过 → netstat 定位 + tasklist 二次确认只杀 python
+  系进程（防误杀占端口的其他服务）→ DETACHED/新会话拉起 agent。
+- **`install.py` 自拷贝**：安装时把 install.py 一并部署到安装目录（watchdog
+  任务长期引用它，升级不失效）。
+
+### 修复
+- **[开发中实锤] 看门狗对鉴权节点必然误判（无限重启风暴）**：`/health` 与其他
+  端点一样过 `_guard()` 统一鉴权（v5 审计的安全收敛：不向未认证者暴露指纹），
+  开了 `auth_token` 的节点匿名探活恒 401 → 看门狗每分钟判定宕机 → 无限重拉。
+  修复：watchdog 自动读安装目录 `mcp_agent_config.json` 的 `auth_token` 带凭据
+  探活（本机进程持 token 天经地义），裸奔模式自动匿名；端到端回归确认匿名
+  `/health` 仍 401（安全收敛未被破坏）。
+- 探活防误判加固：只认 `{status:ok, version:...}` 结构——别的服务恰好占了
+  端口返回 200 也不会触发重启。
+
+### 测试
+- **83 → 94 用例**：平台守护 11 项（launchd plist 结构与 XML 转义 / schtasks
+  命令构造 / netstat IPv4+IPv6 PID 解析 / tasklist python 映像过滤 / 真实 HTTP
+  探活含防误判与 401 场景 / watchdog 健康零动作 / token 自动携带 / 异常重启）。
+- **端到端**（真实安装 + 真实 agent）：冷启动 0.5s 拉起到健康；运行中零动作；
+  `kill -9` 后复活；匿名探活 401 回归。
+
+---
+
 ## [5.0.3] — 2026-10-17 · 长期运行可靠性版本（git tag: v5.0.3）
 
 **第四轮审查聚焦长期运行：NAS/软路由常年挂机场景下，资源只增不减的地方全部加上界。**
