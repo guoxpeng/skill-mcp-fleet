@@ -1,17 +1,15 @@
 ---
 name: mcp-fleet
 description: |
-  零依赖 MCP Fleet 节点互控系统：把任意 Linux 设备变成可被 MCP agent 远程操控的节点。
-  v4.1 新增自研通讯协议层（fleet_proto）：UDP 广播自动发现、store-and-forward 离线邮箱、
-  HTTP 消息端点（/fleet/mail /fleet/poll /fleet/sync）、gossip 邮箱同步。
-  agent 间可直接通信——在线直接投递，离线存邮箱，上线自动收信。不依赖 Tailscale 或任何外部服务。
-  兼容 Tailscale（可选加速跨网段组网）。每个节点 32 个工具。
-  纯 Python 标准库，零依赖，兼容 Python 3.6+。
-  Trigger: fleet, MCP fleet, 节点互控, agent 组网, agent 通信, store-and-forward, 
-  peer call, remote exec, 副端安装, 节点发现, agent 协作, task delegation, 
-  message bus, mesh topology, 离线消息, 邮箱, mailbox, UDP discovery
-tags: [mcp, fleet, mesh, peer-to-peer, agent-collaboration, remote-control, zero-dependency, store-and-forward]
-version: 4.4.0
+  零依赖 MCP Fleet 节点互控系统 v4.4：把任意 Linux 设备变成可被 MCP agent 远程操控的节点。
+  自研通讯协议层（fleet_proto）：UDP 广播自动发现、store-and-forward 离线邮箱、
+  HTTP 消息端点、gossip 邮箱同步。agent 间直接通信——在线直接投递，离线存邮箱，上线自动收信。
+  设备码自动生成 + 邀请链接配对（安全确权流程）。连接模式（临时/长期）+ 控制模式（直接/辅助审查）。
+  不依赖 Tailscale 或任何外部服务，纯 Python 标准库零依赖，兼容 Python 3.6+。
+  Trigger: fleet, MCP fleet, 节点互控, agent 组网, agent 通信, store-and-forward,
+  peer call, remote exec, 副端安装, 节点发现, agent 协作, task delegation,
+  message bus, mesh topology, 离线消息, 邮箱, mailbox, UDP discovery,
+  设备码, 邀请链接, invite, pair, 邀请码配对, 远程操控, 连接模式, 控制模式
 ---
 
 # MCP Fleet · 节点互控系统 v4.4
