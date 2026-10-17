@@ -2,45 +2,92 @@
 name: mcp-fleet
 description: |
   零依赖 MCP Fleet 节点互控系统：把任意 Linux 设备变成可被 MCP agent 远程操控的节点。
-  v4.0 新增 Tailscale 自动组网（多设备装完即自动发现互连）、Agent 协作协议（能力声明/任务委派/多节点群组）、
-  消息总线（pub/sub + 持久化）、安全加固（tailnet 自动信任/审计日志/限流）和 mesh 拓扑可视化。
-  每个节点 32 个工具：exec/read/write/edit/docker/systemctl/sysinfo + peer_call/peers + msg_send/recv + caps/delegate/group + mesh。
+  v4.1 新增自研通讯协议层（fleet_proto）：UDP 广播自动发现、store-and-forward 离线邮箱、
+  HTTP 消息端点（/fleet/mail /fleet/poll /fleet/sync）、gossip 邮箱同步。
+  agent 间可直接通信——在线直接投递，离线存邮箱，上线自动收信。不依赖 Tailscale 或任何外部服务。
+  兼容 Tailscale（可选加速跨网段组网）。每个节点 32 个工具。
   纯 Python 标准库，零依赖，兼容 Python 3.6+。
-  Trigger: fleet, MCP fleet, 节点互控, agent 组网, tailscale mesh, multi-device agent, peer call, 
-  remote exec, 副端安装, 节点发现, agent 协作, task delegation, message bus, mesh topology
-tags: [mcp, fleet, mesh, tailscale, peer-to-peer, agent-collaboration, remote-control, zero-dependency]
-version: 4.0.0
+  Trigger: fleet, MCP fleet, 节点互控, agent 组网, agent 通信, store-and-forward, 
+  peer call, remote exec, 副端安装, 节点发现, agent 协作, task delegation, 
+  message bus, mesh topology, 离线消息, 邮箱, mailbox, UDP discovery
+tags: [mcp, fleet, mesh, peer-to-peer, agent-collaboration, remote-control, zero-dependency, store-and-forward]
+version: 4.1.0
 ---
 
-# MCP Fleet · 节点互控系统 v4.0
+# MCP Fleet · 节点互控系统 v4.1
 
 ## 这是什么
 
 给你的设备集群（NAS / 飞牛 OS / 树莓派 / 云主机 / 容器 / 手机…）每台装一个「节点」，即可被**任意支持 MCP 的 AI agent**远程操控。
 
-**v4.0 核心进化**：
+**v4.1 核心进化——自研通讯协议**：
 
-1. **Tailscale 自动组网** — 装完 skill 自动加入 tailnet，新设备一上线，mesh 里所有节点自动发现它，零配置
-2. **Agent 协作协议** — 节点自动声明能力（Docker/GPU/网络/工具），可按能力委派任务，多节点临时组队
-3. **消息总线** — pub/sub 广播 + 持久化邮箱 + topic 过滤，agent 间异步通信
-4. **安全加固** — tailnet 内自动互信（端到端加密）、审计日志、令牌桶限流
-5. **Mesh 拓扑可视化** — `fleet mesh` 一键打印全网拓扑
+1. **UDP 广播自动发现** — 同网段的 fleet 节点自动互相发现，零配置，不依赖任何外部服务
+2. **Store-and-forward 离线邮箱** — agent 发消息给离线 agent，消息存 outbox；目标上线后自动投递，不丢消息
+3. **HTTP 消息端点** — `POST /fleet/mail`（收消息）、`GET /fleet/poll`（上线收信）、`POST /fleet/sync`（邮箱同步）
+4. **Gossip 邮箱同步** — 节点间定期同步邮箱状态，消息跨节点可达
+5. **Tailscale 可选** — 不再依赖 Tailscale；如已安装则作为跨网段加速（端到端加密 + MagicDNS）
 
 ## 快速安装
 
-### 一键安装 + Tailscale 自动组网
+### 一键安装（自研协议，零依赖）
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/guoxpeng/skill-mcp-fleet/main/scripts/install.sh -o install.sh
+sudo bash install.sh --name nas --port 3100
+```
+
+装完后自动：启动 MCP agent → UDP 广播发现同网段其他 fleet 节点 → 自动互连 → 邮箱同步
+
+### 可选：Tailscale 跨网段加速
+
+```bash
 sudo bash install.sh --name nas --port 3100 --tailnet my-tailnet --tailnet-key tskey-xxx
 ```
 
-装完后自动：安装 Tailscale → 加入 tailnet → 启动 MCP agent → 发现其他 fleet 节点 → 自动互连
-
-### 普通安装（内网，不需要 Tailscale）
+### 自定义 UDP 发现端口
 
 ```bash
-sudo bash install.sh --name nas --port 3100
+sudo bash install.sh --name nas --port 3100 --discover-port 3199
+```
+
+## 通讯协议架构
+
+```
+Agent A (NAS)              Agent B (云主机)            Agent C (树莓派)
+  ├── UDP :3199 广播          ├── UDP :3199 广播          ├── UDP :3199 广播
+  ├── HTTP :3100/mcp          ├── HTTP :3100/mcp          ├── HTTP :3100/mcp
+  ├── HTTP :3100/fleet/*      ├── HTTP :3100/fleet/*      ├── HTTP :3100/fleet/*
+  │   ├── /fleet/mail         │   ├── /fleet/mail         │   ├── /fleet/mail
+  │   ├── /fleet/poll         │   ├── /fleet/poll         │   ├── /fleet/poll
+  │   ├── /fleet/sync         │   ├── /fleet/sync         │   ├── /fleet/sync
+  │   └── /fleet/discover     │   └── /fleet/discover     │   └── /fleet/discover
+  ├── mailbox/                ├── mailbox/                ├── mailbox/
+  │   ├── inbox.jsonl         │   ├── inbox.jsonl         │   ├── inbox.jsonl
+  │   ├── outbox.jsonl        │   ├── outbox.jsonl        │   ├── outbox.jsonl
+  │   └── sent.jsonl          │   └── sent.jsonl          │   └── sent.jsonl
+  ├── 32 tools                ├── 32 tools                ├── 32 tools
+  └── peer_call → B,C         └── peer_call → A,C         └── peer_call → A,B
+```
+
+### 消息投递流程
+
+```
+msg_send(from=A, to=B, text="hello")
+  │
+  ├─ B 是本地 agent? → 存 inbox ✓
+  ├─ B 在已知 peer? → HTTP POST /fleet/mail → B 收到 ✓
+  └─ B 离线/未知? → 存 outbox → delivery daemon 每 15s 重试
+                                    │
+                                    └─ B 上线 → UDP 发现 → peer_add → 投递成功 ✓
+```
+
+### 上线收信流程
+
+```
+B 启动 → UDP 广播 → 发现 A,C → peer_add
+  → msg_recv(me=B) → 向 A,C 发 GET /fleet/poll?name=B
+  → A,C 把给 B 的消息返回 → B 存入 inbox → 收到所有离线消息 ✓
 ```
 
 ## 节点工具清单（32 个）
@@ -52,7 +99,7 @@ sudo bash install.sh --name nas --port 3100
 | **Docker** | `docker_ps` / `docker_logs` / `docker_restart` | 容器管理 |
 | **系统** | `systemctl` / `service_logs` / `sysinfo` / `http_get` | 服务管理 + 系统信息 |
 | **Peer Mesh** | `peers` / `peer_call` / `peer_add` / `peer_remove` / `peer_info` | 节点互控（多跳转发） |
-| **消息总线** | `msg_send` / `msg_recv` / `msg_history` | 异步消息 + topic 广播 + 持久化 |
+| **消息总线** | `msg_send` / `msg_recv` / `msg_history` | store-and-forward + topic + 离线邮箱 |
 | **Agent 协作** | `caps` / `mesh_caps` / `delegate` / `group_form` / `group_list` / `group_disband` | 能力声明 + 任务委派 + 群组 |
 | **Mesh 拓扑** | `mesh` | 全网拓扑与在线状态 |
 
@@ -61,7 +108,11 @@ sudo bash install.sh --name nas --port 3100
 ```bash
 python scripts/fleet.py add --name nas --ip 192.168.1.10 --port 3100
 python scripts/fleet.py mesh                    # 打印 mesh 拓扑图
+python scripts/fleet.py discover                # UDP 广播发现同网段节点
 python scripts/fleet.py exec nas "docker ps"   # 在节点执行命令
+python scripts/fleet.py msg nas send --to agent-b --text "hello"  # 发消息
+python scripts/fleet.py msg nas recv --me agent-a               # 收消息
+python scripts/fleet.py msg nas history                         # 消息历史
 python scripts/fleet.py pair nas               # 双向配对
 python scripts/fleet.py health --deep          # 全网体检
 ```
@@ -74,6 +125,7 @@ mcp-fleet/
 ├── mcp_agent_config.example.json     # 配置模板
 ├── scripts/
 │   ├── mcp_agent.py                  # 节点 MCP 服务器（核心，32 个工具）
+│   ├── fleet_proto.py                # v4.1 自研通讯协议层（UDP发现+store-and-forward+gossip）
 │   ├── fleet.py                      # 主端统一 CLI
 │   ├── fleet_chat.py                 # AI 间消息 CLI
 │   ├── fleet_watch.py                # 保活守护
@@ -91,28 +143,26 @@ mcp-fleet/
     └── 云服务器-副端安装-一条命令.md
 ```
 
-## v4.0 新增配置
+## v4.1 新增配置
 
 ```json
 {
+  "discover_port": 3199,
   "tailnet_auto_mesh": true,
   "tailnet_auto_trust": true,
-  "tailnet_scan_interval": 60,
   "collab_tools": true,
   "audit_log": true,
   "rate_limit_per_min": 120
 }
 ```
 
-## 架构
+## v4.1 通讯协议端点
 
-```
-Agent A (NAS)          Agent B (云主机)        Agent C (树莓派)
-  ├── tailscale 100.x     ├── tailscale 100.y     ├── tailscale 100.z
-  ├── 32 tools            ├── 32 tools            ├── 32 tools
-  ├── peer_call → B,C     ├── peer_call → A,C     ├── peer_call → A,B
-  ├── msg_send → B,C      ├── delegate → A(GPU)   ├── caps: GPIO
-  └── caps: Docker,GPU    └── caps: 8CPU,32GB     └── group: deploy-team
-```
-
-Tailscale 提供端到端加密的 tailnet，fleet 在其上自动构建 agent mesh。
+| 端点 | 方法 | 作用 |
+|------|------|------|
+| `/fleet/mail` | POST | 接收来自其他节点的消息，存入本地 inbox |
+| `/fleet/poll?name=X` | GET | 拉取给 agent X 的待收消息（上线收信） |
+| `/fleet/sync` | POST | 邮箱同步 gossip：交换邮箱摘要 |
+| `/fleet/discover` | POST | 节点握手：交换信息，自动互加 peer |
+| `/fleet/register_agent` | POST | agent 注册到本节点 |
+| `/fleet/status` | GET | 邮箱状态：inbox/outbox/agents |

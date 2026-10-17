@@ -48,7 +48,16 @@ import sys
 import threading
 import time
 import uuid
+import urllib.parse
+import urllib.request
+import urllib.error
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+try:
+    from fleet_proto import (MailEngine, DiscoveryLayer, MessageDelivery,
+                             SyncEngine, DEFAULT_DISCOVER_PORT, PROTO_VERSION)
+    _HAS_PROTO = True
+except ImportError:
+    _HAS_PROTO = False
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 CONFIG_PATH = os.path.join(HERE, "mcp_agent_config.json")
@@ -777,6 +786,39 @@ def t_http_get(a):
 # 对等节点表与本机 fleet 命令共用同一个文件：<安装目录>/peers.json（0600）
 PEERS_PATH = os.path.join(HERE, "peers.json")
 PEERS_LOCK = threading.Lock()
+
+# v4.1: 自研通讯协议层初始化
+_mail_engine = None
+_discovery_layer = None
+_delivery_engine = None
+_sync_engine = None
+
+def _init_proto():
+    """初始化自研通讯协议层（在 main() 中配置加载后调用）。"""
+    global _mail_engine, _discovery_layer, _delivery_engine, _sync_engine
+    if not _HAS_PROTO:
+        return
+    _mail_engine = MailEngine(HERE, SERVER_NAME)
+    def _get_peers():
+        return load_peers().get("nodes", {})
+    _delivery_engine = MessageDelivery(_mail_engine, _get_peers, self_url())
+    _sync_engine = SyncEngine(_mail_engine, _get_peers, self_url())
+
+def _on_discover(name, ip, port, caps):
+    """UDP 发现回调：自动 peer_add。"""
+    url = "http://%s:%d/mcp" % (ip, port)
+    try:
+        with PEERS_LOCK:
+            d = load_peers()
+            if name not in d["nodes"]:
+                d["nodes"][name] = {"url": url, "token": "",
+                                    "added_by": "udp-discover",
+                                    "updated": int(time.time())}
+                save_peers(d)
+                if _mail_engine:
+                    _mail_engine.register_agent(name)
+    except Exception:
+        pass
 _REQ = threading.local()          # 当前请求带进来的跳数（X-Fleet-Hops）
 try:
     LISTEN_PORT = int(open(os.path.join(HERE, "port.txt")).read().strip())
@@ -1068,6 +1110,8 @@ def _mail_name(v, field):
 
 
 def t_msg_send(a):
+    """v4.1: store-and-forward 消息发送。
+    在线 agent -> 直接 HTTP 投递；离线 -> 存 outbox，上线自动收信。"""
     frm = _mail_name(a.get("from"), "from")
     to = _mail_name(a.get("to"), "to")
     text = a.get("text") or ""
@@ -1076,6 +1120,29 @@ def t_msg_send(a):
         return "text 不能为空", True
     if len(text) > _MAIL_MAX_TEXT:
         return "text 过长（上限 %d 字符）" % _MAIL_MAX_TEXT, True
+
+    msg = {"from": frm, "to": to, "text": text,
+           "ts": time.strftime("%Y-%m-%d %H:%M:%S")}
+    if topic:
+        msg["topic"] = topic
+
+    # v4.1: 使用自研通讯协议
+    if _mail_engine:
+        # 本地 agent？直接存 inbox
+        if _mail_engine.is_local_agent(to) or to == _mail_engine.node_name:
+            _mail_engine.inbox_append(dict(msg))
+            return "已投递(本地) -> %s" % to, False
+
+        # 远程 agent：尝试直接投递
+        if _delivery_engine:
+            ok = _delivery_engine.deliver_now(msg)
+            if ok:
+                return "已投递(在线) -> %s" % to, False
+            # 投递失败：存 outbox，等目标上线后自动投递
+            _mail_engine.outbox_append(dict(msg))
+            return "已存邮箱(离线) -> %s，对方上线后自动投递" % to, False
+
+    # fallback: 旧逻辑（无 fleet_proto）
     with _MAIL_COND:
         _mail_load()
         mid = (_MAIL["msgs"][-1]["id"] + 1) if _MAIL["msgs"] else 1
@@ -1091,10 +1158,47 @@ def t_msg_send(a):
 
 
 def t_msg_recv(a):
+    """v4.1: 收消息。读本地 inbox + 向所有 peer poll 拉取离线消息。"""
     me = _mail_name(a.get("me"), "me")
     wait = max(0, min(int(a.get("wait", 0) or 0), 300))
     peek = bool(a.get("peek"))
     topic = a.get("topic")
+
+    # v4.1: 使用自研通讯协议
+    if _mail_engine:
+        # 先向所有 peer poll 拉取给我的消息（上线收信）
+        if _sync_engine:
+            try:
+                peers = load_peers().get("nodes", {})
+                for pname, pinfo in peers.items():
+                    url = pinfo.get("url", "")
+                    token = pinfo.get("token", "")
+                    if url:
+                        polled = _sync_engine._poll_peer(
+                            url.rstrip("/").removesuffix("/mcp").removesuffix("/sse"),
+                            token, me)
+                        for m in polled:
+                            _mail_engine.inbox_append(m)
+            except Exception:
+                pass
+
+        # 读本地 inbox
+        deadline = time.time() + wait
+        while True:
+            cursor = _mail_engine.inbox_cursor(me)
+            got = _mail_engine.inbox_read(me, after_id=cursor, topic=topic,
+                                           mark_read=not peek)
+            if got or (deadline - time.time()) <= 0:
+                break
+            time.sleep(min(2, deadline - time.time()))
+
+        if not got:
+            return "（没有新消息）", False
+        return "\n\n".join("#%s [%s] %s -> %s:\n%s" % (
+            m.get("id", "?"), m.get("ts", ""), m.get("from", ""),
+            m.get("to", ""), m.get("text", "")) for m in got), False
+
+    # fallback: 旧逻辑
     deadline = time.time() + wait
     with _MAIL_COND:
         _mail_load()
@@ -1121,8 +1225,29 @@ def t_msg_recv(a):
 
 
 def t_msg_history(a):
+    """v4.1: 查看邮箱历史。"""
     n = max(1, min(int(a.get("lines", 20) or 20), 200))
     topic = a.get("topic")
+
+    if _mail_engine:
+        stats = _mail_engine.stats()
+        inbox_msgs = _mail_engine._load_jsonl(_mail_engine.inbox_path)
+        got = inbox_msgs[-n:]
+        if topic:
+            got = [m for m in got if m.get("topic") == topic]
+        if not got:
+            return "（邮箱为空）inbox=%d outbox_pending=%d agents=%s" % (
+                stats["inbox_total"], stats["outbox_pending"],
+                ",".join(stats["local_agents"])), False
+        lines = ["#%s [%s] %s -> %s: %s" % (
+            m.get("id", "?"), m.get("ts", ""), m.get("from", ""),
+            m.get("to", ""), _truncate(m.get("text", ""))[:300]) for m in got]
+        lines.append("--- inbox=%d outbox_pending=%d agents=%s" % (
+            stats["inbox_total"], stats["outbox_pending"],
+            ",".join(stats["local_agents"])))
+        return "\n".join(lines), False
+
+    # fallback: 旧逻辑
     with _MAIL_COND:
         _mail_load()
         got = _MAIL["msgs"][-n:]
@@ -1131,7 +1256,6 @@ def t_msg_history(a):
     if not got:
         return "（邮箱为空）", False
     return "\n".join("#%d [%s] %s -> %s: %s" % (m["id"], m["ts"], m["from"], m["to"], _truncate(m["text"])[:300]) for m in got), False
-
 
 
 # ===========================================================================
@@ -1869,6 +1993,83 @@ class Handler(BaseHTTPRequestHandler):
             self._empty(202)
             return
 
+        # ---- v4.1: 自研通讯协议端点 ----
+        if path == "/fleet/mail":
+            """接收来自其他节点的消息，存入本地 inbox。"""
+            try:
+                payload = json.loads(raw.decode("utf-8"))
+            except Exception:
+                self._json(400, {"error": "bad json"})
+                return
+            if _mail_engine:
+                msg = {
+                    "from": payload.get("from", ""),
+                    "to": payload.get("to", ""),
+                    "text": payload.get("text", ""),
+                    "ts": payload.get("ts", time.strftime("%Y-%m-%d %H:%M:%S")),
+                }
+                if payload.get("topic"):
+                    msg["topic"] = payload["topic"]
+                if payload.get("msg_id"):
+                    msg["msg_id"] = payload["msg_id"]
+                if payload.get("source_node"):
+                    msg["source_node"] = payload["source_node"]
+                _mail_engine.inbox_append(msg)
+                self._json(200, {"ok": True, "id": msg.get("id")})
+            else:
+                self._json(503, {"error": "proto not initialized"})
+            return
+
+        if path == "/fleet/discover":
+            """节点握手：交换信息，自动互加 peer。"""
+            try:
+                payload = json.loads(raw.decode("utf-8"))
+            except Exception:
+                self._json(400, {"error": "bad json"})
+                return
+            peer_name = payload.get("name", "")
+            peer_url = payload.get("url", "")
+            if peer_name and peer_url:
+                try:
+                    with PEERS_LOCK:
+                        d = load_peers()
+                        d["nodes"][peer_name] = {"url": peer_url, "token": "",
+                                                "added_by": "discover", "updated": int(time.time())}
+                        save_peers(d)
+                except Exception:
+                    pass
+            self._json(200, {"name": SERVER_NAME, "url": self_url(),
+                            "version": SERVER_VERSION, "ok": True})
+            return
+
+        if path == "/fleet/sync":
+            """邮箱同步 gossip：对方告诉我它的 agent，我返回我的摘要。"""
+            try:
+                payload = json.loads(raw.decode("utf-8"))
+            except Exception:
+                payload = {}
+            if _mail_engine:
+                summary = _mail_engine.sync_summary()
+                self._json(200, summary)
+            else:
+                self._json(503, {"error": "proto not initialized"})
+            return
+
+        if path == "/fleet/register_agent":
+            """agent 注册到本节点。"""
+            try:
+                payload = json.loads(raw.decode("utf-8"))
+            except Exception:
+                self._json(400, {"error": "bad json"})
+                return
+            agent_name = payload.get("name", "")
+            if agent_name and _mail_engine:
+                _mail_engine.register_agent(agent_name)
+                self._json(200, {"ok": True, "agent": agent_name})
+            else:
+                self._json(400, {"error": "missing name"})
+            return
+
         if path not in ("/mcp", "/rpc", ""):
             self._json(404, {"error": "not found"})
             return
@@ -1949,6 +2150,27 @@ class Handler(BaseHTTPRequestHandler):
                 with SSE_LOCK:
                     SSE_ACTIVE -= 1
             return
+        # v4.1: poll 端点 -- 上线收信
+        if path == "/fleet/poll":
+            qs = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query)
+            name = (qs.get("name", [""])[0]).strip()
+            if not name:
+                self._json(400, {"error": "missing name param"})
+                return
+            if _mail_engine:
+                msgs = _mail_engine.poll_for_agent(name)
+                self._json(200, {"messages": msgs, "count": len(msgs)})
+            else:
+                self._json(503, {"error": "proto not initialized"})
+            return
+
+        if path == "/fleet/status":
+            if _mail_engine:
+                self._json(200, _mail_engine.stats())
+            else:
+                self._json(200, {"proto": False})
+            return
+
         if path in ("/mcp", "/rpc"):
             # MCP 规范：服务端不提供 GET 流时必须回 405。原来回 404，而 404 在规范里
             # 表示「会话已失效」——部分客户端（含带 Mcp-Session-Id 的重连）据此
@@ -2020,7 +2242,32 @@ def main():
         print("  " + "!" * 68)
     if nets:
         print("  来源白名单      : %s" % ", ".join(str(n) for n in nets))
-    # ---- v4.0: Tailscale 自动组网 ----
+    # ---- v4.1: 自研通讯协议启动 ----
+    _init_proto()
+    if _HAS_PROTO and _mail_engine:
+        print("  通讯协议        : fleet-proto v%d (store-and-forward)" % PROTO_VERSION)
+        # UDP 发现层
+        caps_summary = {"docker": CFG.get("enable_docker", True),
+                        "tools": len(TOOLS)}
+        _discovery_layer = DiscoveryLayer(
+            SERVER_NAME, args.port, caps=caps_summary,
+            discover_port=int(CFG.get("discover_port", 3199)),
+            on_discover=_on_discover)
+        _discovery_layer.start()
+        print("  UDP 发现        : 端口 %d (每 %ds 广播)" % (
+            int(CFG.get("discover_port", 3199)), 30))
+        # 消息投递 daemon
+        if _delivery_engine:
+            _delivery_engine.start_delivery()
+            print("  消息投递        : 后台 daemon (每 %ds 重试 outbox)" % 15)
+        # 邮箱同步 daemon
+        if _sync_engine:
+            _sync_engine.start_sync()
+            print("  邮箱同步        : 后台 daemon (每 %ds gossip)" % 60)
+    else:
+        print("  通讯协议        : 旧版邮箱（fleet_proto 不可用）")
+
+    # ---- v4.0: Tailscale 自动组网（可选增强）----
     if CFG.get("tailnet_auto_mesh", True):
         ts_ip = _tailscale_ip()
         if ts_ip:

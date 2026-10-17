@@ -105,6 +105,7 @@ while [ $# -gt 0 ]; do
     --generate-token) GEN_TOKEN="1"; shift ;;
     --tailnet)    TAILNET="${2:-}"; shift 2 ;;
     --tailnet-key) TAILNET_KEY="${2:-}"; shift 2 ;;
+    --discover-port) DISCOVER_PORT="${2:-3199}"; shift 2 ;;
     --uninstall)  UNINSTALL="1"; shift ;;
     -h|--help)    sed -n '2,44p' "$0" 2>/dev/null || echo "(管道方式不支持 --help，请见 README)"; exit 0 ;;
     *) echo "[!] 未知参数: $1"; exit 1 ;;
@@ -172,6 +173,7 @@ p='${DIR}/mcp_agent_config.json'
 d=json.load(open(p))
 d['tailnet_auto_mesh']=True
 d['tailnet_auto_trust']=True
+d['discover_port']=${DISCOVER_PORT:-3199}
 d['self_url']='http://${TS_IP}:${PORT}/mcp'
 json.dump(d,open(p,'w'),ensure_ascii=False)
 " 2>/dev/null || true

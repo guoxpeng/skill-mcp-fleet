@@ -1631,6 +1631,85 @@ def cmd_mesh(a):
     print(ok("=" * 60))
     return 0
 
+def cmd_msg(a):
+    """fleet msg send/recv/history -- 通过 peer_call 调远程节点的 msg 工具。"""
+    reg = load_registry()
+    nodes = reg.get("nodes", {})
+    target = getattr(a, "target", None)
+    if not target:
+        return die("需要指定 target 节点")
+    url, token = _resolve_target(target, a)
+    c = MCPClient(url, a.timeout, token=token)
+    c.handshake()
+    if a.msg_cmd == "send":
+        text, is_err = c.call("msg_send", {
+            "from": a.frm or "fleet-cli",
+            "to": a.to,
+            "text": a.text,
+            "topic": a.topic or "",
+        })
+    elif a.msg_cmd == "recv":
+        text, is_err = c.call("msg_recv", {
+            "me": a.me or "fleet-cli",
+            "wait": a.wait or 0,
+            "topic": a.topic or "",
+        })
+    elif a.msg_cmd == "history":
+        text, is_err = c.call("msg_history", {
+            "lines": a.lines or 20,
+            "topic": a.topic or "",
+        })
+    else:
+        return die("未知 msg 子命令: %s" % a.msg_cmd)
+    if is_err:
+        return die(text)
+    print(text)
+    return 0
+
+
+def cmd_discover_proto(a):
+    """fleet discover -- 主动 UDP 广播 + 扫描已知网段，发现 fleet 节点。"""
+    import socket as _sock
+    port = a.discover_port or 3199
+    print(ok("[*] ") + "UDP 广播发现 (端口 %d)..." % port)
+    # 发广播
+    sock = _sock.socket(_sock.AF_INET, _sock.SOCK_DGRAM)
+    sock.setsockopt(_sock.SOL_SOCKET, _sock.SO_BROADCAST, 1)
+    sock.settimeout(a.timeout or 10)
+    hello = json.dumps({"proto": "fleet", "ver": 1, "name": "discover",
+                        "port": 0, "ts": time.time()}).encode("utf-8")
+    for addr in ["255.255.255.255", "192.168.1.255", "192.168.0.255",
+                 "10.0.0.255", "172.16.0.255"]:
+        try:
+            sock.sendto(hello, (addr, port))
+        except Exception:
+            pass
+    # 收应答
+    found = {}
+    deadline = time.time() + (a.timeout or 10)
+    while time.time() < deadline:
+        try:
+            data, addr = sock.recvfrom(4096)
+            pkt = json.loads(data.decode("utf-8"))
+            if pkt.get("proto") == "fleet" and pkt.get("name", "") != "discover":
+                name = pkt["name"]
+                found[name] = {"ip": addr[0], "port": pkt.get("port", 3100),
+                               "caps": pkt.get("caps", {})}
+                print(ok("  [+] %-16s http://%s:%d  caps=%s" % (
+                    name, addr[0], pkt.get("port", 3100),
+                    json.dumps(pkt.get("caps", {})))))
+        except _sock.timeout:
+            break
+        except Exception:
+            continue
+    sock.close()
+    if not found:
+        print(warn("[!] ") + "未发现任何 fleet 节点")
+    else:
+        print(ok("[*] ") + "发现 %d 个节点" % len(found))
+    return 0
+
+
 def build_parser():
     p = argparse.ArgumentParser(
         prog="fleet.py",
@@ -1815,6 +1894,25 @@ def build_parser():
     sp = sub.add_parser("mesh", help="打印 mesh 拓扑图（节点在线状态 + 能力 + peer 关系）")
     sp.add_argument("--timeout", type=int, default=15)
     sp.set_defaults(func=cmd_mesh)
+
+    # v4.1: fleet msg -- 通过 peer_call 调远程节点的 msg 工具
+    sp = common(sub.add_parser("msg", help="消息总线：send/recv/history（通过 peer_call 调远程节点）"))
+    sp.add_argument("msg_cmd", choices=["send", "recv", "history"], help="子命令")
+    sp.add_argument("--from", dest="frm", help="发送者")
+    sp.add_argument("--to", help="接收者")
+    sp.add_argument("--text", help="消息内容")
+    sp.add_argument("--me", help="我的名字（recv）")
+    sp.add_argument("--topic", help="主题")
+    sp.add_argument("--wait", type=int, default=0, help="等待秒数（recv）")
+    sp.add_argument("--lines", type=int, default=20, help="历史行数（history）")
+    sp.set_defaults(func=cmd_msg)
+
+    # v4.1: fleet discover -- UDP 广播发现
+    sp = sub.add_parser("discover", help="UDP 广播发现同网段 fleet 节点（v4.1 自研协议）")
+    sp.add_argument("--discover-port", type=int, default=3199, help="UDP 发现端口")
+    sp.add_argument("--timeout", type=int, default=10, help="等待应答秒数")
+    sp.set_defaults(func=cmd_discover_proto)
+
     return p
 
 

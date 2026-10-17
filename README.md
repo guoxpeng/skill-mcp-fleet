@@ -1,19 +1,19 @@
-# MCP Fleet · 节点互控系统 v4.0
+# MCP Fleet · 节点互控系统 v4.1
 
-> 零依赖 · 纯 Python 标准库 · 兼容 Python 3.6+ · 32 个工具
+> 零依赖 · 纯 Python 标准库 · 兼容 Python 3.6+ · 32 个工具 · 自研通讯协议
 
 给你的设备集群（NAS / 飞牛 OS / 树莓派 / 云主机 / 容器 / 手机…）每台装一个「节点」，即可被**任意支持 MCP 的 AI agent / 客户端**远程操控 —— WorkBuddy、Claude Desktop、Claude Code、Cursor、Cline、Cherry Studio、Codex 或你自己写的 agent 都行，不绑定某一家。
 
-**v4.0 不分主端副端**：每个节点既能被控制，也能去控制别的节点。谁发起连接，谁就是这一次的控制方；两台节点 `fleet pair` 一下就能**双向互控**。
+**v4.1 核心进化——自研通讯协议**：agent 间可以直接通信，不依赖 Tailscale 或任何外部服务。在线 agent 消息直接投递，离线 agent 消息存邮箱（store-and-forward），上线后自动收信。UDP 广播自动发现同网段节点，gossip 协议同步邮箱。
 
-## v4.0 五大进化
+## v4.1 进化
 
 | # | 进化方向 | 核心能力 |
 |---|---------|----------|
-| 1 | **Tailscale 自动组网** | `--tailnet` 一键加入 tailnet，新设备上线自动发现全网节点，零配置互连 |
+| 1 | **自研通讯协议** | UDP 广播发现 + HTTP 消息端点 + store-and-forward 离线邮箱 + gossip 同步 |
 | 2 | **Agent 协作协议** | 节点自动声明能力（Docker/GPU/网络），按能力委派任务，多节点临时组队 |
-| 3 | **消息总线** | pub/sub 广播 + topic 过滤 + 持久化邮箱，agent 间异步通信不丢消息 |
-| 4 | **安全加固** | tailnet 内自动互信（端到端加密）、审计日志、令牌桶限流 |
+| 3 | **消息总线** | msg_send/msg_recv/msg_history，topic 广播，离线不丢消息 |
+| 4 | **安全加固** | 审计日志、令牌桶限流、Tailscale 可选端到端加密 |
 | 5 | **Mesh 拓扑可视化** | `fleet mesh` 一键打印全网拓扑图（谁连谁、谁在线、各节点能力） |
 
 ## 架构
@@ -21,249 +21,169 @@
 ```
 控制方（任意 MCP 客户端 / agent，或任意一个节点自带的 fleet）
   └── MCP 配置
-        ├── nas      → http://100.64.1.10:3100/mcp   (Tailscale)
-        ├── cloud    → http://100.64.2.5:3100/mcp    (Tailscale)
-        └── pi       → http://100.64.3.20:3100/mcp   (Tailscale)
+        ├── nas      → http://192.168.1.10:3100/mcp
+        ├── cloud    → http://10.0.0.5:3100/mcp
+        └── pi       → http://192.168.1.20:3100/mcp
 
 节点（各台设备，各跑一个 mcp_agent.py，开机自启）
   ├── 命令在设备本机执行，不经 SSH —— 更快、更稳
   ├── 节点之间 peer_call 互控，A ⇄ B 双向，A → B → C 多跳进内网
-  ├── msg_send/msg_recv 异步消息总线，topic 广播
-  ├── caps 能力声明，delegate 按能力委派任务
-  └── Tailscale tailnet 端到端加密，自动发现自动互信
+  ├── UDP :3199 广播自动发现同网段节点
+  ├── HTTP /fleet/* 端点：消息投递、上线收信、邮箱同步
+  ├── mailbox/ 邮箱：inbox + outbox + sent（store-and-forward）
+  └── 32 个工具：exec/read/write/edit/docker/systemctl + peer + msg + collab + mesh
 ```
 
-## 节点工具清单（32 个）
+## 快速安装
 
-| 类别 | 工具 | 作用 |
-|------|------|------|
-| **执行** | `exec` | 执行 shell 命令，`sudo:true` 可提权 |
-| | `exec_async` / `exec_poll` / `exec_result` / `exec_kill` / `exec_jobs` | 后台任务：启动→取增量→等待完成→终止→列表 |
-| **文件** | `read` / `write` / `edit` / `list_dir` | 读文件（可按行）/ 写追加 / 文本块替换 / 列目录 |
-| **Docker** | `docker_ps` / `docker_logs` / `docker_restart` | 容器列表 / 日志 / 重启 |
-| **系统** | `systemctl` / `service_logs` / `sysinfo` / `http_get` | 服务启停 / 日志 / 系统概览 / 本机 HTTP |
-| **Peer Mesh** | `peers` / `peer_info` | 列出对等节点（探活）/ 本节点信息 |
-| | `peer_call` | 经本节点调另一个节点的任意工具，可多跳转发 |
-| | `peer_add` / `peer_remove` | 增删对等节点 |
-| **消息总线** | `msg_send` | 发消息（to=* 广播，topic=主题过滤） |
-| | `msg_recv` | 收消息（wait 阻塞等待，topic 过滤，peek 只看） |
-| | `msg_history` | 查看邮箱历史（可按 topic 过滤） |
-| **Agent 协作** | `caps` | 返回本节点能力清单（Docker/GPU/Tailscale/网络/工具） |
-| | `mesh_caps` | 查询 mesh 内所有节点能力（发现谁有某能力） |
-| | `delegate` | 按能力委派任务（自动找匹配节点执行） |
-| | `group_form` / `group_list` / `group_disband` | 多节点工作群组 |
-| **Mesh 拓扑** | `mesh` | 全网拓扑：本节点 + 所有 peers 的在线状态和能力 |
-
-## 一、安装
-
-### 方式 A：一键安装 + Tailscale 自动组网（推荐）
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/guoxpeng/skill-mcp-fleet/main/scripts/install.sh -o install.sh
-sudo bash install.sh --name nas --port 3100 --tailnet my-tailnet --tailnet-key tskey-xxx
-```
-
-装完后自动完成：安装 Tailscale → 加入 tailnet → 启动 MCP agent → 发现其他 fleet 节点 → 自动互连
-
-### 方式 B：普通安装（内网，不需要 Tailscale）
+### 一键安装（自研协议，零依赖）
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/guoxpeng/skill-mcp-fleet/main/scripts/install.sh -o install.sh
 sudo bash install.sh --name nas --port 3100
 ```
 
-### 方式 C：公网隧道
+装完后自动：启动 MCP agent → UDP 广播发现同网段其他 fleet 节点 → 自动互连 → 邮箱同步
+
+### 可选：Tailscale 跨网段加速
 
 ```bash
-sudo bash install.sh --name phone --port 3100 --tunnel --generate-token --require-auth
+sudo bash install.sh --name nas --port 3100 --tailnet my-tailnet --tailnet-key tskey-xxx
 ```
 
-### 参数
+Tailscale 不是必需的。如果你只需要同网段通信，不需要安装 Tailscale。如果你需要跨网段（比如 NAS 在家、云主机在公网），Tailscale 提供端到端加密的虚拟网络，fleet 在其上自动构建 agent mesh。
 
-| 参数 | 说明 | 默认 |
+## 通讯协议（v4.1 新增）
+
+### UDP 广播发现
+
+每个节点启动后，每 30 秒在 UDP 端口 3199 广播一个 hello 包：
+```json
+{"proto": "fleet", "ver": 1, "name": "nas", "port": 3100, "caps": {"docker": true, "tools": 32}}
+```
+同网段的其他 fleet 节点收到后，自动 `peer_add`，零配置组网。
+
+### Store-and-forward 消息投递
+
+```
+msg_send(from="agent-a", to="agent-b", text="hello")
+  │
+  ├─ agent-b 在本节点? → 存 inbox ✓（本地投递）
+  ├─ agent-b 在已知 peer? → HTTP POST /fleet/mail → 直接投递 ✓
+  └─ agent-b 离线/未知? → 存 outbox → delivery daemon 每 15s 重试
+                                    │
+                                    └─ agent-b 上线 → UDP 发现 → peer_add → 投递成功 ✓
+```
+
+### 上线收信
+
+```
+agent-b 节点启动 → UDP 广播 → 发现其他节点 → peer_add
+  → msg_recv(me="agent-b") → 向所有 peer 发 GET /fleet/poll?name=agent-b
+  → 各 peer 把给 agent-b 的消息返回 → 存入本地 inbox → 收到所有离线消息 ✓
+```
+
+### HTTP 端点
+
+| 端点 | 方法 | 作用 |
 |------|------|------|
-| `--name` | 节点标识 | 主机名 |
-| `--port` | 监听端口 | `3100` |
-| `--tailnet` | Tailscale tailnet 名，自动安装并加入 | 空（不组网） |
-| `--tailnet-key` | Tailscale auth key（免交互登录） | 空（交互登录） |
-| `--tunnel` | 起公网隧道 | 关 |
-| `--auth-token` | 访问令牌 | 空 |
-| `--generate-token` | 自动生成令牌 | 关 |
-| `--require-auth` | 强制鉴权 | 关 |
-| `--allow-ips` | IP/CIDR 白名单 | 空 |
-| `--uninstall` | 卸载 | — |
+| `/fleet/mail` | POST | 接收消息，存入本地 inbox |
+| `/fleet/poll?name=X` | GET | 拉取给 agent X 的待收消息（上线收信） |
+| `/fleet/sync` | POST | 邮箱同步 gossip：交换邮箱摘要 |
+| `/fleet/discover` | POST | 节点握手：交换信息，自动互加 peer |
+| `/fleet/register_agent` | POST | agent 注册到本节点 |
+| `/fleet/status` | GET | 邮箱状态 |
 
-## 二、接入主端
+## 工具清单（32 个）
 
-### 用 fleet.py（零依赖统一 CLI）
+| 类别 | 工具 | 作用 |
+|------|------|------|
+| **执行** | `exec` / `exec_async` / `exec_poll` / `exec_result` / `exec_kill` / `exec_jobs` | 同步/后台命令执行 |
+| **文件** | `read` / `write` / `edit` / `list_dir` | 文件读写编辑 |
+| **Docker** | `docker_ps` / `docker_logs` / `docker_restart` | 容器管理 |
+| **系统** | `systemctl` / `service_logs` / `sysinfo` / `http_get` | 服务管理 + 系统信息 |
+| **Peer Mesh** | `peers` / `peer_call` / `peer_add` / `peer_remove` / `peer_info` | 节点互控（多跳转发） |
+| **消息总线** | `msg_send` / `msg_recv` / `msg_history` | store-and-forward + topic + 离线邮箱 |
+| **Agent 协作** | `caps` / `mesh_caps` / `delegate` / `group_form` / `group_list` / `group_disband` | 能力声明 + 任务委派 + 群组 |
+| **Mesh 拓扑** | `mesh` | 全网拓扑与在线状态 |
+
+## CLI 用法
 
 ```bash
-python scripts/fleet.py add --name nas --ip 100.64.1.10 --port 3100    # Tailscale 地址
-python scripts/fleet.py list                    # 列已注册节点
-python scripts/fleet.py mesh                    # 打印 mesh 拓扑图
-python scripts/fleet.py exec nas "uptime"       # 在节点执行命令
-python scripts/fleet.py call nas --tool caps    # 查节点能力
-python scripts/fleet.py call nas --tool mesh_caps  # 查全网能力
-python scripts/fleet.py pair nas                # 双向配对
-python scripts/fleet.py health --deep           # 全网体检
+# 节点管理
+python scripts/fleet.py add --name nas --ip 192.168.1.10 --port 3100
+python scripts/fleet.py list                         # 列出所有节点
+python scripts/fleet.py mesh                         # 打印 mesh 拓扑图
+python scripts/fleet.py discover                     # UDP 广播发现同网段节点
+python scripts/fleet.py pair nas                     # 双向配对
+python scripts/fleet.py health --deep                # 全网体检
+
+# 远程执行
+python scripts/fleet.py exec nas "docker ps"         # 在节点执行命令
+python scripts/fleet.py call nas peer_call --peer cloud --tool sysinfo  # 多跳调用
+
+# 消息总线
+python scripts/fleet.py msg nas send --to agent-b --text "hello"   # 发消息
+python scripts/fleet.py msg nas recv --me agent-a                  # 收消息
+python scripts/fleet.py msg nas history                             # 消息历史
+
+# Agent 协作
+python scripts/fleet.py call nas caps               # 查看节点能力
+python scripts/fleet.py call nas mesh_caps           # 查看全网能力
+python scripts/fleet.py call nas delegate --capability gpu --task "train model"  # 委派任务
 ```
 
-### 手动配置 MCP 客户端
+## 配置
 
 ```json
 {
-  "mcpServers": {
-    "nas": {
-      "type": "http",
-      "url": "http://100.64.1.10:3100/mcp",
-      "headers": { "Authorization": "Bearer <令牌>" }
-    }
-  }
-}
-```
-
-## 三、Agent 协作示例
-
-### 按能力委派任务
-
-```
-Agent A (无 Docker):
-  → delegate(capability="docker", tool="docker_ps", arguments={})
-  → 自动发现 Agent B 有 Docker
-  → Agent B 执行 docker_ps
-  → 结果返回给 Agent A
-```
-
-### 多节点组队
-
-```
-Agent A:
-  → group_form(name="deploy-team", members=["nas", "cloud", "pi"], purpose="蓝绿部署")
-  → 三个节点收到邀请
-  → A 委派编译给 cloud（8CPU），测试给 pi，部署给 nas
-  → group_disband(name="deploy-team")
-```
-
-### 消息总线
-
-```
-Agent A:
-  → msg_send(from="a", to="*", topic="alert", text="磁盘空间不足")
-  → 所有节点收到 alert 主题消息
-
-Agent B:
-  → msg_recv(me="b", topic="alert", wait=60)
-  → 收到 A 的广播
-```
-
-## 四、Mesh 拓扑可视化
-
-```bash
-python scripts/fleet.py mesh
-```
-
-输出示例：
-```
-============================================================
-  Fleet Mesh 拓扑
-============================================================
-  [*] nas              http://100.64.1.10:3100/mcp  [Docker, GPU, TS:100.64.1.10, systemd, 4CPU, 8192MB]
-      |- cloud           在线 tailnet
-      |- pi              在线 tailnet
-  [*] cloud             http://100.64.2.5:3100/mcp   [Docker, TS:100.64.2.5, systemd, 8CPU, 32768MB]
-      |- nas             在线 tailnet
-      |- pi              在线 tailnet
-============================================================
-```
-
-## 五、安全
-
-### Tailscale 自动信任
-
-同一 tailnet 的节点自动互信——Tailscale 提供 WireGuard 端到端加密，不需要逐对配 token。跨 tailnet 的连接仍需显式 token。
-
-### 审计日志
-
-每次 `peer_call` / `delegate` 自动记录到 `audit.log`：
-```
-2026-10-17 08:30:15 | peer_call | nas -> cloud | docker_ps | ok
-2026-10-17 08:30:20 | delegate | nas -> cloud | exec | delegated
-```
-
-### 限流
-
-每节点入站 `peer_call` 默认限 120 次/分钟（令牌桶），防过载。可配置 `rate_limit_per_min`。
-
-## 六、配置
-
-配置文件：`/opt/<name>_mcp/mcp_agent_config.json`
-
-```json
-{
-  "name": "nas",
-  "version": "4.0.0",
+  "node_name": "nas",
+  "listen_port": 3100,
   "auth_token": "",
-  "peer_tools": true,
-  "tailnet_auto_mesh": true,
-  "tailnet_auto_trust": true,
+  "discover_port": 3199,
+  "enable_docker": true,
   "collab_tools": true,
   "audit_log": true,
-  "rate_limit_per_min": 120
+  "rate_limit_per_min": 120,
+  "tailnet_auto_mesh": false,
+  "tailnet_auto_trust": false
 }
 ```
 
-## 七、目录结构（标准 Skill 格式）
+## 目录结构
 
 ```
-skill-mcp-fleet/
+mcp-fleet/
 ├── SKILL.md                          # AgentSkill 规范
-├── README.md                         # 本文件
 ├── mcp_agent_config.example.json     # 配置模板
 ├── scripts/
-│   ├── mcp_agent.py                  # 节点 MCP 服务器（核心）
-│   ├── fleet.py                      # 主端 CLI
-│   ├── fleet_chat.py                 # 消息 CLI
+│   ├── mcp_agent.py                  # 节点 MCP 服务器（核心，32 个工具）
+│   ├── fleet_proto.py                # v4.1 自研通讯协议层
+│   ├── fleet.py                      # 主端统一 CLI
+│   ├── fleet_chat.py                 # AI 间消息 CLI
 │   ├── fleet_watch.py                # 保活守护
-│   ├── fleet-directory.py            # 地址目录
-│   ├── install.sh                    # 安装脚本
-│   └── ...
+│   ├── fleet-directory.py            # 地址目录服务
+│   ├── install.sh                    # 一键安装脚本
+│   ├── install-fleet-node.sh         # 节点安装辅助
+│   ├── add_fleet_node.py             # 注册节点到 MCP 配置
+│   ├── call_node.py                  # 免重启直接调工具
+│   ├── probe_fleet.py                # 连通性诊断
+│   ├── make-offline.py               # 生成离线安装包
+│   └── fleet-http.service            # systemd 单元
 └── references/
     ├── 加固操作手册.md
     ├── 安全审计报告.md
     └── 云服务器-副端安装-一条命令.md
 ```
 
-## 八、日常运维
+## 设计哲学
 
-```bash
-# systemd 机型
-systemctl status <name>-mcp
-journalctl -u <name>-mcp -f
+- **零依赖**：纯 Python 3 标准库，不需要 pip install 任何东西
+- **自研协议**：不依赖 Tailscale / 任何外部服务，agent 间直接通信
+- **Store-and-forward**：离线 agent 不丢消息，上线自动收信
+- **不分主副**：每个节点既能被控制，也能控制别的节点
+- **兼容 Tailscale**：如已安装则作为跨网段加速（可选，非必需）
 
-# 容器机型
-bash /opt/<name>_mcp/mcp-ctl.sh status
+## License
 
-# 查审计日志
-tail -f /opt/<name>_mcp/audit.log
-
-# 查消息邮箱
-cat /opt/<name>_mcp/mailbox.jsonl
-```
-
-## 从旧版本升级
-
-重跑安装命令即可，配置文件保留不会被覆盖：
-
-```bash
-sudo bash install.sh --name nas --port 3100 --tailnet my-tailnet
-```
-
-## 变更日志
-
-| 版本 | 变更 |
-|------|------|
-| v4.0 | Tailscale 自动组网 + Agent 协作协议 + 消息总线 + 安全加固 + Mesh 拓扑 |
-| v3.5 | 节点不分主副，双向互控，peer_call/peer_add/peer_remove |
-| v3.4 | 保活真实探活 + 连接超时 + 孤儿进程清理 |
-| v3.1 | 默认值改安全 + 请求体限制 + SSE 并发限制 |
-| v3.0 | Bearer 鉴权 + IP 白名单 + 暴力破解节流 |
+MIT
