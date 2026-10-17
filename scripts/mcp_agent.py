@@ -90,7 +90,7 @@ for _stream in (sys.stdout, sys.stderr):
 DEFAULT_CONFIG = {
     "name": "node",             # 副端标识（显示在状态页与 serverInfo）
     "tool_prefix": "",          # 工具名前缀，如 "nas_"；留空则用裸名（exec/read/...）
-    "version": "5.0.2",
+    "version": "5.0.3",
     "sudo_password": "",        # 留空且非 root 时会尝试免密 sudo
     "work_dir": "/",            # 默认工作目录
     "command_timeout": 120,     # 秒
@@ -118,6 +118,14 @@ DEFAULT_CONFIG = {
     "max_body_bytes": 1048576,       # 1 MB
     # SSE 并发连接上限，防止线程被常驻连接打满。
     "max_sse_conns": 16,
+    # ---- 对等消息（v5.0.3）------------------------------------------------
+    # /fleet/mail 入站消息限流（每分钟令牌数）。与工具层限流独立——节点间
+    # 消息（广播一条 = 每个 peer 一次 POST + 投递重试）天然比人工调用高频，
+    # 默认 600/min 足够 10 节点规模，配对的失控节点也塞不爆磁盘。
+    "mail_rate_per_min": 600,
+    # inbox 容量硬上限（条数）。超出后拒收并返回 507，防止消息 flooding
+    # 耗尽磁盘（正常使用远达不到；配合 maintenance compaction 长期稳定）。
+    "max_inbox_msgs": 5000,
     # ---- 稳定性（v3.4）----------------------------------------------------
     # 单连接空闲多少秒后断开。原来没有超时：隧道/NAT 留下的半开连接会永久占住线程，
     # 日积月累把 agent 拖到无响应（进程还在，保活守护看不出来）。
@@ -1522,6 +1530,24 @@ AUDIT_PATH = os.path.join(HERE, "audit.log")
 _audit_lock = threading.Lock()
 
 
+AUDIT_ROTATE_BYTES = 10 * 1024 * 1024   # v5.0.3: audit.log 轮转阈值
+
+
+def _audit_rotate_if_needed(max_bytes=None):
+    """v5.0.3: audit.log 超过阈值时轮转保留一份（audit.log.1，旧的覆盖）。
+
+    append-only 无轮转的日志在常年挂机设备上只增不减；单份备份已足够
+    排障用途，避免引入文件序列无限增长。
+    """
+    if max_bytes is None:
+        max_bytes = AUDIT_ROTATE_BYTES
+    try:
+        if os.path.exists(AUDIT_PATH) and os.path.getsize(AUDIT_PATH) > max_bytes:
+            os.replace(AUDIT_PATH, AUDIT_PATH + ".1")
+    except OSError:
+        pass
+
+
 def audit_log(action, caller, target, tool, status="ok", detail=""):
     """记录 peer_call / msg_send / delegate 等操作到审计日志。"""
     if not CFG.get("audit_log", True):
@@ -1530,6 +1556,7 @@ def audit_log(action, caller, target, tool, status="ok", detail=""):
         time.strftime("%Y-%m-%d %H:%M:%S"), action, caller, target, tool, status, detail[:200])
     try:
         with _audit_lock:
+            _audit_rotate_if_needed()   # v5.0.3: 持锁检查，避免并发轮转竞争
             with io.open(AUDIT_PATH, "a", encoding="utf-8") as f:
                 f.write(line)
     except (OSError, IOError):
@@ -1541,6 +1568,9 @@ def audit_log(action, caller, target, tool, status="ok", detail=""):
 # ---------------------------------------------------------------------------
 _rate_lock = threading.Lock()
 _rate_bucket = {"tokens": 0, "last": 0}
+# v5.0.3: /fleet/mail 独立令牌桶（与工具层限流分离，见 DEFAULT_CONFIG 注释）
+_mail_rate_lock = threading.Lock()
+_mail_rate_bucket = {"tokens": 0, "last": 0}
 
 
 def rate_limit_allow():
@@ -1557,6 +1587,24 @@ def rate_limit_allow():
             _rate_bucket["last"] = now
         if _rate_bucket["tokens"] > 0:
             _rate_bucket["tokens"] -= 1
+            return True
+        return False
+
+
+def rate_limit_mail():
+    """v5.0.3: /fleet/mail 入站限流（独立令牌桶，mail_rate_per_min/分钟）。"""
+    cap = int(CFG.get("mail_rate_per_min", 600))
+    if cap <= 0:
+        return True
+    now = time.time()
+    with _mail_rate_lock:
+        elapsed = now - _mail_rate_bucket["last"]
+        refill = int(elapsed / 60.0 * cap)
+        if refill > 0:
+            _mail_rate_bucket["tokens"] = min(cap, _mail_rate_bucket["tokens"] + refill)
+            _mail_rate_bucket["last"] = now
+        if _mail_rate_bucket["tokens"] > 0:
+            _mail_rate_bucket["tokens"] -= 1
             return True
         return False
 
@@ -2557,12 +2605,21 @@ class Handler(BaseHTTPRequestHandler):
         # ---- v4.1: 自研通讯协议端点 ----
         if path == "/fleet/mail":
             """接收来自其他节点的消息，存入本地 inbox。"""
+            # v5.0.3: 入站限流（独立令牌桶）+ inbox 容量硬上限——
+            # 配对的失控节点/token 泄露也无法用消息 flooding 耗尽磁盘
+            if not rate_limit_mail():
+                self._json(429, {"error": "mail rate limited"})
+                return
             try:
                 payload = json.loads(raw.decode("utf-8"))
             except Exception:
                 self._json(400, {"error": "bad json"})
                 return
             if _mail_engine:
+                max_inbox = int(CFG.get("max_inbox_msgs", 5000))
+                if _mail_engine.stats()["inbox_total"] >= max_inbox:
+                    self._json(507, {"error": "inbox full (%d)" % max_inbox})
+                    return
                 msg = {
                     "from": payload.get("from", ""),
                     "to": payload.get("to", ""),
