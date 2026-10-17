@@ -246,8 +246,7 @@ mcp-fleet/
 │   ├── call_node.py                  # 免重启直接调工具
 │   ├── probe_fleet.py                # 连通性诊断
 │   ├── demo.sh                       # 一键演示：双节点互联 30 秒上手
-│   ├── make-offline.py               # 生成离线安装包
-│   └── fleet-http.service            # systemd 单元
+│   └── make-offline.py               # 生成离线安装包（systemd 单元由 install.sh 运行时生成）
 └── references/
     ├── 加固操作手册.md
     ├── 安全审计报告.md
