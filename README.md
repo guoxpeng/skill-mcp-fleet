@@ -65,7 +65,7 @@ mcp-fleet/                               # 参赛提交包（AgentSkill 规范�
 │   ├── fleet_chat.py / fleet_watch.py   # AI 间消息 / 保活守护
 │   ├── fleet-directory.py               # 地址目录服务
 │   ├── add_fleet_node.py / probe_fleet.py / call_node.py
-│   └── make-offline.py / fleet-http.service
+│   └── make-offline.py                  # 离线安装包（systemd 单元由 install.sh 运行时生成）
 └── references/
     ├── vision-and-scenarios.md          # ★ 场景故事 + 演进蓝图 + 生态结合点
     ├── 传播度证据.md                     # ★ 三层传播渠道数据（GitHub克隆747次/市场浏览全场第2，附复现命令）
