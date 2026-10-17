@@ -89,7 +89,7 @@ for _stream in (sys.stdout, sys.stderr):
 DEFAULT_CONFIG = {
     "name": "node",             # 副端标识（显示在状态页与 serverInfo）
     "tool_prefix": "",          # 工具名前缀，如 "nas_"；留空则用裸名（exec/read/...）
-    "version": "5.0.0",
+    "version": "5.0.1",
     "sudo_password": "",        # 留空且非 root 时会尝试免密 sudo
     "work_dir": "/",            # 默认工作目录
     "command_timeout": 120,     # 秒
@@ -945,6 +945,27 @@ _discovery_layer = None
 _delivery_engine = None
 _sync_engine = None
 
+def _note_peer_agents(peer_name, agents):
+    """v5.0.1: 记录对端节点的 agent 归属（gossip 上报），供投递匹配。
+
+    对端 sync 时上报它的 local_agents；本节点把它们记进 peers 条目，
+    deliver_now 遇到 to=远程 agent 时据此找到宿主节点直投。
+    只在有变化时写盘，避免 60s 一次的 gossip 产生无谓 IO。
+    """
+    if not peer_name or not isinstance(agents, list):
+        return
+    agents = sorted(set(str(a) for a in agents))[:64]   # 上限防御
+    with PEERS_LOCK:
+        d = load_peers()
+        entry = d["nodes"].get(peer_name)
+        if not entry:
+            return
+        if entry.get("agents") != agents:
+            entry["agents"] = agents
+            entry["updated"] = int(time.time())
+            save_peers(d)
+
+
 def _init_proto():
     """初始化自研通讯协议层（在 main() 中配置加载后调用）。"""
     global _mail_engine, _discovery_layer, _delivery_engine, _sync_engine
@@ -963,7 +984,8 @@ def _init_proto():
         except Exception:
             return None
     _delivery_engine = MessageDelivery(_mail_engine, _get_peers, self_url())
-    _sync_engine = SyncEngine(_mail_engine, _get_peers, self_url())
+    _sync_engine = SyncEngine(_mail_engine, _get_peers, self_url(),
+                              on_peer_agents=_note_peer_agents)
 
 def _on_discover(name, ip, port, caps):
     """UDP 发现回调：自动 peer_add。"""
