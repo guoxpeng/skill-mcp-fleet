@@ -62,7 +62,8 @@ except ImportError:
         pass
 try:
     from fleet_proto import (MailEngine, DiscoveryLayer, MessageDelivery,
-                             SyncEngine, DEFAULT_DISCOVER_PORT, PROTO_VERSION)
+                             SyncEngine, PeerHealth,
+                             DEFAULT_DISCOVER_PORT, PROTO_VERSION)
     _HAS_PROTO = True
 except ImportError:
     _HAS_PROTO = False
@@ -89,7 +90,7 @@ for _stream in (sys.stdout, sys.stderr):
 DEFAULT_CONFIG = {
     "name": "node",             # 副端标识（显示在状态页与 serverInfo）
     "tool_prefix": "",          # 工具名前缀，如 "nas_"；留空则用裸名（exec/read/...）
-    "version": "5.0.1",
+    "version": "5.0.2",
     "sudo_password": "",        # 留空且非 root 时会尝试免密 sudo
     "work_dir": "/",            # 默认工作目录
     "command_timeout": 120,     # 秒
@@ -983,10 +984,13 @@ def _init_proto():
                 return load_peers().get("nodes", {}).get(name, {}).get("token", "") or None
         except Exception:
             return None
-    _delivery_engine = MessageDelivery(_mail_engine, _get_peers, self_url())
+    # v5.0.2: 投递与同步共享同一熔断器——一个 peer 的健康状态在两条链路一致
+    _peer_health = PeerHealth()
+    _delivery_engine = MessageDelivery(_mail_engine, _get_peers, self_url(),
+                                       health=_peer_health)
     _sync_engine = SyncEngine(_mail_engine, _get_peers, self_url(),
-                              on_peer_agents=_note_peer_agents)
-
+                              on_peer_agents=_note_peer_agents,
+                              health=_peer_health)
 def _on_discover(name, ip, port, caps):
     """UDP 发现回调：自动 peer_add。"""
     url = "http://%s:%d/mcp" % (ip, port)
@@ -1027,6 +1031,9 @@ def _dashboard_data():
             "added_by": info.get("added_by", ""),
             "online": bool(last_seen and (now - last_seen) < 90),
             "last_seen_ago": int(now - last_seen) if last_seen else None,
+            # v5.0.2: 连接熔断状态（冷却剩余秒数，0=健康）
+            "cooldown": (_delivery_engine.health.cooldown_remaining(info.get("url", ""))
+                         if _delivery_engine and info.get("url") else 0),
         })
     stats = _mail_engine.stats() if _mail_engine else {}
     recent = []
