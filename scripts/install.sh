@@ -109,6 +109,7 @@ while [ $# -gt 0 ]; do
     --mode)       CONN_MODE="${2:-permanent}"; shift 2 ;;
     --control)    CTRL_MODE="${2:-direct}"; shift 2 ;;
     --ttl)        TTL="${2:-0}"; shift 2 ;;
+    --invite)     INVITE_CODE="${2:-}"; shift 2 ;;
     --uninstall)  UNINSTALL="1"; shift ;;
     -h|--help)    sed -n '2,44p' "$0" 2>/dev/null || echo "(管道方式不支持 --help，请见 README)"; exit 0 ;;
     *) echo "[!] 未知参数: $1"; exit 1 ;;
@@ -220,6 +221,38 @@ if [ -n "$ALLOW_IPS" ]; then
   ALLOW_IPS_JSON="$(printf '%s' "$ALLOW_IPS" | tr ',' '\n' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' \
     | grep -v '^$' | sed 's/.*/"&"/' | paste -sd, - 2>/dev/null || true)"
   [ -n "$ALLOW_IPS_JSON" ] && ALLOW_IPS_JSON="[$ALLOW_IPS_JSON]" || ALLOW_IPS_JSON="[]"
+fi
+
+# ---------- v4.4: 邀请码解析 ----------
+if [ -n "${INVITE_CODE:-}" ]; then
+  _INVITE_JSON="$(echo "$INVITE_CODE" | base64 -d 2>/dev/null)"
+  if [ -z "$_INVITE_JSON" ]; then
+    echo "[!] 邀请码解析失败"
+    exit 1
+  fi
+  _INV_CODE="$(echo "$_INVITE_JSON" | $PY3 -c "import sys,json; print(json.load(sys.stdin).get('code',''))" 2>/dev/null)"
+  _INV_URL="$(echo "$_INVITE_JSON" | $PY3 -c "import sys,json; print(json.load(sys.stdin).get('url',''))" 2>/dev/null)"
+  _INV_ID="$(echo "$_INVITE_JSON" | $PY3 -c "import sys,json; print(json.load(sys.stdin).get('invite_id',''))" 2>/dev/null)"
+
+  echo ""
+  echo "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"
+  echo "  [!] 安全警告"
+  echo ""
+  echo "  你正在使用邀请码安装，将自动连接到以下设备："
+  echo "  设备码 : $_INV_CODE"
+  echo "  地址   : $_INV_URL"
+  echo ""
+  echo "  连接后，对方可以远程操控本机（执行命令、读写文件）。"
+  echo "  请确认你信任设备 $_INV_CODE 的主人！"
+  echo "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"
+  echo ""
+  printf "确认安装并连接？(输入 yes 继续): "
+  read _INV_CONFIRM
+  if [ "$_INV_CONFIRM" != "yes" ]; then
+    echo "已取消。"
+    exit 1
+  fi
+  echo "[+] 邀请码验证通过，开始安装..."
 fi
 
 # ---------- 基本信息 ----------
@@ -5248,6 +5281,14 @@ cat <<EOF
 ║  $URL_NOTE$(printf '%*s' $((10)) '')║
 ╚══════════════════════════════════════════════════════════════════════════╝
 EOF
+
+# v4.4: 如果有邀请码，自动确权配对
+if [ -n "${INVITE_CODE:-}" ]; then
+  echo ""
+  echo "[+] 正在确权配对..."
+  $PY3 "$DIR/fleet.py" accept "$INVITE_CODE" --yes --timeout 15 2>&1 || \\
+    echo "[!] 自动配对失败，可稍后手动运行: $PY3 $DIR/fleet.py accept $INVITE_CODE"
+fi
 
 # ---------------------------------------------------------------------------
 # 未设令牌时的加固提示（v3.1）

@@ -1,4 +1,4 @@
-# MCP Fleet · 节点互控系统 v4.3
+# MCP Fleet · 节点互控系统 v4.4
 
 > 零依赖 · 纯 Python 标准库 · 兼容 Python 3.6+ · 32 个工具 · 自研通讯协议
 
@@ -18,6 +18,7 @@
 | 6 | **连接模式** | `--mode temporary`（TTL 自动退出）/ `permanent`（长期在线） |
 | 7 | **控制模式** | `--control assisted`（本机 agent 审查）/ `direct`（直接控制），运行时可切换 |
 | 8 | **设备码配对** | 安装自动生成设备码，`fleet pair CODE@URL` 一键配对，A 有 agent 操控 B，双 agent 协作 |
+| 9 | **邀请链接** | `fleet invite` 生成邀请码，对方 `install.sh --invite CODE` 一键安装+自动连接+确权 |
 
 ## 架构
 
@@ -54,6 +55,23 @@
 - A 有 Claude/Cursor → A 的 AI agent 可以 `exec`、`read`、`write` 操控 B
 - B 有 Claude/Cursor → B 的 AI agent 也可以操控 A
 - 两个 agent 可以 `msg_send` 互发消息、分工协作
+
+### 邀请链接配对（v4.4）
+
+更简单的配对方式 — A 生成邀请码，B 一键安装自动连接：
+
+```bash
+# A 生成邀请码
+fleet.py invite
+# → 输出: bash install.sh --invite eyJjb2RlIjoi...
+
+# B 用邀请码安装（自动确权 + 自动连接）
+bash install.sh --invite eyJjb2RlIjoi...
+```
+
+⚠ **安全警告**：邀请码包含连接凭据，仅分享给信任的人。安装后对方可远程操控你的设备。
+
+邀请码有过期时间（默认 1 小时），使用一次后失效。
 
 ## 快速安装
 

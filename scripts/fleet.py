@@ -1594,6 +1594,140 @@ def cmd_pair(a):
     return 0
 
 
+def cmd_invite(a):
+    """v4.4: 生成邀请码 — 其他设备用此码一键安装+自动连接。"""
+    import base64 as _b64
+    me = local_node(a.self_url)
+    if not me:
+        return die("本机没有装节点 agent。先安装：bash install.sh --port 3100")
+    # 调本机 /fleet/invite 端点生成邀请码
+    url = me["url"].rstrip("/").replace("/mcp", "/fleet/invite")
+    token = me["token"]
+    try:
+        import urllib.request as _ur
+        req_data = json.dumps({"ttl": a.ttl}).encode()
+        req = _ur.Request(url, data=req_data, method="POST")
+        req.add_header("Content-Type", "application/json")
+        if token:
+            req.add_header("Authorization", "Bearer " + token)
+        resp = _ur.urlopen(req, timeout=a.timeout)
+        result = json.loads(resp.read().decode())
+    except Exception as e:
+        return die("生成邀请失败：%s" % e)
+    if not result.get("ok"):
+        return die("生成邀请失败：%s" % result.get("error", "unknown"))
+    invite_code = result["invite_code"]
+    device_code = result["device_code"]
+    expires_at = result.get("expires_at", "?")
+    install_cmd = result.get("install_cmd", "")
+    # 显示
+    _bar = "═" * 60
+    print("╔%s╗" % _bar)
+    print("║  邀请码已生成%-46s║" % "")
+    print("║%-60s║" % "")
+    print("║  设备码 : %-50s║" % device_code)
+    print("║  过期   : %-50s║" % expires_at)
+    print("║%-60s║" % "")
+    print("║  把以下命令发给要连接的设备：                       ║")
+    # 邀请命令可能很长，截断显示
+    invite_line = "  %s" % install_cmd
+    print("║" + invite_line[:58] + " " * max(1, 58 - len(invite_line)) + "║")
+    if len(invite_line) > 58:
+        # 多行显示剩余部分
+        remaining = invite_line[58:]
+        while remaining:
+            chunk = remaining[:58]
+            remaining = remaining[58:]
+            print("║  " + chunk + " " * max(1, 56 - len(chunk)) + "║")
+    print("║%-60s║" % "")
+    print("║  ⚠  仅分享给信任的人！邀请码包含连接凭据。           ║")
+    print("║  对方安装后将自动连接本机，可远程操控。             ║")
+    print("╚%s╝" % _bar)
+    print("")
+    print("  邀请码 (单行，方便复制):")
+    print("  %s" % invite_code)
+    return 0
+
+
+def cmd_accept(a):
+    """v4.4: 接受邀请码 → 解析 → 确权 → 自动配对。"""
+    import base64 as _b64
+    # 解析邀请码
+    try:
+        invite_data = json.loads(_b64.b64decode(a.invite_code).decode())
+    except Exception as e:
+        return die("邀请码格式错误：%s" % e)
+    device_code = invite_data.get("code", "")
+    url = invite_data.get("url", "").rstrip("/")
+    token = invite_data.get("token", "")
+    invite_id = invite_data.get("invite_id", "")
+    expires = invite_data.get("expires", 0)
+    # 检查过期
+    if int(time.time()) > expires:
+        return die("邀请码已过期（过期时间: %s）" %
+                   time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(expires)))
+    # 安全警告
+    _bar = "!" * 60
+    print("╔%s╗" % _bar)
+    print("║  ⚠  安全警告%-48s║" % "")
+    print("║%-60s║" % "")
+    print("║  你即将连接到以下设备：                               ║")
+    print("║  设备码 : %-50s║" % device_code)
+    print("║  地址   : %-50s║" % url)
+    print("║%-60s║" % "")
+    print("║  连接后，对方可以远程操控本机（执行命令、读写文件）。 ║")
+    print("║  请确认你信任设备 %s 的主人！%-20s║" % (device_code, ""))
+    print("╚%s╝" % _bar)
+    print("")
+    if not a.yes:
+        try:
+            ans = input("确认连接？(输入 yes 继续): ").strip()
+        except Exception:
+            ans = ""
+        if ans != "yes":
+            print("已取消。")
+            return 1
+    # 确权：向对方发送 invite/verify
+    verify_url = url.replace("/mcp", "/fleet/invite/verify")
+    me = local_node(a.self_url)
+    my_name = me["name"] if me else (a.name or "guest-%s" % uuid.uuid4().hex[:6])
+    my_url = me["url"] if me else (a.self_url or "")
+    my_token = me["token"] if me else ""
+    try:
+        import urllib.request as _ur
+        req_data = json.dumps({
+            "invite_id": invite_id,
+            "name": my_name,
+            "url": my_url,
+            "token": my_token
+        }).encode()
+        req = _ur.Request(verify_url, data=req_data, method="POST")
+        req.add_header("Content-Type", "application/json")
+        if token:
+            req.add_header("Authorization", "Bearer " + token)
+        resp = _ur.urlopen(req, timeout=a.timeout)
+        result = json.loads(resp.read().decode())
+    except Exception as e:
+        return die("确权失败：%s" % e)
+    if not result.get("ok"):
+        return die("确权失败：%s" % result.get("error", "unknown"))
+    # 对方已登记本机，本机也登记对方
+    if me:
+        reg = load_registry()
+        reg.setdefault("nodes", {})[device_code] = {
+            "url": url, "token": token, "description": "邀请配对"}
+        save_registry(reg)
+    print(ok("[+] ") + "确权通过！已与 %s 建立连接" % device_code)
+    print("  对方设备码 : %s" % device_code)
+    print("  对方地址   : %s" % url)
+    print("  本机设备码 : %s" % my_name)
+    if me:
+        print("")
+        print("  控制对方： fleet exec %s 'uptime'" % device_code)
+        print("  发消息：   fleet msg send to=%s text='你好'" % device_code)
+    return 0
+
+
 # ---------------------------------------------------------------- 入口
 
 
@@ -1900,6 +2034,20 @@ def build_parser():
     sp.add_argument("--port", type=int, default=3100)
     sp.add_argument("--timeout", type=int, default=20)
     sp.set_defaults(func=cmd_pair)
+
+    sp = sub.add_parser("invite", help="v4.4: 生成邀请码，其他设备用它一键安装+自动连接")
+    sp.add_argument("--ttl", type=int, default=3600, help="邀请码有效期（秒，默认 3600）")
+    sp.add_argument("--self-url", help="本机对外地址（默认自动检测）")
+    sp.add_argument("--timeout", type=int, default=10)
+    sp.set_defaults(func=cmd_invite)
+
+    sp = sub.add_parser("accept", help="v4.4: 接受邀请码 → 确权 → 自动配对")
+    sp.add_argument("invite_code", help="邀请码（base64 编码字符串）")
+    sp.add_argument("--name", help="本机设备名（默认用配置中的 name）")
+    sp.add_argument("--self-url", help="本机对外地址（默认自动检测）")
+    sp.add_argument("--yes", action="store_true", help="跳过确认提示（危险）")
+    sp.add_argument("--timeout", type=int, default=15)
+    sp.set_defaults(func=cmd_accept)
 
     sp = sub.add_parser("directory", help="查看/设置地址目录（副端上报地址、主端自动跟随）")
     sp.add_argument("--url", help="地址目录服务地址，如 http://192.168.1.10:8790")

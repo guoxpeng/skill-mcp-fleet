@@ -11,10 +11,10 @@ description: |
   peer call, remote exec, 副端安装, 节点发现, agent 协作, task delegation, 
   message bus, mesh topology, 离线消息, 邮箱, mailbox, UDP discovery
 tags: [mcp, fleet, mesh, peer-to-peer, agent-collaboration, remote-control, zero-dependency, store-and-forward]
-version: 4.3.0
+version: 4.4.0
 ---
 
-# MCP Fleet · 节点互控系统 v4.3
+# MCP Fleet · 节点互控系统 v4.4
 
 ## 这是什么
 
@@ -67,6 +67,43 @@ fleet.py pair nas-a3f2@http://192.168.1.10:3100/mcp
 | A 操控 B | 有 AI agent | 无 agent（只装 fleet） | A 的 agent 远程操控 B（exec/read/write），B 是 A 的"远程手" |
 | B 操控 A | 无 agent | 有 AI agent | B 的 agent 远程操控 A |
 | 双向协作 | 有 AI agent | 有 AI agent | 两个 agent 互相发消息、分工协作，完成各自主人的任务 |
+
+### 邀请链接配对（v4.4）
+
+**A 生成邀请码**：
+```bash
+fleet.py invite                    # 生成邀请码（默认 1 小时有效）
+fleet.py invite --ttl 86400        # 邀请码 24 小时有效
+```
+
+输出：
+```
+╔════════════════════════════════════════════════════════════╗
+║  邀请码已生成                                               ║
+║  设备码 : nas-a3f2                                          ║
+║  过期   : 2026-10-17 10:30:00                               ║
+║                                                            ║
+║  把以下命令发给要连接的设备：                               ║
+║  bash install.sh --invite eyJjb2RlIjoi...                  ║
+║                                                            ║
+║  ⚠  仅分享给信任的人！邀请码包含连接凭据。                 ║
+╚════════════════════════════════════════════════════════════╝
+```
+
+**B 用邀请码安装**：
+```bash
+# 一键安装 + 自动确权 + 自动连接
+bash install.sh --invite eyJjb2RlIjoi...
+```
+
+安装前会显示安全警告，需输入 `yes` 确认。安装完成后自动确权配对。
+
+**安全设计**：
+- 邀请码 = base64(json{设备码, API, token, invite_id, 过期时间})
+- 邀请码有过期时间（默认 1 小时），过期后不可用
+- 邀请码使用一次后失效（防重放）
+- 接受方需显式确认信任对方设备
+- ⚠ **不要随意使用他人的邀请码安装** — 安装后对方可远程操控你的设备
 
 ### 临时连接 + 本机辅助模式
 

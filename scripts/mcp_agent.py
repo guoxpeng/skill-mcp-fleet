@@ -2361,6 +2361,106 @@ class Handler(BaseHTTPRequestHandler):
             })
             return
 
+        if path == "/fleet/invite":
+            # v4.4: 创建邀请码
+            # 邀请码 = base64(json{code, url, token, invite_id, expires})
+            try:
+                payload = json.loads(raw.decode("utf-8")) if raw else {}
+            except Exception:
+                payload = {}
+            ttl = int(payload.get("ttl", 3600))  # 默认 1 小时过期
+            invite_id = uuid.uuid4().hex[:12]
+            expires = int(time.time()) + ttl
+            # 存储邀请记录（用于验证）
+            _invite_file = os.path.join(os.path.dirname(CONFIG_PATH), "invites.json")
+            try:
+                invites = json.load(open(_invite_file)) if os.path.exists(_invite_file) else {}
+            except Exception:
+                invites = {}
+            invites[invite_id] = {"expires": expires, "used": False,
+                                  "created": int(time.time())}
+            try:
+                json.dump(invites, open(_invite_file, "w"))
+            except Exception:
+                pass
+            # 生成邀请码
+            invite_data = {
+                "code": SERVER_NAME,
+                "url": self_url(),
+                "token": CFG.get("auth_token", ""),
+                "invite_id": invite_id,
+                "expires": expires
+            }
+            import base64 as _b64
+            invite_code = _b64.b64encode(
+                json.dumps(invite_data).encode()).decode()
+            self._json(200, {
+                "ok": True,
+                "invite_code": invite_code,
+                "device_code": SERVER_NAME,
+                "url": self_url(),
+                "expires_at": time.strftime("%Y-%m-%d %H:%M:%S",
+                                           time.localtime(expires)),
+                "ttl": ttl,
+                "install_cmd": "bash install.sh --invite %s" % invite_code
+            })
+            return
+
+        if path == "/fleet/invite/verify":
+            # v4.4: 验证邀请码 + 自动双向配对
+            try:
+                payload = json.loads(raw.decode("utf-8"))
+            except Exception:
+                self._json(400, {"error": "bad json"})
+                return
+            invite_id = payload.get("invite_id", "")
+            peer_name = payload.get("name", "")
+            peer_url = payload.get("url", "")
+            peer_token = payload.get("token", "")
+            if not invite_id or not peer_name or not peer_url:
+                self._json(400, {"error": "need invite_id, name, url"})
+                return
+            # 验证邀请码
+            _invite_file = os.path.join(os.path.dirname(CONFIG_PATH), "invites.json")
+            try:
+                invites = json.load(open(_invite_file)) if os.path.exists(_invite_file) else {}
+            except Exception:
+                invites = {}
+            inv = invites.get(invite_id)
+            if not inv:
+                self._json(403, {"error": "邀请码不存在"})
+                return
+            if inv.get("used"):
+                self._json(403, {"error": "邀请码已使用"})
+                return
+            if int(time.time()) > inv.get("expires", 0):
+                self._json(403, {"error": "邀请码已过期"})
+                return
+            # 验证通过 → 双向配对
+            with PEERS_LOCK:
+                d = load_peers()
+                d["nodes"][peer_name] = {"url": peer_url, "token": peer_token,
+                                         "added_by": "invite", "updated": int(time.time())}
+                save_peers(d)
+            # 标记邀请码已使用
+            inv["used"] = True
+            inv["used_by"] = peer_name
+            inv["used_at"] = int(time.time())
+            try:
+                json.dump(invites, open(_invite_file, "w"))
+            except Exception:
+                pass
+            self._json(200, {
+                "ok": True,
+                "verified": True,
+                "my_name": SERVER_NAME,
+                "my_url": self_url(),
+                "my_token": CFG.get("auth_token", ""),
+                "my_version": SERVER_VERSION,
+                "message": "确权通过，已与 %s 建立连接" % peer_name
+            })
+            return
+
         if path not in ("/mcp", "/rpc", ""):
             self._json(404, {"error": "not found"})
             return
