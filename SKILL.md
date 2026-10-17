@@ -1,16 +1,25 @@
 ---
 name: mcp-fleet
-description: 把闲置的NAS、云主机、办公室电脑、软路由变成一张「AI对等协作网」——设备上的AI Agent互发消息、按能力委派任务、离线不丢消息（store-and-forward邮箱），零依赖一条命令装机。自研通讯协议（UDP广播发现+HTTP消息端点+gossip同步），设备码/邀请链接安全确权，41个工具，支持TLS加密、审计日志、dryRun预览，不依赖任何外部服务。当用户提到：管NAS、控制家里电脑、远程操控设备、多台设备互联、让AI操作电脑、设备上的AI协作、远程执行命令、离线留言给AI、软路由排查、家里服务器管理、fleet、MCP组网等需求时使用本技能。
+description: 把闲置的NAS、云主机、办公室电脑、软路由变成一张「AI对等协作网」——设备上的AI Agent互发消息、按能力委派任务、离线不丢消息（store-and-forward邮箱），零依赖一条命令装机。自研通讯协议（UDP广播发现+HTTP消息端点+gossip同步），设备码/邀请链接安全确权，41个工具，支持TLS加密、消息落盘加密（PBKDF2派生密钥）、UDP hello防伪签名、Web Dashboard实时拓扑、Windows一键安装、61用例测试套件，不依赖任何外部服务。当用户提到：管NAS、控制家里电脑、远程操控设备、多台设备互联、让AI操作电脑、设备上的AI协作、远程执行命令、离线留言给AI、软路由排查、家里服务器管理、设备监控面板、Windows远程管理、fleet、MCP组网等需求时使用本技能。
 tags: 设备互联, MCP, 远程操控, 效率工具, 开发工具, 自研协议, agent协作, 离线邮箱
 ---
 
-# MCP Fleet · 节点互控系统 v4.6
+# MCP Fleet · 节点互控系统 v5.0
 
 ## 这是什么
 
 > 一句话：**让你用聊天的方式指挥家里所有设备干活** —— 手机上说一句，NAS/电脑/软路由上的 AI 就去办。
 
 给你的设备集群（NAS / 飞牛 OS / 树莓派 / 云主机 / 容器 / 手机…）每台装一个「节点」，即可被**任意支持 MCP 的 AI agent**远程操控。
+
+**v5.0 安全大版本**：
+
+1. **邮箱落盘加密** — 节点间消息（inbox/outbox/sent）以 `enc1$` 前缀密文落盘，密钥由配对 token 经 PBKDF2 派生，物理拷走硬盘也读不到明文
+2. **UDP hello 防伪签名** — 已配对节点的发现包必须携带 HMAC 签名，冒充已知节点直接拒收（对 v4.x 旧节点保持兼容）
+3. **Web Dashboard** — 浏览器打开 `http://节点IP:端口/fleet/ui`，实时看全网拓扑、在线状态、消息流（零 CDN 依赖单文件页面）
+4. **Windows 安装器** — `scripts/install.py` 跨平台一键安装（含开机自启与防火墙规则），Windows 不再需要手敲命令
+5. **测试套件** — 61 个测试（含真实 UDP socket 验签用例），`python3 -m pytest tests/ -q` 一键回归
+6. **修复死锁** — 自测发现并修复 gossip 同步路径的重入死锁（v4.1 引入至今的隐蔽 bug，`Lock` → `RLock`）
 
 **v4.6 文档增强**：新增「谁需要它」适用场景、一键演示脚本 `scripts/demo.sh`（30 秒看懂双节点互联）、兼容性清单；修复历史文档中工具数描述（统一为 41 个）。
 
@@ -152,6 +161,44 @@ bash scripts/demo.sh
 
 演示结束自动清理进程与临时文件。评测评测、第一次接触本技能的用户，建议从这里开始。
 
+## v5.0 新能力速览
+
+### Web Dashboard（浏览器实时监控）
+
+节点启动后，浏览器打开：
+
+```
+http://<节点IP>:<端口>/fleet/ui#<你的节点token>
+```
+
+- token 放在 URL `#` 之后，**不会发送到服务器**（仅存于浏览器 sessionStorage）
+- 页面 5 秒自动刷新：KPI 卡片（在线节点数 / 消息总数 / 待投递）、mesh 网络拓扑图、最近消息流
+- 单文件零 CDN 依赖，内网/离线环境可用
+
+### Windows 一键安装（跨平台安装器）
+
+```powershell
+# 下载 scripts/install.py 后，管理员 PowerShell 中执行：
+python install.py --name office-pc --port 3100
+```
+
+自动完成：文件部署 → 配置生成 → 启动脚本 → 防火墙放行 → 开机自启（Startup 文件夹）。
+卸载用 `python install.py --uninstall`（保留邮箱数据）。Linux 用户仍推荐 `install.sh`（含 systemd）。
+
+### 邮箱加密与 hello 防伪（默认自动生效）
+
+- 配对成功的节点之间，消息**自动加密落盘**（`enc1$` 前缀），无需任何配置；v4.x 明文邮箱读取时自动兼容
+- 已配对节点的 UDP 发现包**自动携带签名**，伪造已知节点名会被拒收并计数（`mesh` 可见）
+- 与旧版本混部不破坏网络：无签名的 v4.x 节点照常发现
+
+### 测试套件（61 个用例）
+
+```bash
+python3 -m pytest tests/ -q    # 0.8s 全量回归
+```
+
+覆盖：加解密往返与防篡改（12）、邮箱读写与并发（24）、投递三分支与重试（6，合并在邮箱文件）、hello 验签策略与真实 UDP socket（10）、工具层（7）、双节点端到端集成（8，含密文落盘断言）。本套件在开发中真实抓出一个隐蔽死锁（见 `references/安全审计报告.md`）。
+
 ## 通讯协议架构
 
 ```
@@ -232,24 +279,36 @@ python scripts/fleet.py health --deep          # 全网体检
 ```
 mcp-fleet/
 ├── SKILL.md                          # 本文件（AgentSkill 规范）
-├── mcp_agent_config.example.json     # 配置模板
+├── pytest.ini                        # 测试配置（faulthandler 超时保护）
 ├── scripts/
-│   ├── mcp_agent.py                  # 节点 MCP 服务器（核心，41 个工具）
-│   ├── fleet_proto.py                # v4.1 自研通讯协议层（UDP发现+store-and-forward+gossip）
+│   ├── mcp_agent.py                  # 节点 MCP 服务器（核心，41 个工具，TLS+审计+Dashboard 路由）
+│   ├── fleet_proto.py                # 自研通讯协议层（UDP发现+store-and-forward+gossip+加密+签名）
+│   ├── dashboard_html.py             # v5.0 Web Dashboard 单文件页面（零 CDN 依赖）
+│   ├── install.py                    # v5.0 跨平台安装器（Windows/Linux/macOS）
 │   ├── fleet.py                      # 主端统一 CLI
 │   ├── fleet_chat.py                 # AI 间消息 CLI
 │   ├── fleet_watch.py                # 保活守护
 │   ├── fleet-directory.py            # 地址目录服务
-│   ├── install.sh                    # 一键安装脚本
+│   ├── install.sh                    # 一键安装脚本（Linux，含 systemd）
 │   ├── install-fleet-node.sh         # 节点安装辅助
 │   ├── add_fleet_node.py             # 注册节点到 MCP 配置
 │   ├── call_node.py                  # 免重启直接调工具
 │   ├── probe_fleet.py                # 连通性诊断
 │   ├── demo.sh                       # 一键演示：双节点互联 30 秒上手
-│   └── make-offline.py               # 生成离线安装包（systemd 单元由 install.sh 运行时生成）
+│   ├── make-offline.py               # 生成离线安装包（systemd 单元由 install.sh 运行时生成）
+│   └── mcp_agent_config.example.json # 配置模板
+├── tests/                            # v5.0 测试套件（61 用例，pytest 一键回归）
+│   ├── conftest.py                   # sys.path 公共配置
+│   ├── test_crypto.py                # 加解密往返 / 防篡改 / 密钥派生（12）
+│   ├── test_mail_engine.py           # 邮箱读写 / 加密落盘 / 并发 / 投递三分支（24）
+│   ├── test_hello.py                 # hello 验签策略 + 真实 UDP socket（10）
+│   ├── test_agent_tools.py           # 工具参数与安全护栏（7）
+│   └── test_agent_integration.py     # 双节点端到端集成（8）
 └── references/
+    ├── vision-and-scenarios.md       # 场景故事 + 演进蓝图
+    ├── 传播度证据.md                  # 三层传播渠道数据（附复现命令）
     ├── 加固操作手册.md
-    ├── 安全审计报告.md
+    ├── 安全审计报告.md                # 含 v5.0 自发现自修复记录
     └── 云服务器-副端安装-一条命令.md
 ```
 
@@ -276,3 +335,5 @@ mcp-fleet/
 | `/fleet/discover` | POST | 节点握手：交换信息，自动互加 peer |
 | `/fleet/register_agent` | POST | agent 注册到本节点 |
 | `/fleet/status` | GET | 邮箱状态：inbox/outbox/agents |
+| `/fleet/ui` | GET | v5.0 Web Dashboard（单文件页面，token 经 URL fragment 传入） |
+| `/fleet/ui/data` | GET | Dashboard 数据接口（需 token 鉴权，5s 轮询） |
