@@ -13,6 +13,7 @@ fleet_proto -- MCP-Fleet 自研通讯协议层（零依赖，纯 Python 标准�
 
 import json, os, re, socket, threading, time, uuid, io
 import urllib.request, urllib.parse, urllib.error
+import ipaddress
 import base64, hashlib, hmac
 import collections
 
@@ -700,6 +701,27 @@ class DiscoveryLayer:
 # ---------------------------------------------------------------------------
 # 消息投递 MessageDelivery
 # ---------------------------------------------------------------------------
+def _opener_for(url):
+    """v5.0.5: 内网/本机地址不走系统代理。
+
+    Windows 装了代理软件（注册表代理未豁免 <local>）时，urllib 的默认
+    opener 会把 127.0.0.1 / 192.168.x.x 的请求也发给代理服务器 —— 代理
+    够不到用户的局域网，投递/gossip/poll 全部失败进死信，看门狗探活
+    假阴性引发重启风暴。与 mcp_agent._peer_opener 同规则：
+    回环/私网/链路本地/localhost/.local 直连，公网地址仍走系统代理。
+    """
+    host = urllib.parse.urlsplit(url).hostname or ""
+    direct = host == "localhost" or host.endswith(".local")
+    try:
+        ip = ipaddress.ip_address(host)
+        direct = direct or ip.is_private or ip.is_loopback or ip.is_link_local
+    except ValueError:
+        pass
+    if direct:
+        return urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    return urllib.request.build_opener()
+
+
 class MessageDelivery:
     """
     消息投递引擎：outbox -> HTTP POST /fleet/mail -> 目标节点
@@ -777,7 +799,7 @@ class MessageDelivery:
             req.add_header("Content-Type", "application/json; charset=utf-8")
             if token:
                 req.add_header("Authorization", "Bearer " + token)
-            with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT) as r:
+            with _opener_for(deliver_url).open(req, timeout=HTTP_TIMEOUT) as r:
                 ok = (r.status == 200)
             self.health.record_success(url)
             return ok
@@ -876,7 +898,7 @@ class SyncEngine:
             req.add_header("Content-Type", "application/json; charset=utf-8")
             if token:
                 req.add_header("Authorization", "Bearer " + token)
-            with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT) as r:
+            with _opener_for(sync_url).open(req, timeout=HTTP_TIMEOUT) as r:
                 resp = json.loads(r.read().decode("utf-8"))
             self.health.record_success(url)   # v5.0.2: gossip 通了即恢复健康
 
@@ -908,7 +930,7 @@ class SyncEngine:
             req = urllib.request.Request(poll_url)
             if token:
                 req.add_header("Authorization", "Bearer " + token)
-            with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT) as r:
+            with _opener_for(poll_url).open(req, timeout=HTTP_TIMEOUT) as r:
                 return json.loads(r.read().decode("utf-8")).get("messages", [])
         except Exception:
             return []
