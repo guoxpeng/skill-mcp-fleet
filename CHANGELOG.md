@@ -6,6 +6,44 @@
 
 ---
 
+## [5.0.5] — 2026-10-17 · Windows 代理穿透修复版本（git tag: v5.0.5）
+
+**第五轮审查聚焦 Windows 端。实锤并修复一个贯穿协议层与安装器的同源根因：
+Windows 代理软件（科学上网/抓包工具）未豁免 `<local>` 时，urllib 默认 opener
+会把发往 127.0.0.1 / 局域网 IP 的请求全部劫持到代理服务器——代理够不到
+用户局域网，节点间消息全进死信、看门狗探活假阴性引发每分钟重启风暴。**
+mcp_agent 工具层早有代理豁免（`_peer_opener`），协议层与安装器从未对齐。
+
+### 修复
+- **[高危] fleet_proto 三处裸 urlopen 被系统代理劫持（W1）**：单播投递
+  （deliver）、gossip 同步（sync_with_peer）、拉信（_poll_peer）直连内网 URL
+  时若系统代理未豁免回环，消息必然失败进死信。修复：新增 `_opener_for(url)`；
+  回环/私网/链路本地/localhost/.local 直连（空 proxies），公网仍走系统代理
+  （隧道/中转场景不受影响）——与 mcp_agent._peer_opener 同规则。
+- **[高危] 看门狗探活被系统代理劫持（W2）**：probe_agent 匿名裸 urlopen，
+  代理环境下健康节点被误判宕机 → 每分钟重启风暴。修复：探活目标恒为
+  127.0.0.1，强制 `ProxyHandler({})` 禁代理（空 proxies 语义：直连）。
+  端到端实测：假系统代理环境下 watchdog 对健康节点零动作。
+- **[中危] 看门狗计划任务每分钟闪黑窗（W3）**：MINUTE 任务用 python.exe
+  （控制台程序）→ 任务计划程序每分钟弹一次黑色窗口。修复：改用 pythonw。
+- **[中危] venv 下找不到 pythonw 闪窗（W4）**：win_find_pythonw 只查
+  sys.executable 同目录，venv 的 Scripts 下无 pythonw.exe → 回退 python.exe
+  → 登录自启闪黑窗。修复：回退链补 sys.base_prefix/base_exec_prefix
+  （venv 内指向真实 Python 安装目录）。
+- **[低危] 安装流程 UnicodeDecodeError（W5）**：_run_cmd 的 text=True 遇
+  schtasks 本地化输出（非 UTF-8 字节）抛解码异常中断安装。修复：errors=replace。
+- **[低危] goodbye 上报裸 urlopen（W6）**：agent 退出广播 goodbye 同受代理
+  劫持（低频），顺手走 _peer_opener。
+
+### 测试
+- **94 → 100 用例**：TestWinHardening 6 项——假代理环境下探活仍准确（真 HTTP
+  服务 + watchdog 全链路零动作）、_opener_for 私网直连/公网保代理（功能断言：
+  真实服务 + 假代理正反对照）、pythonw venv 回退链与最终回退、_run_cmd 容错。
+- **端到端**：冷启动 0.5s；健康零动作；kill -9 复活；**假系统代理下不再误判**。
+- 探活防误判保持：只认 `{status:ok, version:...}` 结构（与 5.0.4 一致）。
+
+---
+
 ## [5.0.4] — 2026-10-17 · 三平台守护对齐版本（git tag: v5.0.4）
 
 **补齐 Windows / macOS 的开机自启与进程保护，三平台守护矩阵对齐 Linux 既有水位。**
