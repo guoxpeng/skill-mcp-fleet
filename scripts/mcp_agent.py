@@ -38,7 +38,6 @@ import json
 import os
 import re
 import hmac
-import io
 import ipaddress
 import locale
 import shlex
@@ -49,14 +48,16 @@ import sys
 import threading
 import time
 import uuid
-from http.server import BaseHTTPRequestHandler, HTTPServer
+import urllib.parse
+import urllib.request
+import urllib.error
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 try:
-    from http.server import ThreadingHTTPServer  # novermin（3.7+，下面有 3.6 兜底）
-except ImportError:  # Python 3.6（如 CentOS 7 自带 3.6.8）没有 ThreadingHTTPServer，自己拼一个
-    from socketserver import ThreadingMixIn
-
-    class ThreadingHTTPServer(ThreadingMixIn, HTTPServer):
-        daemon_threads = True
+    from fleet_proto import (MailEngine, DiscoveryLayer, MessageDelivery,
+                             SyncEngine, DEFAULT_DISCOVER_PORT, PROTO_VERSION)
+    _HAS_PROTO = True
+except ImportError:
+    _HAS_PROTO = False
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 CONFIG_PATH = os.path.join(HERE, "mcp_agent_config.json")
@@ -64,26 +65,16 @@ CONFIG_PATH = os.path.join(HERE, "mcp_agent_config.json")
 # 日志行缓冲：副端是被 nohup/systemd 拉起的常驻进程，stdout 重定向到文件时
 # 默认是块缓冲，启动横幅和诊断信息会一直卡在缓冲区里；进程被 kill 时直接丢失，
 # 表现为 agent.log 一直是空的。这里强制行缓冲。
-# Python 3.6 没有 reconfigure，而且在 C/POSIX locale（systemd 下常见）里默认是 ascii，
-# 打印中文直接 UnicodeEncodeError 把进程打崩 —— 这时重新包一层 utf-8 + 行缓冲。
-for _name in ("stdout", "stderr"):
-    _stream = getattr(sys, _name)
-    if hasattr(_stream, "reconfigure"):
-        try:
-            _stream.reconfigure(line_buffering=True)
-        except Exception:
-            pass
-    else:
-        try:
-            setattr(sys, _name, io.TextIOWrapper(_stream.buffer, encoding="utf-8",
-                                                 errors="replace", line_buffering=True))
-        except Exception:
-            pass
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(line_buffering=True)
+    except Exception:
+        pass
 
 DEFAULT_CONFIG = {
     "name": "node",             # 副端标识（显示在状态页与 serverInfo）
     "tool_prefix": "",          # 工具名前缀，如 "nas_"；留空则用裸名（exec/read/...）
-    "version": "3.4.1",
+    "version": "4.0.0",
     "sudo_password": "",        # 留空且非 root 时会尝试免密 sudo
     "work_dir": "/",            # 默认工作目录
     "command_timeout": 120,     # 秒
@@ -115,6 +106,21 @@ DEFAULT_CONFIG = {
     # 单连接空闲多少秒后断开。原来没有超时：隧道/NAT 留下的半开连接会永久占住线程，
     # 日积月累把 agent 拖到无响应（进程还在，保活守护看不出来）。
     "socket_timeout": 300,
+    # ---- 对等互控（v3.5）--------------------------------------------------
+    # 不再区分主端/副端：每个节点既能被连，也能通过 peer_* 工具去连别的节点。
+    "peer_tools": True,         # False = 不暴露 peers/peer_call/peer_add/peer_remove
+    "peer_max_hops": 3,         # A→B→C… 最多转几跳，防止互相转发成环
+    "self_url": "",             # 别的节点回连本机用的地址；留空=自动（隧道地址 > 内网 IP）
+    # ---- Tailscale 自动组网（v4.0）-----------------------------------------
+    "tailnet_auto_mesh": True,  # 启动时自动发现 tailnet 上的 fleet 节点并 peer_add
+    "tailnet_name": "",         # tailscale up --login-server 或 tailnet 名（留空=用已登录的）
+    "tailnet_scan_interval": 60,# 每 N 秒扫一次 tailnet 发现新节点
+    "tailnet_auto_trust": True, # 同 tailnet 的节点自动互信（Tailscale 端到端加密），省去逐对配 token
+    # ---- Agent 协作（v4.0）------------------------------------------------
+    "collab_tools": True,       # 暴露 caps/mesh_caps/delegate/group_* 工具
+    # ---- 安全加固 + 可观测性（v4.0）----------------------------------------
+    "audit_log": True,          # 记录 peer_call/msg_send 到 audit.log
+    "rate_limit_per_min": 120,  # 每节点入站 peer_call 每分钟上限（令牌桶）
 }
 
 
@@ -127,28 +133,6 @@ def load_config():
         except Exception as e:
             print("[warn] 读配置失败，用默认值: %s" % e, file=sys.stderr)
     return cfg
-
-
-# ---- 本机 Tailscale IP 探测（v3.4：供主端诊断「登记 IP vs 实际 IP」）----
-_TS_IP_CACHE = {"ts": 0, "ip": ""}
-def tailscale_ip():
-    """本机 tailscale IPv4（100.64/10），60 秒缓存；没有/失败返回 ""。"""
-    now = time.time()
-    if now - _TS_IP_CACHE["ts"] < 60:
-        return _TS_IP_CACHE["ip"]
-    ip = ""
-    try:
-        p = subprocess.run(["tailscale", "ip", "-4"], stdout=subprocess.PIPE,
-                           stderr=subprocess.PIPE, universal_newlines=True, timeout=3)
-        for line in (p.stdout or "").splitlines():
-            line = line.strip()
-            if line.startswith("100."):
-                ip = line
-                break
-    except Exception:
-        ip = ""
-    _TS_IP_CACHE.update(ts=now, ip=ip)
-    return ip
 
 
 def save_config(cfg):
@@ -178,7 +162,9 @@ def gen_token():
 
 CFG = load_config()
 SERVER_NAME = CFG.get("name", "node")
-SERVER_VERSION = CFG.get("version", "1.0.0")
+# 版本以代码为准：配置文件里的 version 是安装当时写的，重装时不覆盖，会显示成旧版本
+AGENT_VERSION = DEFAULT_CONFIG["version"]
+SERVER_VERSION = AGENT_VERSION
 PREFIX = CFG.get("tool_prefix", "") or ""
 
 
@@ -795,7 +781,295 @@ def t_http_get(a):
 
 
 # ---------------------------------------------------------------------------
-# 节点间对话邮箱（msg_send / msg_recv）：AI 之间通过一个都能访问的节点互发消息
+# 对等互控（v3.5）：节点之间不分主副，任何一台都能经 MCP 调用另一台
+# ---------------------------------------------------------------------------
+# 对等节点表与本机 fleet 命令共用同一个文件：<安装目录>/peers.json（0600）
+PEERS_PATH = os.path.join(HERE, "peers.json")
+PEERS_LOCK = threading.Lock()
+
+# v4.1: 自研通讯协议层初始化
+_mail_engine = None
+_discovery_layer = None
+_delivery_engine = None
+_sync_engine = None
+
+def _init_proto():
+    """初始化自研通讯协议层（在 main() 中配置加载后调用）。"""
+    global _mail_engine, _discovery_layer, _delivery_engine, _sync_engine
+    if not _HAS_PROTO:
+        return
+    _mail_engine = MailEngine(HERE, SERVER_NAME)
+    def _get_peers():
+        return load_peers().get("nodes", {})
+    _delivery_engine = MessageDelivery(_mail_engine, _get_peers, self_url())
+    _sync_engine = SyncEngine(_mail_engine, _get_peers, self_url())
+
+def _on_discover(name, ip, port, caps):
+    """UDP 发现回调：自动 peer_add。"""
+    url = "http://%s:%d/mcp" % (ip, port)
+    try:
+        with PEERS_LOCK:
+            d = load_peers()
+            if name not in d["nodes"]:
+                d["nodes"][name] = {"url": url, "token": "",
+                                    "added_by": "udp-discover",
+                                    "updated": int(time.time())}
+                save_peers(d)
+                if _mail_engine:
+                    _mail_engine.register_agent(name)
+    except Exception:
+        pass
+_REQ = threading.local()          # 当前请求带进来的跳数（X-Fleet-Hops）
+try:
+    LISTEN_PORT = int(open(os.path.join(HERE, "port.txt")).read().strip())
+except Exception:
+    LISTEN_PORT = None                # main() 里会按实际监听端口覆盖
+
+
+def load_peers():
+    try:
+        with open(PEERS_PATH, encoding="utf-8") as f:
+            d = json.load(f)
+        if isinstance(d.get("nodes"), dict):
+            return d
+    except Exception:
+        pass
+    return {"nodes": {}}
+
+
+def save_peers(d):
+    tmp = PEERS_PATH + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(d, f, ensure_ascii=False, indent=2)
+        f.write("\n")
+    try:
+        os.chmod(tmp, 0o600)          # 里面有别的节点的令牌
+    except Exception:
+        pass
+    os.replace(tmp, PEERS_PATH)
+
+
+def _lan_ip():
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        s.connect(("10.255.255.255", 1))
+        return s.getsockname()[0]
+    except Exception:
+        return "127.0.0.1"
+    finally:
+        s.close()
+
+
+def self_url():
+    """别的节点回连本机的地址：配置 self_url > 当前隧道地址 > 内网 IP:端口。"""
+    u = (CFG.get("self_url") or "").strip()
+    if not u:
+        try:
+            u = open(os.path.join(HERE, "current_url.txt"), encoding="utf-8").read().strip()
+        except Exception:
+            u = ""
+    if not u:
+        u = "http://%s:%s" % (_lan_ip(), LISTEN_PORT or 3100)
+    u = u.rstrip("/")
+    return u if u.endswith("/mcp") else u + "/mcp"
+
+
+def _norm_mcp_url(u):
+    u = (u or "").strip().rstrip("/")
+    if not u.startswith(("http://", "https://")):
+        u = "http://" + u
+    if not re.search(r"/(mcp|sse)$", u):
+        u += "/mcp"
+    return u
+
+
+def _peer_opener(url):
+    """内网/本机地址不走 http_proxy（设备上配了代理时，局域网对等节点会被代理成 404/超时）。"""
+    import urllib.request
+    import urllib.parse
+    host = urllib.parse.urlsplit(url).hostname or ""
+    direct = host == "localhost" or host.endswith(".local")
+    try:
+        ip = ipaddress.ip_address(host)
+        direct = direct or ip.is_private or ip.is_loopback or ip.is_link_local
+    except ValueError:
+        pass
+    if direct:
+        return urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    return urllib.request.build_opener()
+
+
+def _peer_rpc(url, token, payload, sid, hops, timeout):
+    import urllib.request
+    import urllib.error
+    req = urllib.request.Request(url, data=json.dumps(payload).encode("utf-8"), method="POST",
+                                 headers={"Content-Type": "application/json",
+                                          "Accept": "application/json, text/event-stream",
+                                          "X-Fleet-Hops": str(hops),
+                                          "X-Fleet-From": SERVER_NAME})
+    if token:
+        req.add_header("Authorization", "Bearer " + token)
+    if sid:
+        req.add_header("Mcp-Session-Id", sid)
+    try:
+        with _peer_opener(url).open(req, timeout=timeout) as r:
+            sid = r.headers.get("Mcp-Session-Id") or sid
+            body = r.read().decode("utf-8", "ignore")
+    except urllib.error.HTTPError as e:
+        raise ValueError("对端返回 HTTP %s %s%s" % (e.code, e.reason,
+                         "（令牌不对或本机 IP 不在对端 allow_ips 里）" if e.code in (401, 403) else ""))
+    except Exception as e:
+        raise ValueError("连不上 %s：%s" % (url, getattr(e, "reason", e)))
+    for line in body.splitlines():
+        if line.startswith("data:"):
+            body = line[5:].strip()
+            break
+    return (json.loads(body) if body.strip() else {}), sid
+
+
+def peer_call(url, token, tool, arguments, timeout=130):
+    """对另一个节点做一次完整 MCP 调用：initialize → tools/call。返回 (text, is_err)。"""
+    hops = int(getattr(_REQ, "hops", 0) or 0) + 1
+    if hops > int(CFG.get("peer_max_hops", 3)):
+        raise ValueError("转发跳数超过上限 peer_max_hops=%s，疑似互相转发成环，已拒绝"
+                         % CFG.get("peer_max_hops", 3))
+    r, sid = _peer_rpc(url, token, {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {
+        "protocolVersion": "2024-11-05", "capabilities": {},
+        "clientInfo": {"name": "mcp-fleet-peer:" + SERVER_NAME, "version": SERVER_VERSION}}},
+        None, hops, 20)
+    try:
+        _peer_rpc(url, token, {"jsonrpc": "2.0", "method": "notifications/initialized"},
+                  sid, hops, 10)
+    except ValueError:
+        pass
+    r, _ = _peer_rpc(url, token, {"jsonrpc": "2.0", "id": 2, "method": "tools/call",
+                                  "params": {"name": tool, "arguments": arguments or {}}},
+                     sid, hops, timeout)
+    if "error" in r:
+        return "对端错误: %s" % json.dumps(r["error"], ensure_ascii=False), True
+    res = r.get("result") or {}
+    text = "\n".join(c.get("text", "") for c in res.get("content") or [])
+    return text, bool(res.get("isError"))
+
+
+def _peer_entry(name):
+    nodes = load_peers()["nodes"]
+    if name in nodes:
+        return name, nodes[name]
+    if name.startswith(("http://", "https://")):
+        return name, {"url": name, "token": ""}
+    raise ValueError("没有叫 %r 的对等节点。已知：%s（先用 peer_add 添加，或在本机跑 fleet pair）"
+                     % (name, ", ".join(sorted(nodes)) or "无"))
+
+
+def t_peers(a):
+    nodes = load_peers()["nodes"]
+    lines = ["本机: %s  回连地址: %s" % (SERVER_NAME, self_url()), ""]
+    if not nodes:
+        lines.append("（还没有对等节点。用 peer_add 添加，或在本机跑：fleet pair <对方地址> --token <令牌>）")
+    for n in sorted(nodes):
+        v = nodes[n]
+        st = ""
+        if a.get("check"):
+            try:
+                import urllib.request
+                base = re.sub(r"/(mcp|sse)$", "", v.get("url", ""))
+                req = urllib.request.Request(base + "/health")
+                if v.get("token"):
+                    req.add_header("Authorization", "Bearer " + v["token"])
+                with _peer_opener(base).open(req, timeout=5) as r:
+                    st = "  在线" if r.status == 200 else "  HTTP %s" % r.status
+            except Exception as e:
+                st = "  不通(%s)" % (getattr(e, "reason", None) or type(e).__name__)
+        lines.append("- %s  %s  %s%s" % (n, v.get("url"), "带令牌" if v.get("token") else "无令牌", st))
+    return "\n".join(lines), False
+
+
+def t_peer_call(a):
+    name, v = _peer_entry(a["peer"])
+    if _norm_mcp_url(v.get("url")) == self_url():
+        return "目标就是本机，直接调本机工具即可", True
+    # v4.0: 限流
+    if not rate_limit_allow():
+        return "限流：本节点入站 peer_call 超过每分钟上限 %d，请稍后重试" % CFG.get("rate_limit_per_min", 120), True
+    args = a.get("arguments") or {}
+    if isinstance(args, str):
+        args = json.loads(args or "{}")
+    t = int(a.get("timeoutMs") or 130000) / 1000.0
+    my_name = CFG.get("name", "node")
+    audit_log("peer_call", my_name, name, a["tool"], "calling")
+    text, is_err = peer_call(_norm_mcp_url(v["url"]), v.get("token", ""), a["tool"], args, t)
+    audit_log("peer_call", my_name, name, a["tool"], "ok" if not is_err else "error")
+    return "[%s → %s] %s\n%s" % (SERVER_NAME, name, a["tool"], text), is_err
+
+
+def t_peer_add(a):
+    # v4.0: tailnet 自动信任
+    _url = a.get("url", "")
+    _is_tailnet = False
+    try:
+        _h = urllib.parse.urlsplit(_url).hostname or ""
+        if _h.endswith(".ts.net") or _h.startswith("100."):
+            _is_tailnet = True
+    except Exception:
+        pass
+    if _is_tailnet and CFG.get("tailnet_auto_trust", True) and not a.get("token"):
+        a = dict(a)  # shallow copy, don't require token for tailnet peers
+    name = (a.get("name") or "").strip()
+    if not re.match(r"^[A-Za-z0-9_.-]{1,64}$", name):
+        return "name 只能是字母数字和 _ . -（1~64 位）", True
+    url = _norm_mcp_url(a["url"])
+    with PEERS_LOCK:
+        d = load_peers()
+        old = d["nodes"].get(name)
+        d["nodes"][name] = {"url": url, "token": (a.get("token") or "").strip(),
+                            "added_by": a.get("_from") or "", "updated": int(time.time())}
+        save_peers(d)
+    return "%s对等节点 %s → %s" % ("已更新" if old else "已添加", name, url), False
+
+
+def t_peer_remove(a):
+    with PEERS_LOCK:
+        d = load_peers()
+        if d["nodes"].pop(a["name"], None) is None:
+            return "没有叫 %r 的对等节点" % a["name"], True
+        save_peers(d)
+    return "已移除对等节点 %s" % a["name"], False
+
+
+def t_peer_info(a):
+    """配对用：告诉对方「回连我用哪个地址」。令牌不在这里返回（对方本来就持有）。"""
+    return json.dumps({"name": SERVER_NAME, "url": self_url(), "version": SERVER_VERSION,
+                       "peers": sorted(load_peers()["nodes"])}, ensure_ascii=False), False
+
+
+PEER_TOOLS = [
+    ("peers", "列出本节点认识的对等节点（check=true 顺带探活）。节点之间不分主副，可互相调用。",
+     {"type": "object", "properties": {"check": {"type": "boolean"}}}),
+    ("peer_call", "经本节点调用另一个节点的工具（如 peer=nas, tool=exec, arguments={command:'uptime'}）。可多跳转发进内网。",
+     {"type": "object", "properties": {
+         "peer": {"type": "string", "description": "对等节点名字（见 peers），或完整 http(s)://…/mcp 地址"},
+         "tool": {"type": "string", "description": "对端工具名，如 exec / read / sysinfo / peer_call"},
+         "arguments": {"type": "object", "description": "传给对端工具的参数"},
+         "timeoutMs": {"type": "number"}}, "required": ["peer", "tool"]}),
+    ("peer_add", "添加/更新一个对等节点（名字 + 地址 + 令牌），之后即可用 peer_call 控制它。",
+     {"type": "object", "properties": {
+         "name": {"type": "string"}, "url": {"type": "string"},
+         "token": {"type": "string", "description": "对端的 auth_token，未开鉴权可留空"}},
+      "required": ["name", "url"]}),
+    ("peer_remove", "移除一个对等节点。",
+     {"type": "object", "properties": {"name": {"type": "string"}}, "required": ["name"]}),
+    ("peer_info", "返回本节点名字与回连地址（配对时由对方调用）。",
+     {"type": "object", "properties": {}}),
+]
+PEER_FUNCS = {"peers": t_peers, "peer_call": t_peer_call, "peer_add": t_peer_add,
+              "peer_remove": t_peer_remove, "peer_info": t_peer_info}
+
+
+
+# ---------------------------------------------------------------------------
+# 节点间对话邮箱（msg_send / msg_recv / msg_history）
+# AI 之间通过一个都能访问的节点互发消息；也可做 pub/sub 广播（to="*"）
 # ---------------------------------------------------------------------------
 MAIL_PATH = os.path.join(HERE, "mailbox.jsonl")
 MAIL_CUR = os.path.join(HERE, "mailbox.cursor.json")
@@ -836,17 +1110,46 @@ def _mail_name(v, field):
 
 
 def t_msg_send(a):
+    """v4.1: store-and-forward 消息发送。
+    在线 agent -> 直接 HTTP 投递；离线 -> 存 outbox，上线自动收信。"""
     frm = _mail_name(a.get("from"), "from")
     to = _mail_name(a.get("to"), "to")
     text = a.get("text") or ""
+    topic = a.get("topic") or ""
     if not text.strip():
         return "text 不能为空", True
     if len(text) > _MAIL_MAX_TEXT:
         return "text 过长（上限 %d 字符）" % _MAIL_MAX_TEXT, True
+
+    msg = {"from": frm, "to": to, "text": text,
+           "ts": time.strftime("%Y-%m-%d %H:%M:%S")}
+    if topic:
+        msg["topic"] = topic
+
+    # v4.1: 使用自研通讯协议
+    if _mail_engine:
+        # 本地 agent？直接存 inbox
+        if _mail_engine.is_local_agent(to) or to == _mail_engine.node_name:
+            _mail_engine.inbox_append(dict(msg))
+            return "已投递(本地) -> %s" % to, False
+
+        # 远程 agent：尝试直接投递
+        if _delivery_engine:
+            ok = _delivery_engine.deliver_now(msg)
+            if ok:
+                return "已投递(在线) -> %s" % to, False
+            # 投递失败：存 outbox，等目标上线后自动投递
+            _mail_engine.outbox_append(dict(msg))
+            return "已存邮箱(离线) -> %s，对方上线后自动投递" % to, False
+
+    # fallback: 旧逻辑（无 fleet_proto）
     with _MAIL_COND:
         _mail_load()
         mid = (_MAIL["msgs"][-1]["id"] + 1) if _MAIL["msgs"] else 1
-        m = {"id": mid, "ts": time.strftime("%Y-%m-%d %H:%M:%S"), "from": frm, "to": to, "text": text}
+        m = {"id": mid, "ts": time.strftime("%Y-%m-%d %H:%M:%S"),
+             "from": frm, "to": to, "text": text}
+        if topic:
+            m["topic"] = topic
         _MAIL["msgs"].append(m)
         with io.open(MAIL_PATH, "a", encoding="utf-8") as f:
             f.write(json.dumps(m, ensure_ascii=False) + "\n")
@@ -855,16 +1158,57 @@ def t_msg_send(a):
 
 
 def t_msg_recv(a):
+    """v4.1: 收消息。读本地 inbox + 向所有 peer poll 拉取离线消息。"""
     me = _mail_name(a.get("me"), "me")
     wait = max(0, min(int(a.get("wait", 0) or 0), 300))
     peek = bool(a.get("peek"))
+    topic = a.get("topic")
+
+    # v4.1: 使用自研通讯协议
+    if _mail_engine:
+        # 先向所有 peer poll 拉取给我的消息（上线收信）
+        if _sync_engine:
+            try:
+                peers = load_peers().get("nodes", {})
+                for pname, pinfo in peers.items():
+                    url = pinfo.get("url", "")
+                    token = pinfo.get("token", "")
+                    if url:
+                        polled = _sync_engine._poll_peer(
+                            url.rstrip("/").removesuffix("/mcp").removesuffix("/sse"),
+                            token, me)
+                        for m in polled:
+                            _mail_engine.inbox_append(m)
+            except Exception:
+                pass
+
+        # 读本地 inbox
+        deadline = time.time() + wait
+        while True:
+            cursor = _mail_engine.inbox_cursor(me)
+            got = _mail_engine.inbox_read(me, after_id=cursor, topic=topic,
+                                           mark_read=not peek)
+            if got or (deadline - time.time()) <= 0:
+                break
+            time.sleep(min(2, deadline - time.time()))
+
+        if not got:
+            return "（没有新消息）", False
+        return "\n\n".join("#%s [%s] %s -> %s:\n%s" % (
+            m.get("id", "?"), m.get("ts", ""), m.get("from", ""),
+            m.get("to", ""), m.get("text", "")) for m in got), False
+
+    # fallback: 旧逻辑
     deadline = time.time() + wait
     with _MAIL_COND:
         _mail_load()
         while True:
             after = a.get("after_id")
             after = int(after) if after is not None else int(_MAIL["cur"].get(me, 0))
-            got = [m for m in _MAIL["msgs"] if m["id"] > after and m["to"] in (me, "*") and m["from"] != me]
+            got = [m for m in _MAIL["msgs"]
+                   if m["id"] > after and m["to"] in (me, "*") and m["from"] != me]
+            if topic:
+                got = [m for m in got if m.get("topic") == topic]
             left = deadline - time.time()
             if got or left <= 0:
                 break
@@ -881,14 +1225,467 @@ def t_msg_recv(a):
 
 
 def t_msg_history(a):
+    """v4.1: 查看邮箱历史。"""
     n = max(1, min(int(a.get("lines", 20) or 20), 200))
+    topic = a.get("topic")
+
+    if _mail_engine:
+        stats = _mail_engine.stats()
+        inbox_msgs = _mail_engine._load_jsonl(_mail_engine.inbox_path)
+        got = inbox_msgs[-n:]
+        if topic:
+            got = [m for m in got if m.get("topic") == topic]
+        if not got:
+            return "（邮箱为空）inbox=%d outbox_pending=%d agents=%s" % (
+                stats["inbox_total"], stats["outbox_pending"],
+                ",".join(stats["local_agents"])), False
+        lines = ["#%s [%s] %s -> %s: %s" % (
+            m.get("id", "?"), m.get("ts", ""), m.get("from", ""),
+            m.get("to", ""), _truncate(m.get("text", ""))[:300]) for m in got]
+        lines.append("--- inbox=%d outbox_pending=%d agents=%s" % (
+            stats["inbox_total"], stats["outbox_pending"],
+            ",".join(stats["local_agents"])))
+        return "\n".join(lines), False
+
+    # fallback: 旧逻辑
     with _MAIL_COND:
         _mail_load()
         got = _MAIL["msgs"][-n:]
+        if topic:
+            got = [m for m in got if m.get("topic") == topic]
     if not got:
         return "（邮箱为空）", False
     return "\n".join("#%d [%s] %s -> %s: %s" % (m["id"], m["ts"], m["from"], m["to"], _truncate(m["text"])[:300]) for m in got), False
 
+
+# ===========================================================================
+# v4.0 进化：Tailscale 自动组网 + Agent 协作 + 审计日志 + 限流 + Mesh 拓扑
+# ===========================================================================
+
+# ---------------------------------------------------------------------------
+# 审计日志
+# ---------------------------------------------------------------------------
+AUDIT_PATH = os.path.join(HERE, "audit.log")
+_audit_lock = threading.Lock()
+
+
+def audit_log(action, caller, target, tool, status="ok", detail=""):
+    """记录 peer_call / msg_send / delegate 等操作到审计日志。"""
+    if not CFG.get("audit_log", True):
+        return
+    line = "%s | %-6s | %s -> %s | %s | %s | %s\n" % (
+        time.strftime("%Y-%m-%d %H:%M:%S"), action, caller, target, tool, status, detail[:200])
+    try:
+        with _audit_lock:
+            with io.open(AUDIT_PATH, "a", encoding="utf-8") as f:
+                f.write(line)
+    except (OSError, IOError):
+        pass
+
+
+# ---------------------------------------------------------------------------
+# 限流：令牌桶（每分钟 N 次）
+# ---------------------------------------------------------------------------
+_rate_lock = threading.Lock()
+_rate_bucket = {"tokens": 0, "last": 0}
+
+
+def rate_limit_allow():
+    """检查是否允许一次入站 peer_call。令牌桶：每分钟补充 rate_limit_per_min 个。"""
+    cap = int(CFG.get("rate_limit_per_min", 120))
+    if cap <= 0:
+        return True
+    now = time.time()
+    with _rate_lock:
+        elapsed = now - _rate_bucket["last"]
+        refill = int(elapsed / 60.0 * cap)
+        if refill > 0:
+            _rate_bucket["tokens"] = min(cap, _rate_bucket["tokens"] + refill)
+            _rate_bucket["last"] = now
+        if _rate_bucket["tokens"] > 0:
+            _rate_bucket["tokens"] -= 1
+            return True
+        return False
+
+
+# ---------------------------------------------------------------------------
+# Tailscale 自动组网
+# ---------------------------------------------------------------------------
+def _tailscale_status():
+    """检测 tailscale 是否安装且在线。返回 dict 或 None。"""
+    ts = _which("tailscale")
+    if not ts:
+        return None
+    try:
+        r = subprocess.run([ts, "status", "--json"], capture_output=True, timeout=10)
+        if r.returncode == 0:
+            return json.loads(r.stdout)
+    except Exception:
+        pass
+    return None
+
+
+def _tailscale_ip():
+    """返回本机的 tailscale IP（100.64.0.0/10），没有则 None。"""
+    st = _tailscale_status()
+    if not st:
+        return None
+    self_key = st.get("Self", {}).get("UserID")
+    for peer_id, peer in st.get("Peer", {}).items():
+        if peer.get("UserID") == self_key:
+            for ip in peer.get("TailscaleIPs", []):
+                if ip.startswith("100."):
+                    return ip
+    # Fallback: check Self directly
+    for ip in st.get("Self", {}).get("TailscaleIPs", []):
+        if ip.startswith("100."):
+            return ip
+    return None
+
+
+def _tailscale_peers_online():
+    """列出 tailnet 上在线的其他设备。返回 [(hostname, ip), ...]。"""
+    st = _tailscale_status()
+    if not st:
+        return []
+    self_ip = _tailscale_ip()
+    result = []
+    for peer_id, peer in st.get("Peer", {}).items():
+        if not peer.get("Online"):
+            continue
+        ips = peer.get("TailscaleIPs", [])
+        if not ips:
+            continue
+        ip = ips[0]
+        if ip == self_ip:
+            continue
+        host = peer.get("HostName", "") or peer.get("DNSName", "").rstrip(".")
+        result.append((host, ip))
+    return result
+
+
+def _auto_discover_peers(port=3100):
+    """扫描 tailnet，发现其他 fleet 节点并自动 peer_add。
+    用 TCP connect 探测 port，通的就把对方登记为 peer。"""
+    if not CFG.get("tailnet_auto_mesh", True):
+        return []
+    peers = _tailscale_peers_online()
+    if not peers:
+        return []
+    discovered = []
+    my_name = CFG.get("name", "node")
+    my_token = CFG.get("auth_token", "")
+    my_url = CFG.get("self_url", "") or self_url()
+    existing = load_peers()
+    for host, ip in peers:
+        # 探测对方 fleet 端口
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.settimeout(2)
+            result = sock.connect_ex((ip, port))
+            sock.close()
+            if result != 0:
+                continue
+        except Exception:
+            continue
+        # 用 hostname 做 peer 名（去掉重复）
+        pname = host.split(".")[0] if host else ip
+        if pname == my_name:
+            continue
+        peer_url = "http://%s:%d/mcp" % (ip, port)
+        # 已登记就跳过
+        if pname in existing:
+            continue
+        # 自动信任：同 tailnet 不需要 token（Tailscale 端到端加密）
+        existing[pname] = {"url": peer_url, "token": "", "tailnet": True}
+        discovered.append((pname, peer_url))
+        audit_log("auto_mesh", my_name, pname, "peer_add", "discovered")
+    if discovered:
+        save_peers(existing)
+    return discovered
+
+
+def _broadcast_join():
+    """新节点上线时广播 fleet_join 事件，让已有节点发现自己。"""
+    my_name = CFG.get("name", "node")
+    my_url = CFG.get("self_url", "") or self_url()
+    my_token = CFG.get("auth_token", "")
+    ts_ip = _tailscale_ip()
+    join_msg = json.dumps({"node": my_name, "url": my_url, "tailscale_ip": ts_ip or "",
+                           "ts": time.strftime("%Y-%m-%d %H:%M:%S")})
+    peers = load_peers()
+    for pname, pinfo in peers.items():
+        try:
+            peer_call(pinfo["url"], pinfo.get("token", ""),
+                      "msg_send", {"from": my_name, "to": "*", "topic": "fleet-join",
+                                   "text": join_msg}, timeout=10)
+        except Exception:
+            pass
+
+
+# ---------------------------------------------------------------------------
+# 能力声明（capability detection）
+# ---------------------------------------------------------------------------
+def _detect_capabilities():
+    """探测本节点能力，返回 dict。"""
+    caps = {"node": CFG.get("name", "node"), "version": AGENT_VERSION}
+    # Docker
+    caps["docker"] = _which("docker") is not None
+    # GPU
+    caps["gpu"] = os.path.exists("/dev/nvidia0") or os.path.exists("/dev/dri/renderD128")
+    # systemd
+    caps["systemd"] = _which("systemctl") is not None and os.path.exists("/run/systemd/system")
+    # Tailscale
+    ts = _tailscale_status()
+    caps["tailscale"] = ts is not None
+    caps["tailscale_ip"] = _tailscale_ip() or ""
+    # 内网段
+    try:
+        r = subprocess.run(["ip", "-4", "addr"], capture_output=True, timeout=5)
+        if r.returncode == 0:
+            import re as _re
+            nets = _re.findall(r"inet (\d+\.\d+\.\d+\.\d+/\d+)", r.stdout.decode("utf-8", "replace"))
+            caps["networks"] = [n for n in nets if not n.startswith("127.")]
+    except Exception:
+        caps["networks"] = []
+    # CPU 核数
+    caps["cpu_count"] = os.cpu_count() or 1
+    # 内存
+    try:
+        with open("/proc/meminfo") as f:
+            for line in f:
+                if line.startswith("MemTotal:"):
+                    caps["mem_mb"] = int(line.split()[1]) // 1024
+                    break
+    except Exception:
+        caps["mem_mb"] = 0
+    # 已有 peers 数
+    caps["peer_count"] = len(load_peers())
+    # 工具列表
+    caps["tools"] = [t["name"] for t in TOOLS]
+    return caps
+
+
+_NODE_CAPS = None
+
+
+def get_caps():
+    global _NODE_CAPS
+    if _NODE_CAPS is None:
+        _NODE_CAPS = _detect_capabilities()
+    return _NODE_CAPS
+
+
+def t_caps(a):
+    """返回本节点的能力清单。"""
+    return json.dumps(get_caps(), ensure_ascii=False), False
+
+
+def t_mesh_caps(a):
+    """查询 mesh 内所有节点的能力清单（本机 + 所有 peers）。"""
+    result = {"self": get_caps(), "peers": {}}
+    peers = load_peers()
+    my_name = CFG.get("name", "node")
+    for pname, pinfo in peers.items():
+        try:
+            text, is_err = peer_call(pinfo["url"], pinfo.get("token", ""),
+                                     "caps", {}, timeout=15)
+            if not is_err:
+                result["peers"][pname] = json.loads(text)
+            else:
+                result["peers"][pname] = {"error": text}
+        except Exception as e:
+            result["peers"][pname] = {"error": str(e), "online": False}
+    return json.dumps(result, ensure_ascii=False), False
+
+
+# ---------------------------------------------------------------------------
+# Agent 协作：任务委派
+# ---------------------------------------------------------------------------
+def t_delegate(a):
+    """在 mesh 中广播 who_can <capability>，有能力匹配的节点应答，
+    把任务委派给它执行。"""
+    cap_query = a.get("capability", "")
+    tool = a.get("tool", "exec")
+    arguments = a.get("arguments", {})
+    timeout = int(a.get("timeout", 120))
+    my_name = CFG.get("name", "node")
+
+    # 先查本地能力
+    local_caps = get_caps()
+    if local_caps.get(cap_query):
+        # 本地就能干，直接执行
+        fn = TOOL_FUNCS.get(tool)
+        if fn:
+            return fn(arguments)
+        return "本地有 %s 但工具 %s 不存在" % (cap_query, tool), True
+
+    # 查 peers 的能力，找匹配的
+    peers = load_peers()
+    candidates = []
+    for pname, pinfo in peers.items():
+        try:
+            text, is_err = peer_call(pinfo["url"], pinfo.get("token", ""),
+                                     "caps", {}, timeout=15)
+            if not is_err:
+                pcaps = json.loads(text)
+                if pcaps.get(cap_query):
+                    candidates.append((pname, pinfo, pcaps))
+        except Exception:
+            pass
+
+    if not candidates:
+        return "mesh 中没有节点具备 %s 能力" % cap_query, True
+
+    # 委派给第一个匹配的节点
+    pname, pinfo, pcaps = candidates[0]
+    audit_log("delegate", my_name, pname, tool, "delegated")
+    try:
+        text, is_err = peer_call(pinfo["url"], pinfo.get("token", ""),
+                                 tool, arguments, timeout=timeout)
+        audit_log("delegate", my_name, pname, tool, "ok" if not is_err else "error")
+        return "【委派给 %s】\n%s" % (pname, text), is_err
+    except Exception as e:
+        audit_log("delegate", my_name, pname, tool, "failed", str(e))
+        return "委派给 %s 失败: %s" % (pname, e), True
+
+
+# ---------------------------------------------------------------------------
+# Agent 协作：多节点工作群组
+# ---------------------------------------------------------------------------
+GROUPS_PATH = os.path.join(HERE, "groups.json")
+_groups_lock = threading.Lock()
+
+
+def _load_groups():
+    try:
+        with open(GROUPS_PATH) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {}
+
+
+def _save_groups(d):
+    tmp = GROUPS_PATH + ".tmp"
+    with _groups_lock:
+        with open(tmp, "w") as f:
+            json.dump(d, f, indent=1)
+        os.replace(tmp, GROUPS_PATH)
+
+
+def t_group_form(a):
+    """创建一个多节点工作群组。"""
+    gname = a.get("name", "")
+    members = a.get("members", [])
+    purpose = a.get("purpose", "")
+    if not gname:
+        return "name 不能为空", True
+    my_name = CFG.get("name", "node")
+    if my_name not in members:
+        members.append(my_name)
+    groups = _load_groups()
+    groups[gname] = {"members": members, "purpose": purpose,
+                     "created": time.strftime("%Y-%m-%d %H:%M:%S"), "leader": my_name}
+    _save_groups(groups)
+    # 通知其他成员
+    peers = load_peers()
+    for m in members:
+        if m == my_name:
+            continue
+        if m in peers:
+            try:
+                peer_call(peers[m]["url"], peers[m].get("token", ""),
+                          "msg_send", {"from": my_name, "to": m, "topic": "group-invite",
+                                       "text": json.dumps({"group": gname, "purpose": purpose})},
+                          timeout=10)
+            except Exception:
+                pass
+    return "群组 %s 已创建，成员: %s" % (gname, ", ".join(members)), False
+
+
+def t_group_list(a):
+    """列出所有工作群组。"""
+    groups = _load_groups()
+    if not groups:
+        return "（没有群组）", False
+    lines = []
+    for gname, info in groups.items():
+        lines.append("%s [%s]: %s (成员: %s)" % (gname, info.get("leader", "?"),
+                     info.get("purpose", ""), ", ".join(info.get("members", []))))
+    return "\n".join(lines), False
+
+
+def t_group_disband(a):
+    """解散一个工作群组。"""
+    gname = a.get("name", "")
+    groups = _load_groups()
+    if gname not in groups:
+        return "群组 %s 不存在" % gname, True
+    del groups[gname]
+    _save_groups(groups)
+    return "群组 %s 已解散" % gname, False
+
+
+# ---------------------------------------------------------------------------
+# Mesh 拓扑
+# ---------------------------------------------------------------------------
+def t_mesh(a):
+    """返回 mesh 拓扑信息：本节点 + 所有 peers 的在线状态和能力摘要。"""
+    my_name = CFG.get("name", "node")
+    peers = load_peers()
+    topology = {"self": {"name": my_name, "caps": get_caps(), "online": True}}
+    topology["peers"] = {}
+    for pname, pinfo in peers.items():
+        entry = {"url": pinfo.get("url", ""), "tailnet": pinfo.get("tailnet", False)}
+        # 探活
+        try:
+            text, is_err = peer_call(pinfo["url"], pinfo.get("token", ""),
+                                     "peer_info", {}, timeout=8)
+            entry["online"] = not is_err
+            if not is_err:
+                try:
+                    entry["info"] = json.loads(text)
+                except ValueError:
+                    entry["info"] = text
+        except Exception:
+            entry["online"] = False
+        topology["peers"][pname] = entry
+    return json.dumps(topology, ensure_ascii=False), False
+
+
+# ---------------------------------------------------------------------------
+# v4.0 工具注册
+# ---------------------------------------------------------------------------
+COLLAB_TOOLS = [
+    ("caps", "返回本节点的能力清单（Docker/GPU/Tailscale/网络/工具列表等）。",
+     {"type": "object", "properties": {}}),
+    ("mesh_caps", "查询 mesh 内所有节点的能力清单（本机 + 所有 peers），用于发现谁有某能力。",
+     {"type": "object", "properties": {}}),
+    ("delegate", "在 mesh 中委派任务：指定需要的能力（如 docker/gpu），自动找到匹配的节点执行。",
+     {"type": "object", "properties": {
+         "capability": {"type": "string", "description": "需要的能力，如 docker / gpu / tailscale"},
+         "tool": {"type": "string", "description": "在对端调用的工具名，如 exec / docker_ps"},
+         "arguments": {"type": "object", "description": "传给工具的参数"},
+         "timeout": {"type": "number", "description": "超时秒数，默认 120"}},
+      "required": ["capability", "tool"]}),
+    ("group_form", "创建多节点工作群组，成员收到邀请消息。",
+     {"type": "object", "properties": {
+         "name": {"type": "string"}, "members": {"type": "array", "items": {"type": "string"}},
+         "purpose": {"type": "string"}},
+      "required": ["name"]}),
+    ("group_list", "列出所有工作群组。",
+     {"type": "object", "properties": {}}),
+    ("group_disband", "解散一个工作群组。",
+     {"type": "object", "properties": {"name": {"type": "string"}}, "required": ["name"]}),
+    ("mesh", "返回 mesh 拓扑：本节点 + 所有 peers 的在线状态和能力摘要。",
+     {"type": "object", "properties": {}}),
+]
+
+COLLAB_FUNCS = {
+    "caps": t_caps, "mesh_caps": t_mesh_caps, "delegate": t_delegate,
+    "group_form": t_group_form, "group_list": t_group_list,
+    "group_disband": t_group_disband, "mesh": t_mesh,
+}
 
 # ---------------------------------------------------------------------------
 # 工具清单（base 名，暴露时按 tool_prefix 加前缀）
@@ -955,18 +1752,20 @@ BASE_TOOLS = [
      {"type": "object", "properties": {"job_id": {"type": "string"}}, "required": ["job_id"]}),
     ("exec_jobs", "列出当前所有后台任务（job_id / 状态 / 输出大小）。",
      {"type": "object", "properties": {}}),
-    ("msg_send", "节点间对话：给另一个 AI 发消息（存进本节点邮箱）。from=你的名字, to=对方名字或 *。",
+    ("msg_send", "节点间消息：给另一个 AI/节点发消息（存进本节点邮箱）。from=你的名字, to=对方名字或 *(广播), topic=可选主题。",
      {"type": "object", "properties": {
-         "from": {"type": "string"}, "to": {"type": "string"}, "text": {"type": "string"}},
+         "from": {"type": "string"}, "to": {"type": "string"}, "text": {"type": "string"},
+         "topic": {"type": "string", "description": "可选主题/频道，如 fleet-join, task-request"}},
       "required": ["from", "to", "text"]}),
-    ("msg_recv", "节点间对话：收发给我的新消息；wait=秒（最多300）没有新消息时阻塞等待。默认读后标记已读。",
+    ("msg_recv", "节点间消息：收发给我的新消息；wait=秒（最多300）没有新消息时阻塞等待。topic=只收该主题。",
      {"type": "object", "properties": {
          "me": {"type": "string"}, "wait": {"type": "number"},
          "after_id": {"type": "number", "description": "只取 id 大于它的消息（不改已读位置）"},
-         "peek": {"type": "boolean", "description": "只看不标记已读"}},
+         "peek": {"type": "boolean", "description": "只看不标记已读"},
+         "topic": {"type": "string", "description": "只收该主题的消息"}},
       "required": ["me"]}),
-    ("msg_history", "节点间对话：查看邮箱最近 N 条（所有人）。",
-     {"type": "object", "properties": {"lines": {"type": "number"}}}),
+    ("msg_history", "节点间消息：查看邮箱最近 N 条（可按主题过滤）。",
+     {"type": "object", "properties": {"lines": {"type": "number"}, "topic": {"type": "string"}}}),
 ]
 
 BASE_FUNCS = {
@@ -979,6 +1778,12 @@ BASE_FUNCS = {
     "exec_jobs": t_exec_jobs,
     "msg_send": t_msg_send, "msg_recv": t_msg_recv, "msg_history": t_msg_history,
 }
+if CFG.get("peer_tools", True):
+    BASE_TOOLS += PEER_TOOLS
+    BASE_FUNCS.update(PEER_FUNCS)
+if CFG.get("collab_tools", True):
+    BASE_TOOLS += COLLAB_TOOLS
+    BASE_FUNCS.update(COLLAB_FUNCS)
 
 # 对外暴露的工具（含前缀）
 TOOLS = []
@@ -1156,6 +1961,10 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         if self._guard():
             return
+        try:
+            _REQ.hops = max(0, int(self.headers.get("X-Fleet-Hops") or 0))
+        except ValueError:
+            _REQ.hops = 0
         path = self.path.split("?")[0].rstrip("/")
         # 边界校验：length 原来直接取自请求头且无上限 —— -1 会一直读到 EOF，
         # 超大值会一次性吃满内存，单连接即可长时间占住一个线程。
@@ -1182,6 +1991,83 @@ class Handler(BaseHTTPRequestHandler):
                 except Exception:
                     pass
             self._empty(202)
+            return
+
+        # ---- v4.1: 自研通讯协议端点 ----
+        if path == "/fleet/mail":
+            """接收来自其他节点的消息，存入本地 inbox。"""
+            try:
+                payload = json.loads(raw.decode("utf-8"))
+            except Exception:
+                self._json(400, {"error": "bad json"})
+                return
+            if _mail_engine:
+                msg = {
+                    "from": payload.get("from", ""),
+                    "to": payload.get("to", ""),
+                    "text": payload.get("text", ""),
+                    "ts": payload.get("ts", time.strftime("%Y-%m-%d %H:%M:%S")),
+                }
+                if payload.get("topic"):
+                    msg["topic"] = payload["topic"]
+                if payload.get("msg_id"):
+                    msg["msg_id"] = payload["msg_id"]
+                if payload.get("source_node"):
+                    msg["source_node"] = payload["source_node"]
+                _mail_engine.inbox_append(msg)
+                self._json(200, {"ok": True, "id": msg.get("id")})
+            else:
+                self._json(503, {"error": "proto not initialized"})
+            return
+
+        if path == "/fleet/discover":
+            """节点握手：交换信息，自动互加 peer。"""
+            try:
+                payload = json.loads(raw.decode("utf-8"))
+            except Exception:
+                self._json(400, {"error": "bad json"})
+                return
+            peer_name = payload.get("name", "")
+            peer_url = payload.get("url", "")
+            if peer_name and peer_url:
+                try:
+                    with PEERS_LOCK:
+                        d = load_peers()
+                        d["nodes"][peer_name] = {"url": peer_url, "token": "",
+                                                "added_by": "discover", "updated": int(time.time())}
+                        save_peers(d)
+                except Exception:
+                    pass
+            self._json(200, {"name": SERVER_NAME, "url": self_url(),
+                            "version": SERVER_VERSION, "ok": True})
+            return
+
+        if path == "/fleet/sync":
+            """邮箱同步 gossip：对方告诉我它的 agent，我返回我的摘要。"""
+            try:
+                payload = json.loads(raw.decode("utf-8"))
+            except Exception:
+                payload = {}
+            if _mail_engine:
+                summary = _mail_engine.sync_summary()
+                self._json(200, summary)
+            else:
+                self._json(503, {"error": "proto not initialized"})
+            return
+
+        if path == "/fleet/register_agent":
+            """agent 注册到本节点。"""
+            try:
+                payload = json.loads(raw.decode("utf-8"))
+            except Exception:
+                self._json(400, {"error": "bad json"})
+                return
+            agent_name = payload.get("name", "")
+            if agent_name and _mail_engine:
+                _mail_engine.register_agent(agent_name)
+                self._json(200, {"ok": True, "agent": agent_name})
+            else:
+                self._json(400, {"error": "missing name"})
             return
 
         if path not in ("/mcp", "/rpc", ""):
@@ -1224,7 +2110,6 @@ class Handler(BaseHTTPRequestHandler):
                     "auth": bool(CFG.get("auth_token") or ""),
                     "allow_ips": CFG.get("allow_ips") or [],
                     "transports": ["POST /mcp (streamable-http)", "GET /sse (sse)"],
-                    "tailscale_ip": tailscale_ip(),
                 })
             self._json(200, body)
             return
@@ -1265,6 +2150,27 @@ class Handler(BaseHTTPRequestHandler):
                 with SSE_LOCK:
                     SSE_ACTIVE -= 1
             return
+        # v4.1: poll 端点 -- 上线收信
+        if path == "/fleet/poll":
+            qs = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query)
+            name = (qs.get("name", [""])[0]).strip()
+            if not name:
+                self._json(400, {"error": "missing name param"})
+                return
+            if _mail_engine:
+                msgs = _mail_engine.poll_for_agent(name)
+                self._json(200, {"messages": msgs, "count": len(msgs)})
+            else:
+                self._json(503, {"error": "proto not initialized"})
+            return
+
+        if path == "/fleet/status":
+            if _mail_engine:
+                self._json(200, _mail_engine.stats())
+            else:
+                self._json(200, {"proto": False})
+            return
+
         if path in ("/mcp", "/rpc"):
             # MCP 规范：服务端不提供 GET 流时必须回 405。原来回 404，而 404 在规范里
             # 表示「会话已失效」——部分客户端（含带 Mcp-Session-Id 的重连）据此
@@ -1310,6 +2216,8 @@ def main():
               file=sys.stderr)
         sys.exit(2)
 
+    global LISTEN_PORT
+    LISTEN_PORT = args.port
     httpd = FleetHTTPServer((args.host, args.port), Handler)
     print("MCP 副端 Agent 已启动: %s v%s" % (SERVER_NAME, SERVER_VERSION))
     print("  Streamable HTTP : http://%s:%d/mcp" % (args.host, args.port))
@@ -1334,6 +2242,56 @@ def main():
         print("  " + "!" * 68)
     if nets:
         print("  来源白名单      : %s" % ", ".join(str(n) for n in nets))
+    # ---- v4.1: 自研通讯协议启动 ----
+    _init_proto()
+    if _HAS_PROTO and _mail_engine:
+        print("  通讯协议        : fleet-proto v%d (store-and-forward)" % PROTO_VERSION)
+        # UDP 发现层
+        caps_summary = {"docker": CFG.get("enable_docker", True),
+                        "tools": len(TOOLS)}
+        _discovery_layer = DiscoveryLayer(
+            SERVER_NAME, args.port, caps=caps_summary,
+            discover_port=int(CFG.get("discover_port", 3199)),
+            on_discover=_on_discover)
+        _discovery_layer.start()
+        print("  UDP 发现        : 端口 %d (每 %ds 广播)" % (
+            int(CFG.get("discover_port", 3199)), 30))
+        # 消息投递 daemon
+        if _delivery_engine:
+            _delivery_engine.start_delivery()
+            print("  消息投递        : 后台 daemon (每 %ds 重试 outbox)" % 15)
+        # 邮箱同步 daemon
+        if _sync_engine:
+            _sync_engine.start_sync()
+            print("  邮箱同步        : 后台 daemon (每 %ds gossip)" % 60)
+    else:
+        print("  通讯协议        : 旧版邮箱（fleet_proto 不可用）")
+
+    # ---- v4.0: Tailscale 自动组网（可选增强）----
+    if CFG.get("tailnet_auto_mesh", True):
+        ts_ip = _tailscale_ip()
+        if ts_ip:
+            print("  Tailscale       : 在线 (%s)" % ts_ip)
+            discovered = _auto_discover_peers(args.port)
+            if discovered:
+                print("  自动发现        : %d 个 fleet 节点 -> %s" %
+                      (len(discovered), ", ".join(n for n, _ in discovered)))
+            else:
+                print("  自动发现        : tailnet 上暂无其他 fleet 节点")
+            # 启动后台线程：定期扫描 + 上线广播
+            def _mesh_daemon():
+                _broadcast_join()
+                while True:
+                    time.sleep(int(CFG.get("tailnet_scan_interval", 60)))
+                    try:
+                        _auto_discover_peers(args.port)
+                    except Exception:
+                        pass
+            t = threading.Thread(target=_mesh_daemon, daemon=True)
+            t.start()
+        else:
+            print("  Tailscale       : 未安装或未登录（--tailnet 安装时自动配置）")
+
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:

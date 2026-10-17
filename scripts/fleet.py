@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-mcp-fleet 统一命令行 —— 主端操作副端集群
+mcp-fleet 统一命令行 —— 节点之间互相操控（不分主副，谁发起谁就是控制方）
 =========================================
 零依赖（只用 Python 3 标准库），可在任何 agent / 任何操作系统上运行。
 
@@ -26,6 +26,7 @@ mcp-fleet 统一命令行 —— 主端操作副端集群
   sync [名字...]                按地址目录刷新副端地址（隧道换域名后自动跟随）
   directory                     查看/设置地址目录（副端上报地址、主端自动跟随）
   targets                       列出所有可作为 target 的名字与地址
+  pair <对方地址|名字>          双向配对（v3.5）：互相登记，之后两边都能控制对方
 
 target 写法
 -----------
@@ -52,8 +53,6 @@ target 写法
   python fleet.py sync cloud
 """
 import argparse
-import io
-import ipaddress
 import json
 import os
 import re
@@ -64,29 +63,30 @@ import subprocess
 import sys
 import time
 import urllib.error
-import urllib.parse
 import urllib.request
 
 # ---------------------------------------------------------------- 基础
 
-VERSION = "1.1.1"
-REGISTRY = os.path.join(os.path.expanduser("~"), ".mcp-fleet", "nodes.json")
+VERSION = "1.2.0"
 PROTOCOL = "2024-11-05"
 HERE = os.path.dirname(os.path.abspath(__file__))
+# 登记表位置：
+#   * 本脚本装在节点目录里（同目录有 mcp_agent_config.json，v3.5 安装器会这么放）
+#     → 用 <节点目录>/peers.json，与本节点 agent 的 peers / peer_call 工具共用一份对等节点表；
+#   * 否则（如只当控制端的 Windows 电脑）→ ~/.mcp-fleet/nodes.json。
+#   FLEET_REGISTRY 环境变量可强制指定。
+if os.environ.get("FLEET_REGISTRY"):
+    REGISTRY = os.environ["FLEET_REGISTRY"]
+elif os.path.isfile(os.path.join(HERE, "mcp_agent_config.json")):
+    REGISTRY = os.path.join(HERE, "peers.json")
+else:
+    REGISTRY = os.path.join(os.path.expanduser("~"), ".mcp-fleet", "nodes.json")
 
-for _name in ("stdout", "stderr"):    # Windows 控制台默认 GBK / Linux C locale 是 ascii，中文会炸
-    _stream = getattr(sys, _name)
-    if hasattr(_stream, "reconfigure"):
-        try:
-            _stream.reconfigure(encoding="utf-8", errors="replace")
-        except Exception:
-            pass
-    else:                             # Python 3.6 没有 reconfigure
-        try:
-            setattr(sys, _name, io.TextIOWrapper(_stream.buffer, encoding="utf-8",
-                                                 errors="replace", line_buffering=True))
-        except Exception:
-            pass
+try:                                  # Windows 控制台默认 GBK，中文会炸
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+except Exception:
+    pass
 
 C_OK, C_ERR, C_WARN, C_DIM, C_OFF = "\033[32m", "\033[31m", "\033[33m", "\033[2m", "\033[0m"
 if os.environ.get("NO_COLOR") or not sys.stdout.isatty():
@@ -118,98 +118,23 @@ def die(msg, code=1):
     return code
 
 
-# ---------------------------------------------------------------- 传输：按目标地址选代理
-# Tailscale 给节点分配的是 CGNAT 段 100.64.0.0/10（RFC 6598）。Python 的
-# ipaddress.is_private 对它返回 False，于是配了 HTTP(S)_PROXY 的机器会把 tailnet
-# 节点也丢给代理 —— 代理那头根本到不了 100.x，回个 404/502/超时。
-# 规则（v3.4.1）：
-#   1. tailnet 地址（100.64/10、fd7a:115c:a1e0::/48、*.ts.net）：
-#      有「tailnet 隧道代理」（FLEET_TAILNET_PROXY，或托管沙盒的 hatch-egress-proxy:3130）
-#      就走它；没有就直连（忽略 http_proxy）。
-#   2. 其他内网 / 本机地址：直连（忽略 http_proxy）。
-#   3. 公网：照常走系统代理。
-_TAILNET_V4 = ipaddress.ip_network("100.64.0.0/10")
-_TAILNET_V6 = ipaddress.ip_network("fd7a:115c:a1e0::/48")   # Tailscale ULA（is_private 本来就 True，写明意图）
-
-
-def _tailnet_proxy_url():
-    """Tailscale 内网地址要走的隧道代理；没有返回 None（= 直连）。
-
-    托管沙盒里直连被运行时网络策略拦截，tailnet 流量必须经隧道代理
-    （与 HTTPS_PROXY 同主机、端口 3130）。显式设置 FLEET_TAILNET_PROXY 可覆盖。
-    普通机器上的 HTTP(S)_PROXY（Clash 之类）到不了 tailnet，不会被当成隧道代理。
-    """
-    explicit = os.environ.get("FLEET_TAILNET_PROXY", "").strip()
-    if explicit:
-        return explicit
-    for var in ("HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy"):
-        v = os.environ.get(var, "")
-        if v and "hatch-egress-proxy" in v:
-            head, sep, _port = v.rpartition(":")
-            if sep:
-                return head + ":3130"
-    return None
-
-
-def _is_tailnet_host(host):
-    """tailnet IP（100.64/10 或 fd7a:115c:a1e0::/48）？只认 IP，不认主机名。"""
-    try:
-        ip = ipaddress.ip_address((host or "").strip("[]"))
-    except ValueError:
-        return False
-    if ip.version == 4:
-        return ip in _TAILNET_V4
-    return ip in _TAILNET_V6
-
-
-def _is_direct_host(host):
-    """内网 / 本机 / tailnet 地址：不走 http_proxy。"""
-    host = (host or "").strip("[]").lower().rstrip(".")
-    if not host:
-        return False
-    if host == "localhost" or host.endswith(".localhost") or host.endswith(".local"):
-        return True
-    if host.endswith(".ts.net"):          # MagicDNS 全名：<机器>.<tailnet>.ts.net
-        return True
-    if _is_tailnet_host(host):
-        return True
-    try:
-        ip = ipaddress.ip_address(host)
-    except ValueError:
-        return False
-    return ip.is_private or ip.is_loopback or ip.is_link_local
-
-
-_DIRECT_OPENER = None
-_DEFAULT_OPENER = None
-_TUNNEL_OPENERS = {}
+# ---------------------------------------------------------------- MCP 客户端
 
 
 def _opener_for(url):
-    """按目标地址选 opener（规则见上）。所有 HTTP 请求都经这里，不要裸调 urlopen。"""
-    global _DIRECT_OPENER, _DEFAULT_OPENER
+    """内网/本机地址不走 http_proxy：机器上配了代理时，局域网节点会被代理成 404/超时。"""
+    import ipaddress
+    import urllib.parse
+    host = urllib.parse.urlsplit(url).hostname or ""
+    direct = host == "localhost" or host.endswith(".local")
     try:
-        host = (urllib.parse.urlsplit(url).hostname or "").lower().rstrip(".")
+        ip = ipaddress.ip_address(host)
+        direct = direct or ip.is_private or ip.is_loopback or ip.is_link_local
     except ValueError:
-        host = ""
-    if _is_tailnet_host(host) or host.endswith(".ts.net"):
-        proxy = _tailnet_proxy_url()
-        if proxy:
-            op = _TUNNEL_OPENERS.get(proxy)
-            if op is None:
-                op = _TUNNEL_OPENERS[proxy] = urllib.request.build_opener(
-                    urllib.request.ProxyHandler({"http": proxy, "https": proxy}))
-            return op
-    if _is_direct_host(host):
-        if _DIRECT_OPENER is None:
-            _DIRECT_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
-        return _DIRECT_OPENER
-    if _DEFAULT_OPENER is None:
-        _DEFAULT_OPENER = urllib.request.build_opener()
-    return _DEFAULT_OPENER
-
-
-# ---------------------------------------------------------------- MCP 客户端
+        pass
+    if direct:
+        return urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    return urllib.request.build_opener()
 
 
 class MCPError(Exception):
@@ -227,58 +152,35 @@ class MCPClient:
         self.token = (token or "").strip()
 
     # -- 传输层 --------------------------------------------------
-    def _post(self, payload, timeout=None, retry=False):
-        """retry=True 时，对连接类错误（URLError/超时）重试一次（1s 退避）。
-
-        只用于 initialize / tools/list 这类幂等只读调用 —— exec 等写操作
-        绝不能自动重试（会执行两次）。"""
+    def _post(self, payload, timeout=None):
         data = json.dumps(payload).encode("utf-8")
-
-        def _once():
-            req = urllib.request.Request(
-                self.url, data=data, method="POST",
-                headers={"Content-Type": "application/json",
-                         "Accept": "application/json, text/event-stream"})
-            if self.token:
-                req.add_header("Authorization", "Bearer " + self.token)
-            if self.sid:
-                req.add_header("Mcp-Session-Id", self.sid)
-            try:
-                with _opener_for(req.full_url).open(req, timeout=timeout or self.timeout) as r:
-                    if r.headers.get("Mcp-Session-Id"):
-                        self.sid = r.headers["Mcp-Session-Id"]
-                    return r.read().decode("utf-8", "ignore")
-            except urllib.error.HTTPError as e:
-                if e.code in (401, 403):
-                    hint = ("副端开了鉴权，但本地没有它的 token。\n"
-                            "     补一个： python fleet.py add --name <名字> --url %s --token <令牌>\n"
-                            "     （令牌在副端 mcp_agent_config.json 的 auth_token，"
-                            "或跑 `bash mcp-ctl.sh` 时打印过）" % self.url) if not self.token else \
-                           ("副端拒绝了令牌（HTTP %d）。确认 auth_token 与主端填的一致，"
-                            "或本机 IP 不在 allow_ips 白名单里。" % e.code)
-                    raise MCPError("HTTP %s %s\n     %s" % (e.code, e.reason, hint))
-                raise MCPError("HTTP %s %s" % (e.code, e.reason))
-            except urllib.error.URLError as e:
-                raise MCPError("连不上 %s（%s）" % (self.url, e.reason))
-            except socket.timeout:
-                raise MCPError("超时（%ss）" % (timeout or self.timeout))
-
-        attempts = 2 if retry else 1
-        last = None
-        for i in range(attempts):
-            try:
-                body = _once()
-                break
-            except MCPError as e:
-                # 只重试「连不上/超时」这类传输层失败；401/403、HTTP 错误不重试
-                msg = str(e)
-                if retry and ("连不上" in msg or "超时" in msg) and i < attempts - 1:
-                    last = e
-                    time.sleep(1)
-                    continue
-                raise
-        else:
-            raise last
+        req = urllib.request.Request(
+            self.url, data=data, method="POST",
+            headers={"Content-Type": "application/json",
+                     "Accept": "application/json, text/event-stream"})
+        if self.token:
+            req.add_header("Authorization", "Bearer " + self.token)
+        if self.sid:
+            req.add_header("Mcp-Session-Id", self.sid)
+        try:
+            with _opener_for(self.url).open(req, timeout=timeout or self.timeout) as r:
+                if r.headers.get("Mcp-Session-Id"):
+                    self.sid = r.headers["Mcp-Session-Id"]
+                body = r.read().decode("utf-8", "ignore")
+        except urllib.error.HTTPError as e:
+            if e.code in (401, 403):
+                hint = ("副端开了鉴权，但本地没有它的 token。\n"
+                        "     补一个： python fleet.py add --name <名字> --url %s --token <令牌>\n"
+                        "     （令牌在副端 /opt/<名字>_mcp/mcp_agent_config.json 的 auth_token，"
+                        "或跑 `bash mcp-ctl.sh` 时打印过）" % self.url) if not self.token else \
+                       ("副端拒绝了令牌（HTTP %d）。确认 auth_token 与主端填的一致，"
+                        "或本机 IP 不在 allow_ips 白名单里。" % e.code)
+                raise MCPError("HTTP %s %s\n     %s" % (e.code, e.reason, hint))
+            raise MCPError("HTTP %s %s" % (e.code, e.reason))
+        except urllib.error.URLError as e:
+            raise MCPError("连不上 %s（%s）" % (self.url, e.reason))
+        except socket.timeout:
+            raise MCPError("超时（%ss）" % (timeout or self.timeout))
         # 兼容 SSE 帧
         for line in body.splitlines():
             if line.startswith("data:"):
@@ -295,7 +197,7 @@ class MCPClient:
     def handshake(self):
         r = self._post({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {
             "protocolVersion": PROTOCOL, "capabilities": {},
-            "clientInfo": {"name": "mcp-fleet", "version": VERSION}}}, retry=True)
+            "clientInfo": {"name": "mcp-fleet", "version": VERSION}}})
         self.info = r.get("result", {}).get("serverInfo", {}) or {}
         try:
             self._post({"jsonrpc": "2.0", "method": "notifications/initialized",
@@ -305,8 +207,7 @@ class MCPClient:
         return self.info
 
     def list_tools(self):
-        r = self._post({"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}},
-                       retry=True)
+        r = self._post({"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}})
         if "error" in r:
             raise MCPError(str(r["error"]))
         return r.get("result", {}).get("tools", [])
@@ -337,7 +238,7 @@ def http_probe(base_url, timeout=8, token="", retries=3):
     last_err = None
     for attempt in range(max(1, retries + 1)):
         try:
-            with _opener_for(req.full_url).open(req, timeout=timeout) as r:
+            with urllib.request.urlopen(req, timeout=timeout) as r:
                 return json.loads(r.read().decode("utf-8", "ignore") or "{}")
         except Exception as e:
             last_err = e
@@ -393,18 +294,11 @@ def domain_ok(cur_url, new_url):
     xxx.trycloudflare.com → yyy.trycloudflare.com）。注册域都变了
     （例如跳到 evil.example.com）则拒绝，需人工确认。
     设 FLEET_ALLOW_DOMAIN_CHANGE=1 可显式放行。
-
-    例外：同属一个 tailnet（100.64.0.0/10 / fd7a:115c:a1e0::/48）的 IP 之间
-    漂移直接放行 —— Tailscale 节点重装 / 重登录会换 IP（2026-10-12 手机
-    100.103.118.7 → 100.81.253.35 就是一例），这是常态不是投毒。
-    真正的鉴权由后面的「匿名探活 + Bearer token 探活」两道闸门保证。
     """
     ch, nh = host_of(cur_url), host_of(new_url)
     if not ch or not nh:
         return True
     if ch == nh:
-        return True
-    if _is_tailnet_host(ch) and _is_tailnet_host(nh):
         return True
     same = reg_suffix(ch) == reg_suffix(nh)
     if same:
@@ -426,7 +320,7 @@ def probe_anonymous(url, timeout=6):
         req = urllib.request.Request(
             url, method="POST", data=json.dumps(payload).encode("utf-8"),
             headers={"Content-Type": "application/json", "Accept": "application/json"})
-        with _opener_for(req.full_url).open(req, timeout=timeout) as r:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
             body = r.read(8192).decode("utf-8", "ignore")
         return ("jsonrpc" in body) or ("serverInfo" in body)
     except urllib.error.HTTPError as e:
@@ -613,7 +507,7 @@ def fetch_directory(url=None, token=None, timeout=6):
     req = urllib.request.Request(url + "/nodes", method="GET")
     if token:
         req.add_header("X-Fleet-Token", token)
-    with _opener_for(req.full_url).open(req, timeout=timeout) as r:
+    with urllib.request.urlopen(req, timeout=timeout) as r:
         data = json.loads(r.read().decode("utf-8", "ignore") or "{}")
     return data.get("nodes") or {}
 
@@ -686,142 +580,6 @@ def sync_from_directory(name, cur_url=None, timeout=8, quiet=False, verbose=True
     return new_mcp
 
 
-# ------------------------------------------------ Tailscale IP 漂移自动纠正
-# 背景：Tailscale 节点重装 / 重登录会换 IP（如手机 100.103.118.7 →
-# 100.81.253.35），主端登记表里的旧地址随即失效。地址目录（directory）
-# 机制要求额外部署目录服务器，且 domain_ok 本来就拒绝 IP→IP 变更，
-# 所以这里走权威得多的渠道：Tailscale 控制面 API。
-#
-# 一次性准备（老郭操作一次即可）：
-#   1. https://login.tailscale.com/admin/settings/keys → Generate API access token
-#      （或 OAuth client），只需要 devices:read 权限；
-#   2. export TAILSCALE_API_KEY='tskey-api-...'（或写进 ~/.mcp-fleet/nodes.json
-#      顶层的 "tailscale_api_key" —— 注意该文件权限应为 0600）；
-#   3. 给 tailnet 节点登记 MagicDNS 主机名：
-#      python fleet.py add --name phone --ip <当前IP> --tailnet phone --force
-# 之后节点 IP 再漂移，主端会在探测失败时自动用 API 查最新 IP 并更新登记表。
-
-def tailscale_api_key():
-    """Tailscale API 密钥：环境变量优先，其次登记表顶层配置。"""
-    k = (os.environ.get("TAILSCALE_API_KEY") or "").strip()
-    if k:
-        return k
-    try:
-        return (load_registry().get("tailscale_api_key") or "").strip()
-    except Exception:
-        return ""
-
-
-def tailscale_device_ips(timeout=10):
-    """查 Tailscale 控制面，返回 {hostname小写: [ip,...]}。
-
-    无密钥返回 None（调用方据此跳过，不报错）；API 异常则抛给调用方处理。
-    """
-    key = tailscale_api_key()
-    if not key:
-        return None
-    req = urllib.request.Request(
-        "https://api.tailscale.com/api/v2/tailnet/-/devices?fields=all",
-        headers={"Authorization": "Bearer " + key})
-    with _opener_for(req.full_url).open(req, timeout=timeout) as r:
-        devs = json.loads(r.read().decode("utf-8", "ignore") or "{}").get("devices") or []
-    out = {}
-    for dv in devs:
-        hn = (dv.get("hostname") or dv.get("name") or "").lower()
-        ips = []
-        for a in dv.get("addresses") or []:
-            ip = (a or "").split("/")[0]
-            if ip:
-                ips.append(ip)
-        if hn and ips:
-            out[hn] = ips
-    return out
-
-
-def _pick_tailnet_ip(ips):
-    """优先选 IPv4 tailnet 地址（100.64/10），其次第一个。"""
-    for ip in ips or []:
-        if _is_tailnet_host(ip) and "." in ip:
-            return ip
-    return (ips or [None])[0]
-
-
-def sync_from_tailnet(name, cur_url=None, token="", timeout=8, quiet=False, verbose=True):
-    """用 Tailscale API 纠正节点的漂移 IP。返回新 url；无需/无法纠正返回 None。
-
-    流程：登记表取 tailnet 主机名 → API 查当前 IP → 与现地址比对 →
-    无变化直接返回；有变化则「匿名探活 + Bearer 探活」双验证通过后回写登记表。
-    数据源是用户自己的 tailnet 控制面（可信），再加上 token 鉴权探活，
-    不会被投毒。
-    """
-    try:
-        node = (load_registry().get("nodes") or {}).get(name) or {}
-    except Exception:
-        return None
-    thost = (node.get("tailnet") or "").strip().lower()
-    if not thost:
-        return None
-    try:
-        devs = tailscale_device_ips(timeout)
-    except Exception as e:
-        if not quiet:
-            print(warn("Tailscale API 查询失败：%s" % e), file=sys.stderr)
-        return None
-    if devs is None:
-        if verbose and not quiet:
-            print(dim("未配置 TAILSCALE_API_KEY，跳过 tailnet IP 自动纠正"
-                      "（https://login.tailscale.com/admin/settings/keys 建一个 devices:read 的 token）"),
-                  file=sys.stderr)
-        return None
-    ips = devs.get(thost)
-    if not ips:
-        if not quiet:
-            print(warn("Tailscale 里找不到主机 %r（检查 fleet.py add --tailnet 写的主机名）" % thost),
-                  file=sys.stderr)
-        return None
-    new_ip = _pick_tailnet_ip(ips)
-    if not new_ip:
-        return None
-    cur_host = host_of(cur_url) if cur_url else ""
-    if cur_host and cur_host.lower() == new_ip.lower():
-        return None                      # 没漂移
-    try:
-        from urllib.parse import urlparse
-        port = urlparse(cur_url).port if cur_url else None
-    except Exception:
-        port = None
-    new_mcp = "http://%s:%d/mcp" % (new_ip, port or 3100)
-    if new_mcp == cur_url:
-        return None
-    # ---- 双重验证：先确认对面像副端，再带 token 确认是「我们」的副端 ----
-    if not probe_anonymous(new_mcp, timeout=min(timeout, 6)):
-        if not quiet:
-            print(warn("Tailscale 给的 %s 看起来不是 MCP 副端，放弃纠正" % new_mcp),
-                  file=sys.stderr)
-        return None
-    try:
-        if not http_probe(new_mcp, timeout=min(timeout, 6), token=token):
-            raise RuntimeError("无响应")
-    except Exception:
-        if not quiet:
-            print(warn("Tailscale 给的 %s 鉴权探活失败（副端可能还没起来）" % new_mcp),
-                  file=sys.stderr)
-        return None
-    reg = load_registry()
-    node = (reg.get("nodes") or {}).get(name)
-    if node is not None:
-        old = node.get("url")
-        node["url"] = new_mcp
-        node["url_prev"] = old
-        node["tailnet_ip"] = new_ip
-        node["synced_at"] = int(time.time())
-        save_registry(reg)
-    if verbose:
-        print(ok("tailnet IP 已自动纠正：%s → %s" % (cur_url or "(空)", new_mcp)),
-              file=sys.stderr)
-    return new_mcp
-
-
 def resolve_target(target, agent=None, port=3100, sync=None):
     """名字 → url；也接受直接给地址（URL / IPv4 / 带点的主机名）。返回 (url, meta)。"""
     t = (target or "").strip()
@@ -837,15 +595,6 @@ def resolve_target(target, agent=None, port=3100, sync=None):
             if new:
                 url = new
                 m = dict(m, url=new)
-        # tailnet IP 纠正：directory 机制管不了 Tailscale 漂移，这里补上。
-        # 故意不受 --no-sync 影响（健康看门用 --no-sync 跑 probe，照样能自愈）；
-        # 关掉：FLEET_NO_TAILNET_SYNC=1。无 API key 或无 tailnet 字段时是空操作。
-        if url and os.environ.get("FLEET_NO_TAILNET_SYNC") != "1":
-            new2 = sync_from_tailnet(t, url, token=m.get("token", ""),
-                                    quiet=True, verbose=False)
-            if new2:
-                url = new2
-                m = dict(m, url=new2)
         return url, m
     for n, m in nodes.items():        # 允许 http://... 直接当 key 写进过配置
         if m["url"] == t:
@@ -1405,7 +1154,7 @@ def cmd_bootstrap(a):
     print("== bootstrap %s ==" % dest)
     try:
         r = subprocess.run(ssh_base + ["echo SSH_OK; id -u; uname -srm"],
-                           stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True, timeout=a.timeout + 20)
+                           capture_output=True, text=True, timeout=a.timeout + 20)
     except subprocess.TimeoutExpired:
         return die("SSH 连接超时")
     if r.returncode != 0:
@@ -1416,7 +1165,7 @@ def cmd_bootstrap(a):
     if use_local:
         print("[.] 上传本地 install.sh（离线，不依赖副设备外网）…")
         r = subprocess.run(scp_base + [local, "%s:%s" % (dest, tmp)],
-                           stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True, timeout=a.timeout + 60)
+                           capture_output=True, text=True, timeout=a.timeout + 60)
         if r.returncode != 0:
             return die("上传失败：%s" % r.stderr.strip()[:300])
         remote = "sudo bash %s %s" % (tmp, opts)
@@ -1433,7 +1182,7 @@ def cmd_bootstrap(a):
         return 0
 
     print("[.] 远程安装中（可能要 1-2 分钟）…")
-    r = subprocess.run(ssh_base + [remote], stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True, timeout=a.timeout + 300)
+    r = subprocess.run(ssh_base + [remote], capture_output=True, text=True, timeout=a.timeout + 300)
     out = (r.stdout or "") + (r.stderr or "")
     tail = [l for l in out.splitlines() if l.strip()][-18:]
     for l in tail:
@@ -1575,12 +1324,9 @@ def cmd_add(a):
 
     # 写本地登记表（让不支持 MCP 的 agent 也能用 fleet.py 操控）
     reg = load_registry()
-    entry = {"url": url,
-             "description": "mcp-fleet 副端",
-             "token": token}
-    if getattr(a, "tailnet", ""):
-        entry["tailnet"] = a.tailnet.strip().lower()
-    reg.setdefault("nodes", {})[a.name] = entry
+    reg.setdefault("nodes", {})[a.name] = {"url": url,
+                                           "description": "mcp-fleet 副端",
+                                           "token": token}
     save_registry(reg)
     print(ok("[+] ") + "已登记到 %s" % REGISTRY)
 
@@ -1696,39 +1442,6 @@ def cmd_sync(a):
     return 0
 
 
-def cmd_tailscale_sync(a):
-    """用 Tailscale API 刷新 tailnet 节点的漂移 IP（需要 TAILSCALE_API_KEY）。"""
-    names = a.names or []
-    reg = load_registry()
-    nodes = reg.get("nodes") or {}
-    if not names:
-        names = [n for n, m in nodes.items() if (m or {}).get("tailnet")]
-    if not names:
-        print(warn("没有登记 tailnet 主机名的节点。用法："))
-        print("  python fleet.py add --name phone --ip <当前IP> --tailnet phone --force")
-        return 1
-    if tailscale_api_key() == "":
-        print(warn("未配置 TAILSCALE_API_KEY。去 https://login.tailscale.com/admin/settings/keys"))
-        print(warn("建一个 devices:read 的 API token，然后 export TAILSCALE_API_KEY='tskey-api-...'"))
-        return 2
-    changed = 0
-    for name in names:
-        m = nodes.get(name) or {}
-        cur = m.get("url") or ""
-        try:
-            new = sync_from_tailnet(name, cur, token=m.get("token", ""),
-                                    timeout=a.timeout, quiet=False, verbose=True)
-        except Exception as e:
-            print(err("[x] %s：%s" % (name, e)))
-            continue
-        flag = ok("CHANGED ") if new else dim("ok      ")
-        print("  %s %-14s %s" % (flag, name, new or cur or "(无地址)"))
-        if new:
-            changed += 1
-    print(dim("共纠正 %d 个节点。" % changed))
-    return 0
-
-
 def cmd_directory(a):
     """查看 / 设置地址目录。"""
     reg = load_registry()
@@ -1771,7 +1484,231 @@ def cmd_directory(a):
     return 0
 
 
+# ---------------------------------------------------------------- 对等配对（v3.5）
+
+def _lan_ip():
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        s.connect(("10.255.255.255", 1))
+        return s.getsockname()[0]
+    except Exception:
+        return "127.0.0.1"
+    finally:
+        s.close()
+
+
+def local_node(self_url=None):
+    """本机如果也装了节点 agent，返回它的 {name,url,token,dir}；否则 None。"""
+    d = os.environ.get("FLEET_NODE_DIR") or \
+        (HERE if os.path.isfile(os.path.join(HERE, "mcp_agent_config.json")) else "")
+    if not d or not os.path.isfile(os.path.join(d, "mcp_agent_config.json")):
+        return None
+    try:
+        cfg = load_json_config(os.path.join(d, "mcp_agent_config.json"))
+    except Exception:
+        return None
+
+    def _read(fn):
+        try:
+            return open(os.path.join(d, fn), encoding="utf-8").read().strip()
+        except Exception:
+            return ""
+    url = (self_url or cfg.get("self_url") or _read("current_url.txt") or "").strip()
+    if not url:
+        url = "http://%s:%s" % (_lan_ip(), _read("port.txt") or "3100")
+    url = url.rstrip("/")
+    if not re.search(r"/(mcp|sse)$", url):
+        url += "/mcp"
+    return {"name": cfg.get("name") or socket.gethostname(), "url": url,
+            "token": cfg.get("auth_token") or "", "dir": d}
+
+
+def cmd_pair(a):
+    """双向配对：把对方登记到本机，再让对方把本机登记过去，最后从对方回连本机验证。"""
+    url, meta = resolve_target(a.target, port=a.port)
+    token = (a.token or meta.get("token") or "").strip()
+    c = MCPClient(url, a.timeout, token=token)
+    try:
+        info = c.handshake()
+    except MCPError as e:
+        return die("连不上对方：%s" % e)
+    rname = a.name or info.get("name") or host_of(url)
+    print(ok("[+] ") + "对方在线：%s v%s  %s" % (rname, info.get("version", "?"), url))
+
+    reg = load_registry()
+    reg.setdefault("nodes", {})[rname] = {"url": url, "token": token, "description": "对等节点"}
+    save_registry(reg)
+    print(ok("[+] ") + "本机 → %s：已登记（%s）" % (rname, REGISTRY))
+
+    me = local_node(a.self_url)
+    if a.one_way:
+        print(dim("    --one-way：只登记单向。"))
+        return 0
+    if not me:
+        print(warn("[i] ") + "本机没有装节点 agent，所以对方没法反过来控制本机（单向）。")
+        print("    要双向：先在本机装节点（install.sh / install-offline.paste.txt），再用节点自带的 fleet 跑一次 pair。")
+        return 0
+    if me["name"] == rname:
+        print(warn("[!] ") + "两边名字都叫 %s，会互相覆盖。用 --name 给对方换个名字，或改一边的 name。" % rname)
+        return 2
+
+    try:
+        text, is_err = c.call("peer_add", {"name": me["name"], "url": me["url"], "token": me["token"]},
+                              timeout=a.timeout)
+    except MCPError as e:
+        text, is_err = str(e), True
+    if is_err:
+        print(err("[x] ") + "对方登记本机失败：%s" % text.strip()[:300])
+        if "未知工具" in text:
+            print("    对方节点版本太旧（< v3.5），先在对方重跑一次安装命令升级。")
+        return 2
+    print(ok("[+] ") + "%s → 本机：%s" % (rname, text.strip()))
+
+    # 回连验证：让对方用刚登记的地址调本机一次
+    try:
+        text, is_err = c.call("peer_call", {"peer": me["name"], "tool": "peer_info"},
+                              timeout=max(a.timeout, 40))
+    except MCPError as e:
+        text, is_err = str(e), True
+    if is_err:
+        print(warn("[!] ") + "对方回连本机失败：%s" % text.strip()[:300])
+        print("    对方够不着本机的 %s。常见原因：本机在 NAT/容器里。" % me["url"])
+        print("    办法：本机开隧道（bash %s/mcp-tunnel.sh），或用 --self-url 指定对方能访问的地址后重跑 pair。"
+              % me["dir"])
+        return 3
+    print(ok("[+] ") + "双向验证通过：%s 能控制本机，本机也能控制 %s" % (rname, rname))
+    print(dim("    本机控制对方： fleet exec %s 'uptime'" % rname))
+    print(dim("    对方控制本机： 在 %s 上 fleet exec %s 'uptime'，或经 MCP 调 peer_call" % (rname, me["name"])))
+    return 0
+
+
 # ---------------------------------------------------------------- 入口
+
+
+def cmd_mesh(a):
+    """打印 mesh 拓扑图：本节点 + 所有 peers 的在线状态和能力摘要。"""
+    reg = load_registry()
+    nodes = reg.get("nodes", {})
+    if not nodes:
+        print(warn("[!] ") + "没有已注册的节点。用 fleet.py add / pair 添加。")
+        return 1
+    print(ok("=" * 60))
+    print(ok("  Fleet Mesh 拓扑"))
+    print(ok("=" * 60))
+    for name, info in sorted(nodes.items()):
+        url = info.get("url", "")
+        token = info.get("token", "")
+        # 探活并获取 mesh 信息
+        try:
+            c = MCPClient(url, a.timeout, token=token)
+            c.handshake()
+            text, is_err = c.call("mesh", {})
+            if is_err:
+                print(err("  [X] %-16s %s" % (name, url)))
+                continue
+            mesh = json.loads(text)
+            self_info = mesh.get("self", {})
+            caps = self_info.get("caps", {})
+            cap_str = []
+            if caps.get("docker"): cap_str.append("Docker")
+            if caps.get("gpu"): cap_str.append("GPU")
+            if caps.get("tailscale"): cap_str.append("TS:%s" % caps.get("tailscale_ip", "?"))
+            if caps.get("systemd"): cap_str.append("systemd")
+            cap_str.append("%dCPU" % caps.get("cpu_count", 1))
+            if caps.get("mem_mb"): cap_str.append("%dMB" % caps["mem_mb"])
+            print(ok("  [*] %-16s %s  [%s]" % (name, url, ", ".join(cap_str))))
+            # Peers
+            peers = mesh.get("peers", {})
+            for pname, pinfo in sorted(peers.items()):
+                online = pinfo.get("online", False)
+                ts = "tailnet" if pinfo.get("tailnet") else ""
+                if online:
+                    print("      " + ok("|- ") + "%-14s 在线 %s" % (pname, ts))
+                else:
+                    print("      " + err("|- ") + "%-14s 离线 %s" % (pname, ts))
+        except Exception as e:
+            print(err("  [X] %-16s %s  (%s)" % (name, url, e)))
+    print(ok("=" * 60))
+    return 0
+
+def cmd_msg(a):
+    """fleet msg send/recv/history -- 通过 peer_call 调远程节点的 msg 工具。"""
+    reg = load_registry()
+    nodes = reg.get("nodes", {})
+    target = getattr(a, "target", None)
+    if not target:
+        return die("需要指定 target 节点")
+    url, token = _resolve_target(target, a)
+    c = MCPClient(url, a.timeout, token=token)
+    c.handshake()
+    if a.msg_cmd == "send":
+        text, is_err = c.call("msg_send", {
+            "from": a.frm or "fleet-cli",
+            "to": a.to,
+            "text": a.text,
+            "topic": a.topic or "",
+        })
+    elif a.msg_cmd == "recv":
+        text, is_err = c.call("msg_recv", {
+            "me": a.me or "fleet-cli",
+            "wait": a.wait or 0,
+            "topic": a.topic or "",
+        })
+    elif a.msg_cmd == "history":
+        text, is_err = c.call("msg_history", {
+            "lines": a.lines or 20,
+            "topic": a.topic or "",
+        })
+    else:
+        return die("未知 msg 子命令: %s" % a.msg_cmd)
+    if is_err:
+        return die(text)
+    print(text)
+    return 0
+
+
+def cmd_discover_proto(a):
+    """fleet discover -- 主动 UDP 广播 + 扫描已知网段，发现 fleet 节点。"""
+    import socket as _sock
+    port = a.discover_port or 3199
+    print(ok("[*] ") + "UDP 广播发现 (端口 %d)..." % port)
+    # 发广播
+    sock = _sock.socket(_sock.AF_INET, _sock.SOCK_DGRAM)
+    sock.setsockopt(_sock.SOL_SOCKET, _sock.SO_BROADCAST, 1)
+    sock.settimeout(a.timeout or 10)
+    hello = json.dumps({"proto": "fleet", "ver": 1, "name": "discover",
+                        "port": 0, "ts": time.time()}).encode("utf-8")
+    for addr in ["255.255.255.255", "192.168.1.255", "192.168.0.255",
+                 "10.0.0.255", "172.16.0.255"]:
+        try:
+            sock.sendto(hello, (addr, port))
+        except Exception:
+            pass
+    # 收应答
+    found = {}
+    deadline = time.time() + (a.timeout or 10)
+    while time.time() < deadline:
+        try:
+            data, addr = sock.recvfrom(4096)
+            pkt = json.loads(data.decode("utf-8"))
+            if pkt.get("proto") == "fleet" and pkt.get("name", "") != "discover":
+                name = pkt["name"]
+                found[name] = {"ip": addr[0], "port": pkt.get("port", 3100),
+                               "caps": pkt.get("caps", {})}
+                print(ok("  [+] %-16s http://%s:%d  caps=%s" % (
+                    name, addr[0], pkt.get("port", 3100),
+                    json.dumps(pkt.get("caps", {})))))
+        except _sock.timeout:
+            break
+        except Exception:
+            continue
+    sock.close()
+    if not found:
+        print(warn("[!] ") + "未发现任何 fleet 节点")
+    else:
+        print(ok("[*] ") + "发现 %d 个节点" % len(found))
+    return 0
+
 
 def build_parser():
     p = argparse.ArgumentParser(
@@ -1923,8 +1860,6 @@ def build_parser():
     sp.add_argument("--no-test", action="store_true", help="跳过连通性测试")
     sp.add_argument("--force", action="store_true", help="测试失败也写入")
     sp.add_argument("--timeout", type=int, default=10)
-    sp.add_argument("--tailnet", default="",
-                    help="该副端的 Tailscale MagicDNS 主机名（如 phone）。登记后 IP 漂移可自动纠正")
     sp.set_defaults(func=cmd_add)
 
     sp = sub.add_parser("remove", help="注销副端")
@@ -1939,10 +1874,15 @@ def build_parser():
     sp.add_argument("--timeout", type=int, default=10)
     sp.set_defaults(func=cmd_sync)
 
-    sp = sub.add_parser("tailscale-sync", help="用 Tailscale API 纠正 tailnet 节点的漂移 IP")
-    sp.add_argument("names", nargs="*", help="要纠正的副端名字（默认全部登记了 tailnet 主机名的）")
-    sp.add_argument("--timeout", type=int, default=10)
-    sp.set_defaults(func=cmd_tailscale_sync)
+    sp = sub.add_parser("pair", help="双向配对：互相登记，之后两边都能控制对方（v3.5）")
+    sp.add_argument("target", help="对方地址 http(s)://ip:3100/mcp，或已登记的名字")
+    sp.add_argument("--token", help="对方的 auth_token（对方开了鉴权必填）")
+    sp.add_argument("--name", help="给对方起的名字（默认用对方自报的 name）")
+    sp.add_argument("--self-url", help="对方回连本机用的地址（默认：本机隧道地址 > 内网 IP:端口）")
+    sp.add_argument("--one-way", action="store_true", help="只把对方登记到本机，不让对方反向登记")
+    sp.add_argument("--port", type=int, default=3100)
+    sp.add_argument("--timeout", type=int, default=20)
+    sp.set_defaults(func=cmd_pair)
 
     sp = sub.add_parser("directory", help="查看/设置地址目录（副端上报地址、主端自动跟随）")
     sp.add_argument("--url", help="地址目录服务地址，如 http://192.168.1.10:8790")
@@ -1950,6 +1890,29 @@ def build_parser():
     sp.add_argument("--clear", action="store_true", help="清除已配置的地址目录")
     sp.add_argument("--timeout", type=int, default=8)
     sp.set_defaults(func=cmd_directory)
+
+    sp = sub.add_parser("mesh", help="打印 mesh 拓扑图（节点在线状态 + 能力 + peer 关系）")
+    sp.add_argument("--timeout", type=int, default=15)
+    sp.set_defaults(func=cmd_mesh)
+
+    # v4.1: fleet msg -- 通过 peer_call 调远程节点的 msg 工具
+    sp = common(sub.add_parser("msg", help="消息总线：send/recv/history（通过 peer_call 调远程节点）"))
+    sp.add_argument("msg_cmd", choices=["send", "recv", "history"], help="子命令")
+    sp.add_argument("--from", dest="frm", help="发送者")
+    sp.add_argument("--to", help="接收者")
+    sp.add_argument("--text", help="消息内容")
+    sp.add_argument("--me", help="我的名字（recv）")
+    sp.add_argument("--topic", help="主题")
+    sp.add_argument("--wait", type=int, default=0, help="等待秒数（recv）")
+    sp.add_argument("--lines", type=int, default=20, help="历史行数（history）")
+    sp.set_defaults(func=cmd_msg)
+
+    # v4.1: fleet discover -- UDP 广播发现
+    sp = sub.add_parser("discover", help="UDP 广播发现同网段 fleet 节点（v4.1 自研协议）")
+    sp.add_argument("--discover-port", type=int, default=3199, help="UDP 发现端口")
+    sp.add_argument("--timeout", type=int, default=10, help="等待应答秒数")
+    sp.set_defaults(func=cmd_discover_proto)
+
     return p
 
 
