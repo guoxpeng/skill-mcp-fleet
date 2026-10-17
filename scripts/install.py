@@ -23,6 +23,7 @@ Python 3.6+，零第三方依赖。
 import argparse
 import base64
 import json
+import locale
 import os
 import platform
 import shutil
@@ -57,6 +58,23 @@ def default_install_dir():
 def gen_token():
     """32 字节 urlsafe 随机令牌（与 mcp_agent.py 同格式）。"""
     return base64.urlsafe_b64encode(os.urandom(32)).decode().rstrip("=")
+
+
+def _write_bat(path, content):
+    """v5.0.1 修复：按 cmd 的 ANSI 代码页（中文系统 = GBK）写 bat。
+
+    原实现固定 utf-8：安装路径含中文（如中文用户名的 LOCALAPPDATA）
+    时，cmd 按 GBK 解码 utf-8 字节变乱码 -> cd /d 失败，节点起不来。
+    ASCII 路径下 GBK 与 utf-8 字节完全一致，行为不变。
+    极端情况（路径含 ANSI 页无法表示的字符）退回 utf-8，至少文件可写。
+    """
+    enc = locale.getpreferredencoding(False) or "utf-8"
+    try:
+        with open(path, "w", encoding=enc, newline="") as fh:
+            fh.write(content)
+    except (UnicodeEncodeError, LookupError):
+        with open(path, "w", encoding="utf-8", newline="") as fh:
+            fh.write(content)
 
 
 def gen_device_code(name):
@@ -97,7 +115,7 @@ def do_install(args):
     os.makedirs(target, exist_ok=True)
 
     print("\n╔════════════════════════════════════════════════════╗")
-    print("║  mcp-fleet 跨平台安装器 v5.0                       ║")
+    print("║  mcp-fleet 跨平台安装器 v5.0.1                    ║")
     print("╚════════════════════════════════════════════════════╝\n")
 
     # 1. 拷贝节点程序
@@ -131,11 +149,11 @@ def do_install(args):
     py = sys.executable or ("python" if IS_WIN else "python3")
     if IS_WIN:
         bat = os.path.join(target, "start-fleet.bat")
-        with open(bat, "w", encoding="utf-8") as fh:  # noqa: CRLF 无所谓，cmd 都认
-            fh.write('@echo off\r\n'
-                     'cd /d "%s"\r\n'
-                     '"%s" mcp_agent.py --host 0.0.0.0 --port %d\r\n'
-                     'pause\r\n' % (target, py, args.port))
+        # v5.0.1: _write_bat 按 ANSI 代码页写（原 utf-8 导致中文路径乱码）
+        _write_bat(bat, '@echo off\r\n'
+                   'cd /d "%s"\r\n'
+                   '"%s" mcp_agent.py --host 0.0.0.0 --port %d\r\n'
+                   'pause\r\n' % (target, py, args.port))
         log("启动脚本   : %s" % bat)
     else:
         sh = os.path.join(target, "start-fleet.sh")
@@ -167,11 +185,11 @@ def do_install(args):
                                    r"Microsoft\Windows\Start Menu\Programs\Startup")
             if os.path.isdir(startup):
                 link = os.path.join(startup, "mcp-fleet.bat")
-                with open(link, "w", encoding="utf-8") as fh:
-                    fh.write('@echo off\r\n'
-                             'cd /d "%s"\r\n'
-                             'start "" /min "%s" mcp_agent.py --host 0.0.0.0 --port %d\r\n'
-                             % (target, py, args.port))
+                # v5.0.1: 同上，按 ANSI 代码页写（Startup 路径/中文用户名场景）
+                _write_bat(link, '@echo off\r\n'
+                           'cd /d "%s"\r\n'
+                           'start "" /min "%s" mcp_agent.py --host 0.0.0.0 --port %d\r\n'
+                           % (target, py, args.port))
                 log("开机自启   : 已注册（Startup 文件夹）")
             else:
                 log("开机自启   : 找不到 Startup 文件夹，跳过")
