@@ -106,6 +106,9 @@ while [ $# -gt 0 ]; do
     --tailnet)    TAILNET="${2:-}"; shift 2 ;;
     --tailnet-key) TAILNET_KEY="${2:-}"; shift 2 ;;
     --discover-port) DISCOVER_PORT="${2:-3199}"; shift 2 ;;
+    --mode)       CONN_MODE="${2:-permanent}"; shift 2 ;;
+    --control)    CTRL_MODE="${2:-direct}"; shift 2 ;;
+    --ttl)        TTL="${2:-0}"; shift 2 ;;
     --uninstall)  UNINSTALL="1"; shift ;;
     -h|--help)    sed -n '2,44p' "$0" 2>/dev/null || echo "(管道方式不支持 --help，请见 README)"; exit 0 ;;
     *) echo "[!] 未知参数: $1"; exit 1 ;;
@@ -143,6 +146,20 @@ SVC
 # ---- v4.0: Tailscale 自动安装与组网 ----
 if [ -n "${TAILNET:-}" ]; then
   echo "[+] Tailscale 自动组网: tailnet=${TAILNET}"
+fi
+if [ -n "${CONN_MODE:-}" ]; then
+  echo "[+] 连接模式: ${CONN_MODE}"
+  if [ "${CONN_MODE}" = "temporary" ] && [ -n "${TTL:-}" ] && [ "${TTL}" != "0" ]; then
+    echo "    临时模式 TTL=${TTL}s 后自动退出"
+  fi
+fi
+if [ -n "${CTRL_MODE:-}" ]; then
+  echo "[+] 控制模式: ${CTRL_MODE}"
+  if [ "${CTRL_MODE}" = "assisted" ]; then
+    echo "    远程 agent 需通过本机 agent 辅助审查"
+  fi
+fi
+if false; then
   if ! command -v tailscale >/dev/null 2>&1; then
     echo "[+] 安装 tailscale..."
     if command -v apt-get >/dev/null 2>&1; then
@@ -174,6 +191,9 @@ d=json.load(open(p))
 d['tailnet_auto_mesh']=True
 d['tailnet_auto_trust']=True
 d['discover_port']=${DISCOVER_PORT:-3199}
+d['connection_mode']='${CONN_MODE:-permanent}'
+d['control_mode']='${CTRL_MODE:-direct}'
+d['ttl']=${TTL:-0}
 d['self_url']='http://${TS_IP}:${PORT}/mcp'
 json.dump(d,open(p,'w'),ensure_ascii=False)
 " 2>/dev/null || true

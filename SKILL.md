@@ -11,10 +11,10 @@ description: |
   peer call, remote exec, 副端安装, 节点发现, agent 协作, task delegation, 
   message bus, mesh topology, 离线消息, 邮箱, mailbox, UDP discovery
 tags: [mcp, fleet, mesh, peer-to-peer, agent-collaboration, remote-control, zero-dependency, store-and-forward]
-version: 4.1.0
+version: 4.2.0
 ---
 
-# MCP Fleet · 节点互控系统 v4.1
+# MCP Fleet · 节点互控系统 v4.2
 
 ## 这是什么
 
@@ -27,6 +27,8 @@ version: 4.1.0
 3. **HTTP 消息端点** — `POST /fleet/mail`（收消息）、`GET /fleet/poll`（上线收信）、`POST /fleet/sync`（邮箱同步）
 4. **Gossip 邮箱同步** — 节点间定期同步邮箱状态，消息跨节点可达
 5. **Tailscale 可选** — 不再依赖 Tailscale；如已安装则作为跨网段加速（端到端加密 + MagicDNS）
+6. **连接模式** — `--mode temporary` 临时连接（TTL 自动退出，不装开机自启）或 `permanent` 长期连接
+7. **控制模式** — `--control assisted` 本机 agent 辅助审查（远程 agent 需请求批准）或 `direct` 直接控制。agent 运行时可自选切换
 
 ## 快速安装
 
@@ -43,6 +45,19 @@ sudo bash install.sh --name nas --port 3100
 
 ```bash
 sudo bash install.sh --name nas --port 3100 --tailnet my-tailnet --tailnet-key tskey-xxx
+```
+
+### 临时连接 + 本机辅助模式
+
+```bash
+# 临时连接：TTL 3600s 后自动退出，不装开机自启
+sudo bash install.sh --name temp-pc --port 3100 --mode temporary --ttl 3600
+
+# 本机辅助模式：远程 agent 需通过本机 agent 审查才能执行
+sudo bash install.sh --name win-pc --port 3100 --control assisted
+
+# 组合：临时 + 辅助
+sudo bash install.sh --name borrowed --port 3100 --mode temporary --ttl 7200 --control assisted
 ```
 
 ### 自定义 UDP 发现端口
@@ -102,6 +117,7 @@ B 启动 → UDP 广播 → 发现 A,C → peer_add
 | **消息总线** | `msg_send` / `msg_recv` / `msg_history` | store-and-forward + topic + 离线邮箱 |
 | **Agent 协作** | `caps` / `mesh_caps` / `delegate` / `group_form` / `group_list` / `group_disband` | 能力声明 + 任务委派 + 群组 |
 | **Mesh 拓扑** | `mesh` | 全网拓扑与在线状态 |
+| **v4.2 模式** | `node_mode` / `request_assist` / `assist_queue` | 连接/控制模式 + 辅助请求队列 |
 
 ## 主端 CLI
 

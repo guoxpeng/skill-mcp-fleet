@@ -48,6 +48,7 @@ import sys
 import threading
 import time
 import uuid
+import io
 import urllib.parse
 import urllib.request
 import urllib.error
@@ -121,6 +122,19 @@ DEFAULT_CONFIG = {
     # ---- 安全加固 + 可观测性（v4.0）----------------------------------------
     "audit_log": True,          # 记录 peer_call/msg_send 到 audit.log
     "rate_limit_per_min": 120,  # 每节点入站 peer_call 每分钟上限（令牌桶）
+    # ---- v4.2: 连接模式 + 控制模式 -----------------------------------------
+    # connection_mode: permanent=长期(开机自启), temporary=临时(TTL 到自动退出)
+    "connection_mode": "permanent",
+    # ttl: 临时模式自动退出秒数（0=不自动退出，手动 Ctrl-C）
+    "ttl": 0,
+    # control_mode: direct=远程 agent 直接控制, assisted=本机 agent 辅助审查
+    "control_mode": "direct",
+    # assisted_allow: assisted 模式下远程 agent 可直接调的工具（安全白名单）
+    "assisted_allow": ["sysinfo", "list_dir", "read", "msg_send", "msg_recv",
+                       "msg_history", "peers", "peer_info", "caps", "mesh",
+                       "node_mode", "request_assist"],
+    # assisted_queue: 本机 agent 待处理的辅助请求队列文件
+    "assisted_queue": "",
 }
 
 
@@ -1654,6 +1668,216 @@ def t_mesh(a):
 
 
 # ---------------------------------------------------------------------------
+# v4.2: 连接模式 + 控制模式工具
+# ---------------------------------------------------------------------------
+
+def t_node_mode(a):
+    """v4.2: 查询或切换节点的连接模式和控制模式。
+    - connection_mode: permanent(长期) / temporary(临时)
+    - control_mode: direct(远程直接控制) / assisted(本机agent辅助)
+    - 临时模式显示 TTL 倒计时
+    """
+    action = a.get("action", "query")
+    my_name = CFG.get("name", "node")
+
+    if action == "query":
+        info = {
+            "node": my_name,
+            "connection_mode": CFG.get("connection_mode", "permanent"),
+            "control_mode": CFG.get("control_mode", "direct"),
+            "ttl": CFG.get("ttl", 0),
+            "version": AGENT_VERSION,
+        }
+        if _ttl_deadline:
+            remaining = max(0, int(_ttl_deadline - time.time()))
+            info["ttl_remaining"] = remaining
+        return json.dumps(info, ensure_ascii=False), False
+
+    if action == "set_control":
+        new_mode = a.get("control_mode", "")
+        if new_mode not in ("direct", "assisted"):
+            return "control_mode 必须是 direct 或 assisted", True
+        CFG["control_mode"] = new_mode
+        try:
+            with open(CONFIG_PATH, "w", encoding="utf-8") as f:
+                json.dump(CFG, f, ensure_ascii=False, indent=2)
+        except Exception:
+            pass
+        return "控制模式已切换为: %s" % new_mode, False
+
+    if action == "set_connection":
+        new_mode = a.get("connection_mode", "")
+        if new_mode not in ("permanent", "temporary"):
+            return "connection_mode 必须是 permanent 或 temporary", True
+        CFG["connection_mode"] = new_mode
+        try:
+            with open(CONFIG_PATH, "w", encoding="utf-8") as f:
+                json.dump(CFG, f, ensure_ascii=False, indent=2)
+        except Exception:
+            pass
+        return "连接模式已切换为: %s" % new_mode, False
+
+    if action == "shutdown":
+        """临时节点主动退出：发 goodbye，然后关闭。"""
+        _send_goodbye()
+        return "节点 %s 正在退出..." % my_name, False
+
+    return "未知 action: %s (可用: query/set_control/set_connection/shutdown)" % action, True
+
+
+def t_request_assist(a):
+    """v4.2: assisted 模式下，远程 agent 向本机 agent 发辅助请求。
+    请求存入 assisted 队列，本机 agent（如 Claude/Cursor）可读取并处理。
+    本机 agent 有本地知识，能审查危险操作、加上下文、决定是否执行。
+    """
+    request_text = a.get("request", "")
+    tool = a.get("tool", "")
+    args = a.get("args", {})
+    priority = a.get("priority", "normal")
+
+    if not request_text and not tool:
+        return "需要提供 request(自然语言描述) 或 tool(要执行的工具名)", True
+
+    req = {
+        "id": uuid.uuid4().hex[:12],
+        "from": a.get("from", "remote-agent"),
+        "ts": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "status": "pending",
+        "request": request_text,
+        "tool": tool,
+        "args": args,
+        "priority": priority,
+    }
+
+    # 存入辅助请求队列
+    queue_path = CFG.get("assisted_queue", "") or os.path.join(HERE, "assisted_queue.jsonl")
+    with io.open(queue_path, "a", encoding="utf-8") as f:
+        f.write(json.dumps(req, ensure_ascii=False) + "\n")
+
+    # 同时发一条消息到邮箱，让本机 agent 能 msg_recv 收到通知
+    if _mail_engine:
+        _mail_engine.inbox_append({
+            "from": req["from"],
+            "to": _mail_engine.node_name,
+            "text": "[辅助请求] %s" % (request_text or ("执行 %s" % tool)),
+            "topic": "assist-request",
+            "request_id": req["id"],
+            "ts": req["ts"],
+        })
+
+    return "辅助请求已提交 (id=%s)。本机 agent 将审查并处理。\n用 node_mode action=query 查看状态。" % req["id"], False
+
+
+def t_assist_queue(a):
+    """v4.2: 本机 agent 查看/处理辅助请求队列。
+    - action=list: 列出待处理请求
+    - action=approve: 批准并执行某个请求
+    - action=deny: 拒绝某个请求
+    - action=result: 查看已处理请求的结果
+    """
+    action = a.get("action", "list")
+    queue_path = CFG.get("assisted_queue", "") or os.path.join(HERE, "assisted_queue.jsonl")
+
+    # 加载队列
+    queue = []
+    if os.path.exists(queue_path):
+        with io.open(queue_path, encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if line:
+                    try:
+                        queue.append(json.loads(line))
+                    except ValueError:
+                        pass
+
+    if action == "list":
+        pending = [q for q in queue if q.get("status") == "pending"]
+        if not pending:
+            return "没有待处理的辅助请求", False
+        lines = []
+        for q in pending:
+            lines.append("[%s] %s from=%s priority=%s\n  %s" % (
+                q["id"], q["ts"], q.get("from", ""), q.get("priority", ""),
+                q.get("request", "") or ("执行 %s(%s)" % (q.get("tool", ""), json.dumps(q.get("args", {}))))))
+        return "\n".join(lines), False
+
+    if action == "approve":
+        req_id = a.get("id", "")
+        reason = a.get("reason", "")
+        for q in queue:
+            if q["id"] == req_id and q.get("status") == "pending":
+                q["status"] = "approved"
+                q["approved_ts"] = time.strftime("%Y-%m-%d %H:%M:%S")
+                q["approved_reason"] = reason
+                # 执行请求的工具
+                if q.get("tool"):
+                    result = call_tool(q["tool"], q.get("args", {}), _bypass_assisted=True)
+                    q["result"] = result.get("content", [{}])[0].get("text", "")
+                    q["result_error"] = result.get("isError", False)
+                else:
+                    q["result"] = "已批准(无工具执行)"
+                _save_assist_queue(queue_path, queue)
+                return "请求 %s 已批准并执行。\n结果: %s" % (req_id, q.get("result", "")), False
+        return "未找到待处理请求 %s" % req_id, True
+
+    if action == "deny":
+        req_id = a.get("id", "")
+        reason = a.get("reason", "")
+        for q in queue:
+            if q["id"] == req_id and q.get("status") == "pending":
+                q["status"] = "denied"
+                q["denied_ts"] = time.strftime("%Y-%m-%d %H:%M:%S")
+                q["denied_reason"] = reason
+                _save_assist_queue(queue_path, queue)
+                return "请求 %s 已拒绝: %s" % (req_id, reason), False
+        return "未找到待处理请求 %s" % req_id, True
+
+    if action == "result":
+        req_id = a.get("id", "")
+        for q in queue:
+            if q["id"] == req_id:
+                return json.dumps(q, ensure_ascii=False, indent=2), False
+        return "未找到请求 %s" % req_id, True
+
+    return "未知 action: %s" % action, True
+
+
+def _save_assist_queue(path, queue):
+    tmp = path + ".tmp"
+    with io.open(tmp, "w", encoding="utf-8") as f:
+        for q in queue:
+            f.write(json.dumps(q, ensure_ascii=False) + "\n")
+    os.replace(tmp, path)
+
+
+# 全局 TTL 倒计时
+_ttl_deadline = None
+
+def _send_goodbye():
+    """v4.2: 临时节点退出时发 goodbye 通知。"""
+    try:
+        peers = load_peers().get("nodes", {})
+        for name, info in peers.items():
+            url = info.get("url", "").rstrip("/")
+            for suffix in ["/mcp", "/sse", "/rpc"]:
+                if url.endswith(suffix):
+                    url = url[:-len(suffix)]
+                    break
+            try:
+                payload = json.dumps({
+                    "proto": "fleet", "type": "goodbye",
+                    "name": CFG.get("name", "node"), "ts": time.time(),
+                }).encode("utf-8")
+                req = urllib.request.Request(url + "/fleet/discover", data=payload, method="POST")
+                req.add_header("Content-Type", "application/json")
+                urllib.request.urlopen(req, timeout=5)
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+
+# ---------------------------------------------------------------------------
 # v4.0 工具注册
 # ---------------------------------------------------------------------------
 COLLAB_TOOLS = [
@@ -1766,6 +1990,26 @@ BASE_TOOLS = [
       "required": ["me"]}),
     ("msg_history", "节点间消息：查看邮箱最近 N 条（可按主题过滤）。",
      {"type": "object", "properties": {"lines": {"type": "number"}, "topic": {"type": "string"}}}),
+    ("node_mode", "v4.2: 查询/切换节点模式。action=query(查状态) set_control(切换控制模式) set_connection(切换连接模式) shutdown(临时节点退出)。",
+     {"type": "object", "properties": {
+         "action": {"type": "string", "enum": ["query", "set_control", "set_connection", "shutdown"]},
+         "control_mode": {"type": "string", "enum": ["direct", "assisted"]},
+         "connection_mode": {"type": "string", "enum": ["permanent", "temporary"]}},
+      "description": "action=query 不需要其他参数"}),
+    ("request_assist", "v4.2: assisted 模式下向本机 agent 发辅助请求（本机 agent 审查后执行）。",
+     {"type": "object", "properties": {
+         "request": {"type": "string", "description": "自然语言描述想做什么"},
+         "tool": {"type": "string", "description": "想执行的工具名(可选)"},
+         "args": {"type": "object", "description": "工具参数(可选)"},
+         "from": {"type": "string", "description": "你的名字"},
+         "priority": {"type": "string", "enum": ["low", "normal", "high"]}},
+      "description": "request 和 tool 至少给一个"}),
+    ("assist_queue", "v4.2: 本机 agent 查看/处理辅助请求队列。action=list/approve/deny/result。",
+     {"type": "object", "properties": {
+         "action": {"type": "string", "enum": ["list", "approve", "deny", "result"]},
+         "id": {"type": "string", "description": "请求ID(approve/deny/result时需要)"},
+         "reason": {"type": "string", "description": "批准/拒绝理由"}},
+      "description": "action=list 不需要 id"}),
 ]
 
 BASE_FUNCS = {
@@ -1777,6 +2021,8 @@ BASE_FUNCS = {
     "exec_result": t_exec_result, "exec_kill": t_exec_kill,
     "exec_jobs": t_exec_jobs,
     "msg_send": t_msg_send, "msg_recv": t_msg_recv, "msg_history": t_msg_history,
+    "node_mode": t_node_mode, "request_assist": t_request_assist,
+    "assist_queue": t_assist_queue,
 }
 if CFG.get("peer_tools", True):
     BASE_TOOLS += PEER_TOOLS
@@ -1798,10 +2044,25 @@ for _base, _fn in BASE_FUNCS.items():
     TOOL_FUNCS["nas_" + _base] = _fn
 
 
-def call_tool(name, args):
+def call_tool(name, args, _bypass_assisted=False):
     fn = TOOL_FUNCS.get(name)
     if not fn:
         return {"content": [{"type": "text", "text": "未知工具: %s" % name}], "isError": True}
+    # v4.2: assisted 模式下，远程 agent 只能用白名单工具
+    # node_mode/request_assist/assist_queue 始终可用
+    # _bypass_assisted=True 时跳过限制（本机 agent approve 时用）
+    _safe_names = {"node_mode", "request_assist", "assist_queue",
+                   "msg_send", "msg_recv", "msg_history", "peers", "peer_info",
+                   "caps", "mesh", "sysinfo", "list_dir", "read"}
+    if CFG.get("control_mode", "direct") == "assisted" and not _bypass_assisted:
+        allowed = set(CFG.get("assisted_allow", [])) | _safe_names
+        # 去掉前缀比较
+        bare_name = name.replace(PREFIX, "").replace("nas_", "")
+        if bare_name not in allowed and name not in allowed:
+            return {"content": [{"type": "text", "text":
+                "[assisted 模式] 工具 %s 需要本机 agent 批准。\n"
+                "请用 request_assist 提交辅助请求，或用 node_mode action=set_control control_mode=direct 切换为直接控制。" % name}],
+                "isError": True}
     try:
         text, is_err = fn(args or {})
         return {"content": [{"type": "text", "text": text}], "isError": bool(is_err)}
@@ -2248,7 +2509,10 @@ def main():
         print("  通讯协议        : fleet-proto v%d (store-and-forward)" % PROTO_VERSION)
         # UDP 发现层
         caps_summary = {"docker": CFG.get("enable_docker", True),
-                        "tools": len(TOOLS)}
+                        "tools": len(TOOLS),
+                        "connection_mode": CFG.get("connection_mode", "permanent"),
+                        "control_mode": CFG.get("control_mode", "direct"),
+                        "ttl": int(CFG.get("ttl", 0))}
         _discovery_layer = DiscoveryLayer(
             SERVER_NAME, args.port, caps=caps_summary,
             discover_port=int(CFG.get("discover_port", 3199)),
@@ -2292,10 +2556,37 @@ def main():
         else:
             print("  Tailscale       : 未安装或未登录（--tailnet 安装时自动配置）")
 
+    # ---- v4.2: 连接模式 + 控制模式 ----
+    conn_mode = CFG.get("connection_mode", "permanent")
+    ctrl_mode = CFG.get("control_mode", "direct")
+    ttl = int(CFG.get("ttl", 0))
+    print("  连接模式        : %s%s" % (
+        conn_mode, " (TTL=%ds)" % ttl if conn_mode == "temporary" and ttl else ""))
+    print("  控制模式        : %s%s" % (
+        ctrl_mode, " [远程 agent 只能用安全工具+request_assist]" if ctrl_mode == "assisted" else ""))
+
+    # 临时模式 TTL 倒计时
+    global _ttl_deadline
+    if conn_mode == "temporary" and ttl > 0:
+        _ttl_deadline = time.time() + ttl
+        def _ttl_timer():
+            while True:
+                remaining = _ttl_deadline - time.time()
+                if remaining <= 0:
+                    print("\n[TTL] 临时连接已到期 (%ds)，正在退出..." % ttl)
+                    _send_goodbye()
+                    os._exit(0)
+                time.sleep(min(30, remaining))
+        threading.Thread(target=_ttl_timer, daemon=True).start()
+        print("  TTL 倒计时      : %ds 后自动退出" % ttl)
+
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:
         print("\n已停止")
+        if conn_mode == "temporary":
+            print("[临时模式] 发送 goodbye 通知...")
+            _send_goodbye()
     except Exception as e:
         # 主循环意外退出：以非零码退出，交给 systemd Restart=always / 守护壳重启
         print("[FATAL] 服务主循环异常退出: %r" % (e,), file=sys.stderr)

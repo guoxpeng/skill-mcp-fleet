@@ -1,4 +1,4 @@
-# MCP Fleet · 节点互控系统 v4.1
+# MCP Fleet · 节点互控系统 v4.2
 
 > 零依赖 · 纯 Python 标准库 · 兼容 Python 3.6+ · 32 个工具 · 自研通讯协议
 
@@ -15,6 +15,8 @@
 | 3 | **消息总线** | msg_send/msg_recv/msg_history，topic 广播，离线不丢消息 |
 | 4 | **安全加固** | 审计日志、令牌桶限流、Tailscale 可选端到端加密 |
 | 5 | **Mesh 拓扑可视化** | `fleet mesh` 一键打印全网拓扑图（谁连谁、谁在线、各节点能力） |
+| 6 | **连接模式** | `--mode temporary`（TTL 自动退出）/ `permanent`（长期在线） |
+| 7 | **控制模式** | `--control assisted`（本机 agent 审查）/ `direct`（直接控制），运行时可切换 |
 
 ## 架构
 
@@ -44,6 +46,24 @@ sudo bash install.sh --name nas --port 3100
 ```
 
 装完后自动：启动 MCP agent → UDP 广播发现同网段其他 fleet 节点 → 自动互连 → 邮箱同步
+
+### 临时连接 + 本机辅助
+
+```bash
+# 临时连接：TTL 3600s 后自动退出
+sudo bash install.sh --name temp-pc --port 3100 --mode temporary --ttl 3600
+
+# 本机辅助：远程 agent 需本机 agent 审查批准
+sudo bash install.sh --name win-pc --port 3100 --control assisted
+```
+
+**连接模式**：
+- `permanent`（默认）：装 systemd 开机自启，永远在线。适合 NAS、服务器。
+- `temporary`：不装自启，TTL 到了自动退出，退出时发 goodbye 通知其他节点。适合借来的电脑、临时工位。
+
+**控制模式**：
+- `direct`（默认）：远程 agent 直接调 exec/read/write 等工具，完全控制。
+- `assisted`：远程 agent 只能用安全工具（sysinfo/read/list_dir/msg_*），危险操作需通过 `request_assist` 提交请求，本机 agent 用 `assist_queue` 审查批准后才执行。agent 运行时可用 `node_mode` 切换。
 
 ### 可选：Tailscale 跨网段加速
 

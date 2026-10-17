@@ -1616,7 +1616,12 @@ def cmd_mesh(a):
             if caps.get("systemd"): cap_str.append("systemd")
             cap_str.append("%dCPU" % caps.get("cpu_count", 1))
             if caps.get("mem_mb"): cap_str.append("%dMB" % caps["mem_mb"])
-            print(ok("  [*] %-16s %s  [%s]" % (name, url, ", ".join(cap_str))))
+            # v4.2: 连接模式 + 控制模式标记
+            conn = self_info.get("caps", {}).get("connection_mode", "permanent")
+            ctrl = self_info.get("caps", {}).get("control_mode", "direct")
+            mode_tag = "[T]" if conn == "temporary" else "[P]"
+            ctrl_tag = "[A]" if ctrl == "assisted" else "[D]"
+            print(ok("  [*] %-16s %s  [%s] %s%s" % (name, url, ", ".join(cap_str), mode_tag, ctrl_tag)))
             # Peers
             peers = mesh.get("peers", {})
             for pname, pinfo in sorted(peers.items()):
