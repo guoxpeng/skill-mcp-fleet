@@ -1,290 +1,97 @@
-# MCP Fleet · 节点互控系统
+# MCP Fleet · 参赛作品提交包（v4.6）
 
-> 零依赖 · 纯 Python 标准库 · 兼容 Python 3.6+ · 41 个工具 · 自研通讯协议 · [20 秒演示视频](https://mcp-fleet-demo.obs.cn-north-4.myhuaweicloud.com/fleet-demo.mp4)
+> **2026 华为开发者大赛 · 小红书 Skill 创新赛**
+> 赛道：**通用赛道 · 开发工具**
+> 作者：guoxpeng ｜ 开源仓库：https://github.com/guoxpeng/skill-mcp-fleet
 
-给你的设备集群（NAS / 飞牛 OS / 树莓派 / 云主机 / 容器 / 手机…）每台装一个「节点」，即可被**任意支持 MCP 的 AI agent / 客户端**远程操控 —— WorkBuddy、Claude Desktop、Claude Code、Cursor、Cline、Cherry Studio、Codex 或你自己写的 agent 都行，不绑定某一家。
+---
 
-**v4.1 核心进化——自研通讯协议**：agent 间可以直接通信，不依赖 Tailscale 或任何外部服务。在线 agent 消息直接投递，离线 agent 消息存邮箱（store-and-forward），上线后自动收信。UDP 广播自动发现同网段节点，gossip 协议同步邮箱。
+## 一、核心叙事
 
-## v4.1 进化
+**别人做的是 AI 和 AI 聊天，我做的是 AI 和 AI 协作干活。**
 
-| # | 进化方向 | 核心能力 |
-|---|---------|----------|
-| 1 | **自研通讯协议** | UDP 广播发现 + HTTP 消息端点 + store-and-forward 离线邮箱 + gossip 同步 |
-| 2 | **Agent 协作协议** | 节点自动声明能力（Docker/GPU/网络），按能力委派任务，多节点临时组队 |
-| 3 | **消息总线** | msg_send/msg_recv/msg_history，topic 广播，离线不丢消息 |
-| 4 | **安全加固** | 审计日志、令牌桶限流、Tailscale 可选端到端加密 |
-| 5 | **Mesh 拓扑可视化** | `fleet mesh` 一键打印全网拓扑图（谁连谁、谁在线、各节点能力） |
-| 6 | **连接模式** | `--mode temporary`（TTL 自动退出）/ `permanent`（长期在线） |
-| 7 | **控制模式** | `--control assisted`（本机 agent 审查）/ `direct`（直接控制），运行时可切换 |
-| 8 | **设备码配对** | 安装自动生成设备码，`fleet pair CODE@URL` 一键配对，A 有 agent 操控 B，双 agent 协作 |
-| 9 | **邀请链接** | `fleet invite` 生成邀请码，对方 `install.sh --invite CODE` 一键安装+自动连接+确权 |
+MCP Fleet 是一张 **AI 对等协作网络**：每台设备装一个「节点」（NAS / 云主机 / 电脑 / 软路由 / 手机…），节点间用**自研通讯协议**互联 —— **UDP 广播自动发现 + HTTP 消息端点 + store-and-forward 离线邮箱 + gossip 邮箱同步**，零外部依赖，纯 Python 标准库。
 
-## 架构
+设备上的 **AI Agent 之间可直接通信**：在线直投、离线存邮箱、上线自动收信；按能力委派任务、临时组队协作。不再是"遥控器-接收器"的单向操控，而是**设备与设备之间平等的 agent 协作网**。
 
-```
-控制方（任意 MCP 客户端 / agent，或任意一个节点自带的 fleet）
-  └── MCP 配置
-        ├── nas      → http://192.168.1.10:3100/mcp
-        ├── cloud    → http://10.0.0.5:3100/mcp
-        └── pi       → http://192.168.1.20:3100/mcp
+## 二、核心亮点（v4.6）
 
-节点（各台设备，各跑一个 mcp_agent.py，开机自启）
-  ├── 命令在设备本机执行，不经 SSH —— 更快、更稳
-  ├── 节点之间 peer_call 互控，A ⇄ B 双向，A → B → C 多跳进内网
-  ├── UDP :3199 广播自动发现同网段节点
-  ├── HTTP /fleet/* 端点：消息投递、上线收信、邮箱同步
-  ├── mailbox/ 邮箱：inbox + outbox + sent（store-and-forward）
-  └── 41 个工具：exec/read/write/edit/search/upload/download + docker/systemctl + peer + msg + collab + mesh
-```
+| # | 亮点 | 说明 |
+|---|------|------|
+| 1 | **自研通讯协议** | UDP 发现 + HTTP 消息端点 + 离线邮箱 + gossip 同步，不依赖 Tailscale 等任何外部服务 |
+| 2 | **41 个工具** | exec/文件/搜索/传输/Docker/systemd/网络诊断 + peer 互控 + 消息总线 + agent 协作 + mesh 拓扑 |
+| 3 | **安全确权** | 设备码自动生成 + 邀请链接配对（TTL 过期 + 单次有效 + 显式信任确认） |
+| 4 | **运行模式** | 连接模式（temporary/permanent）+ 控制模式（direct / assisted 辅助审查） |
+| 5 | **Agent 协作协议** | 能力声明（caps）、任务委派（delegate）、临时群组（group_*）、消息总线（msg_*） |
+| 6 | **Mesh 拓扑可视化** | `fleet mesh` 一键打印全网拓扑（谁连谁、谁在线、各节点能力） |
+| 7 | **TLS + 审计日志 + dryRun** | HTTPS 加密通讯、全工具调用审计留痕、edit 预览不落盘 |
+| 8 | **零依赖** | 纯标准库、Python 3.6+（ThreadingHTTPServer 自动降级兼容）、单文件安装 |
+| 9 | **跨网段可选加速** | 已装 Tailscale 时自动作为跨网段加密通道（端到端加密 + MagicDNS） |
 
-## 快速开始（3 步）
+**v4.6 变更**（相对 v4.5）：
+- 新增 `scripts/demo.sh` 一键演示：本机 30 秒拉起双节点，自动演示互发现、跨节点操控、消息投递、mesh 拓扑（端到端实测通过）
+- 修复 `mesh` / `mesh_caps` 工具遍历 peers 的层级 bug（此前拓扑里对等节点显示异常）
+- SKILL.md 新增「谁需要它」六类用户画像与兼容性清单，触发句式改造便于 AI 客户端自动匹配
 
-```
-1. 设备 A 安装：  sudo bash install.sh --port 3100
-   → 显示设备码 nas-a3f2 和 API http://192.168.1.10:3100/mcp
+🎬 **20 秒演示视频**：https://mcp-fleet-demo.obs.cn-north-4.myhuaweicloud.com/fleet-demo.mp4
+（云上项目远程查询 + 出门在外管理家里设备两大场景，1080p）
 
-2. 设备 B 安装：  sudo bash install.sh --port 3100
-   → 显示设备码 win-b7k9 和 API http://192.168.1.20:3100/mcp
+## 三、评审五维自评
 
-3. 在 B 上配对：  fleet.py pair nas-a3f2@http://192.168.1.10:3100/mcp
-   → 双向通讯建立！
-```
+| 维度 | 亮点 | 证据 |
+|---|---|---|
+| **场景真实性** | 全设备管家 / 双 agent 协作 / 离线消息送达，三个真实场景；六类用户画像（NAS 用户/远程党/自托管/软路由/开发者/极客团队） | `references/vision-and-scenarios.md`、SKILL.md「谁需要它」 |
+| **作品可用性** | 一条命令安装 + 设备码/邀请码配对 + 一键演示，端到端实测 | `bash scripts/demo.sh` 30 秒复现全部核心能力；41 工具实测、双节点互联 + 在线直投 + 审计日志验证 |
+| **Skill 复用率** | 任意设备接入、任意 MCP 客户端可用（标准 MCP JSON-RPC，CodeArts / Claude Code / Cursor 均可）、节点间可协作 | 对等网络架构，天然可扩展；兼容性见 SKILL.md |
+| **技术完成度** | 自研协议层 + 安全确权 + 运行模式 + 41 工具 + TLS/审计/dryRun，持续迭代修 bug | 协议级创新，绝非配置型工具；v4.6 修复 mesh 拓扑 bug 并附实测演示脚本 |
+| **内容传播力** | 华为云 × 小红书 × 开源社区三方通道，数据可查证 | `references/传播度证据.md`：GitHub 747 次克隆 / 281 独立访客，市场浏览量全场 111 作品第 2；小红书笔记 + Skill 市场双通道 |
 
-**然后**：
-- A 有 Claude/Cursor → A 的 AI agent 可以 `exec`、`read`、`write` 操控 B
-- B 有 Claude/Cursor → B 的 AI agent 也可以操控 A
-- 两个 agent 可以 `msg_send` 互发消息、分工协作
+### 与华为云的结合
 
-### 邀请链接配对
+真实部署拓扑即「华为云 ECS 节点 ↔ 家里 NAS 节点」跨网段互联：ECS 上跑常驻节点（云服务器一条命令安装见 `references/云服务器-副端安装-一条命令.md`），家里的 NAS/软路由跑本地节点，两端通过 fleet 协议互通。本作品"不依赖云服务"的架构与华为云**互补而非竞争**——用户可以把算力型任务放在 ECS、把存储/家庭任务放在本地设备，AI agent 跨端调度。
 
-更简单的配对方式 — A 生成邀请码，B 一键安装自动连接：
+## 四、提交包结构
 
-```bash
-# A 生成邀请码
-fleet.py invite
-# → 输出: bash install.sh --invite eyJjb2RlIjoi...
-
-# B 用邀请码安装（自动确权 + 自动连接）
-bash install.sh --invite eyJjb2RlIjoi...
-```
-
-⚠ **安全警告**：邀请码包含连接凭据，仅分享给信任的人。安装后对方可远程操控你的设备。
-
-邀请码有过期时间（默认 1 小时），使用一次后失效。
-
-## 快速安装
-
-最快的方式就是把本项目地址丢发给ai，让本地AI使用ssh连接一次云服务器，让AI自己安装本项目。
-
-### 一键安装（自研协议，零依赖）
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/guoxpeng/skill-mcp-fleet/main/scripts/install.sh -o install.sh
-sudo bash install.sh --name nas --port 3100
-```
-
-装完后自动：启动 MCP agent → UDP 广播发现同网段其他 fleet 节点 → 自动互连 → 邮箱同步
-
-### 临时连接 + 本机辅助
-
-```bash
-# 临时连接：TTL 3600s 后自动退出
-sudo bash install.sh --name temp-pc --port 3100 --mode temporary --ttl 3600
-
-# 本机辅助：远程 agent 需本机 agent 审查批准
-sudo bash install.sh --name win-pc --port 3100 --control assisted
-```
-
-**连接模式**：
-- `permanent`（默认）：装 systemd 开机自启，永远在线。适合 NAS、服务器。
-- `temporary`：不装自启，TTL 到了自动退出，退出时发 goodbye 通知其他节点。适合借来的电脑、临时工位。
-
-**控制模式**：
-- `direct`（默认）：远程 agent 直接调 exec/read/write 等工具，完全控制。
-- `assisted`：远程 agent 只能用安全工具（sysinfo/read/list_dir/msg_*），危险操作需通过 `request_assist` 提交请求，本机 agent 用 `assist_queue` 审查批准后才执行。agent 运行时可用 `node_mode` 切换。
-
-### 可选：Tailscale 跨网段加速
-
-```bash
-sudo bash install.sh --name nas --port 3100 --tailnet my-tailnet --tailnet-key tskey-xxx
-```
-
-Tailscale 不是必需的。如果你只需要同网段通信，不需要安装 Tailscale。如果你需要跨网段（比如 NAS 在家、云主机在公网），Tailscale 提供端到端加密的虚拟网络，fleet 在其上自动构建 agent mesh。
-
-## 通讯协议
-
-### UDP 广播发现
-
-每个节点启动后，每 30 秒在 UDP 端口 3199 广播一个 hello 包：
-```json
-{"proto": "fleet", "ver": 1, "name": "nas", "port": 3100, "caps": {"docker": true, "tools": 32}}
-```
-同网段的其他 fleet 节点收到后，自动 `peer_add`，零配置组网。
-
-### Store-and-forward 消息投递
-
-```
-msg_send(from="agent-a", to="agent-b", text="hello")
-  │
-  ├─ agent-b 在本节点? → 存 inbox ✓（本地投递）
-  ├─ agent-b 在已知 peer? → HTTP POST /fleet/mail → 直接投递 ✓
-  └─ agent-b 离线/未知? → 存 outbox → delivery daemon 每 15s 重试
-                                    │
-                                    └─ agent-b 上线 → UDP 发现 → peer_add → 投递成功 ✓
-```
-
-### 上线收信
-
-```
-agent-b 节点启动 → UDP 广播 → 发现其他节点 → peer_add
-  → msg_recv(me="agent-b") → 向所有 peer 发 GET /fleet/poll?name=agent-b
-  → 各 peer 把给 agent-b 的消息返回 → 存入本地 inbox → 收到所有离线消息 ✓
-```
-
-### HTTP 端点
-
-| 端点 | 方法 | 作用 |
-|------|------|------|
-| `/fleet/mail` | POST | 接收消息，存入本地 inbox |
-| `/fleet/poll?name=X` | GET | 拉取给 agent X 的待收消息（上线收信） |
-| `/fleet/sync` | POST | 邮箱同步 gossip：交换邮箱摘要 |
-| `/fleet/discover` | POST | 节点握手：交换信息，自动互加 peer |
-| `/fleet/register_agent` | POST | agent 注册到本节点 |
-| `/fleet/status` | GET | 邮箱状态 |
-
-## 工具清单（41 个）
-
-| 类别 | 工具 | 作用 |
-|------|------|------|
-| **执行** | `exec` / `exec_async` / `exec_poll` / `exec_result` / `exec_kill` / `exec_jobs` | 同步/后台命令执行 |
-| **文件** | `read` / `write` / `edit` / `list_dir` / `search` | 文件读写编辑 + 内容/文件名搜索（edit 支持 dryRun 预览） |
-| **传输** | `upload` / `download` | base64 文件传输，支持二进制 |
-| **进程/网络** | `ps` / `kill` / `net_check` | 进程列表与终止 + 端口/DNS/监听诊断 |
-| **Docker** | `docker_ps` / `docker_logs` / `docker_restart` | 容器管理 |
-| **系统** | `systemctl` / `service_logs` / `sysinfo` / `http_get` | 服务管理 + 系统信息 |
-| **Peer Mesh** | `peers` / `peer_call` / `peer_add` / `peer_remove` / `peer_info` | 节点互控（多跳转发） |
-| **消息总线** | `msg_send` / `msg_recv` / `msg_history` | store-and-forward + topic + 离线邮箱 |
-| **Agent 协作** | `caps` / `mesh_caps` / `delegate` / `group_form` / `group_list` / `group_disband` | 能力声明 + 任务委派 + 群组 |
-| **Mesh 拓扑** | `mesh` | 全网拓扑与在线状态 |
-| **模式** | `node_mode` / `request_assist` / `assist_queue` | 连接/控制模式 + 辅助审查队列 |
-
-## CLI 用法
-
-```bash
-# 节点管理
-python scripts/fleet.py add --name nas --ip 192.168.1.10 --port 3100
-python scripts/fleet.py list                         # 列出所有节点
-python scripts/fleet.py mesh                         # 打印 mesh 拓扑图
-python scripts/fleet.py discover                     # UDP 广播发现同网段节点
-python scripts/fleet.py pair nas                     # 双向配对
-python scripts/fleet.py health --deep                # 全网体检
-
-# 远程执行
-python scripts/fleet.py exec nas "docker ps"         # 在节点执行命令
-python scripts/fleet.py call nas peer_call --peer cloud --tool sysinfo  # 多跳调用
-
-# 消息总线
-python scripts/fleet.py msg nas send --to agent-b --text "hello"   # 发消息
-python scripts/fleet.py msg nas recv --me agent-a                  # 收消息
-python scripts/fleet.py msg nas history                             # 消息历史
-
-# Agent 协作
-python scripts/fleet.py call nas caps               # 查看节点能力
-python scripts/fleet.py call nas mesh_caps           # 查看全网能力
-python scripts/fleet.py call nas delegate --capability gpu --task "train model"  # 委派任务
-```
-
-## 配置
-
-```json
-{
-  "node_name": "nas",
-  "listen_port": 3100,
-  "auth_token": "",
-  "discover_port": 3199,
-  "enable_docker": true,
-  "collab_tools": true,
-  "audit_log": true,
-  "rate_limit_per_min": 120,
-  "tailnet_auto_mesh": false,
-  "tailnet_auto_trust": false
-}
-```
-
-## 目录结构
-
-```
-mcp-fleet/
-├── SKILL.md                          # AgentSkill 规范
-├── mcp_agent_config.example.json     # 配置模板
+```text
+mcp-fleet/                               # 参赛提交包（AgentSkill 规范，21 个文件）
+├── SKILL.md                             # Skill 入口（frontmatter + 适用场景 + 协议架构 + 工具清单 + 兼容性）
+├── README.md                            # 本文件（参赛说明）
 ├── scripts/
-│   ├── mcp_agent.py                  # 节点 MCP 服务器（核心，41 个工具）
-│   ├── fleet_proto.py                # v4.1 自研通讯协议层
-│   ├── demo.sh                       # v4.6 一键演示：双节点互联 30 秒上手
-│   ├── fleet.py                      # 主端统一 CLI
-│   ├── fleet_chat.py                 # AI 间消息 CLI
-│   ├── fleet_watch.py                # 保活守护
-│   ├── fleet-directory.py            # 地址目录服务
-│   ├── install.sh                    # 一键安装脚本
-│   ├── install-fleet-node.sh         # 节点安装辅助
-│   ├── add_fleet_node.py             # 注册节点到 MCP 配置
-│   ├── call_node.py                  # 免重启直接调工具
-│   ├── probe_fleet.py                # 连通性诊断
-│   ├── make-offline.py               # 生成离线安装包
-│   └── fleet-http.service            # systemd 单元
+│   ├── mcp_agent.py                     # 节点 MCP 服务器（核心，41 个工具，TLS+审计+dryRun）
+│   ├── fleet_proto.py                   # 自研通讯协议层（UDP+gossip+离线邮箱）
+│   ├── demo.sh                          # ★ 一键演示：30 秒双节点互联全流程
+│   ├── install.sh                       # 一键安装（自包含）
+│   ├── fleet.py                         # 统一 CLI（配对/巡检/指令/消息/mesh）
+│   ├── fleet_chat.py / fleet_watch.py   # AI 间消息 / 保活守护
+│   ├── fleet-directory.py               # 地址目录服务
+│   ├── add_fleet_node.py / probe_fleet.py / call_node.py
+│   └── make-offline.py / fleet-http.service
 └── references/
-    ├── 加固操作手册.md
-    ├── 安全审计报告.md
+    ├── vision-and-scenarios.md          # ★ 场景故事 + 演进蓝图 + 生态结合点
+    ├── 传播度证据.md                     # ★ 三层传播渠道数据（GitHub克隆747次/市场浏览全场第2，附复现命令）
+    ├── 加固操作手册.md / 安全审计报告.md
     └── 云服务器-副端安装-一条命令.md
 ```
 
-## 设计哲学
+## 五、快速体验
 
-- **零依赖**：纯 Python 3 标准库，不需要 pip install 任何东西
-- **自研协议**：不依赖 Tailscale / 任何外部服务，agent 间直接通信
-- **Store-and-forward**：离线 agent 不丢消息，上线自动收信
-- **不分主副**：每个节点既能被控制，也能控制别的节点
-- **兼容 Tailscale**：如已安装则作为跨网段加速（可选，非必需）
+```bash
+# 0. 30 秒演示（可选）：本机自动拉起双节点，看懂它怎么工作
+bash scripts/demo.sh
 
-## License
+# 1. 在设备 A 安装（输出设备码 nas-a3f2 和 API）
+curl -fsSL https://raw.githubusercontent.com/guoxpeng/skill-mcp-fleet/main/scripts/install.sh -o install.sh
+sudo bash install.sh --port 3100
 
-MIT
+# 2. 在设备 B 安装
+sudo bash install.sh --port 3100
 
+# 3. 在 B 上配对 A（或 A 生成邀请码发给 B 一键安装）
+fleet.py pair nas-a3f2@http://192.168.1.10:3100/mcp
+```
 
----
+## 六、合规说明
 
-## v4.5 增强更新（社区贡献）
-
-### Bug 修复
-- **P0: Python 3.6 兼容性** — `ThreadingHTTPServer` 在 Python 3.6 上不存在，添加 try/except fallback
-- **P0: 参数命名统一** — `list_dir` 的 `path` 参数统一为 `filePath`，保留 `path` 作为兼容别名
-- **P0: 工具数量修正** — README 工具数与实际代码同步
-
-### 安全增强
-- **P1: TLS 支持** — 新增 `--tls-cert` / `--tls-key` 参数，支持 HTTPS 加密传输
-- **P1: 操作审计日志** — `exec`/`write`/`edit`/`docker_restart`/`systemctl` 调用自动记录到 `audit.log`
-- **P1: 安全边界文档化** — `_check_path` 的限制范围在代码注释中明确说明
-
-### 功能增强
-- **P2: `search` 工具** — 文件内容搜索(grep)和文件名搜索(find)，结构化输出
-- **P2: `upload` / `download` 工具** — base64 编码文件传输，支持二进制文件
-- **P2: `ps` / `kill` 工具** — 进程列表和终止进程，带信号选择
-- **P2: `net_check` 工具** — 端口探测、DNS 解析、列出本机监听端口
-- **P2: `edit` dryRun** — `dryRun=true` 预览修改效果但不实际写入
-- **P2: 错误消息 i18n** — 错误提示改为中英双语
-
----
-
-## v4.6 更新
-
-### Bug 修复
-- **mesh / mesh_caps 遍历层级修复** — `load_peers()` 返回 `{"nodes": {...}}` 嵌套结构，此前两处直接遍历外层导致拓扑里对等节点显示异常，现已统一 `.get("nodes", {})`
-
-### 新增
-- **`scripts/demo.sh` 一键演示** — 本机 30 秒拉起双节点（demo-nas/demo-cloud），自动演示互发现、配对、跨节点 exec、消息投递、mesh 拓扑，结束自动清理。第一次接触本项目的用户和评测评测建议从这里开始
-- **SKILL.md 文档增强** — 新增「谁需要它」六类用户画像、兼容性清单（标准 MCP JSON-RPC，CodeArts/Claude Code/Cursor 等均可接入）、description 触发句式改造
-- **20 秒演示视频** — https://mcp-fleet-demo.obs.cn-north-4.myhuaweicloud.com/fleet-demo.mp4 （云上项目远程查询 + 出门在外管理家里设备两大场景）
-
-### 参赛信息
-本作品参加 2026 华为开发者大赛 · 小红书 Skill 创新赛，已上架 [华为云 Skill 市场](https://skills.huaweicloud.com/community)（搜 "mcp-fleet"）。
+- 提交包文件数：**21**（≤ 30 ✓）
+- 提交包大小：约 **1 MB**（≤ 40MB ✓）
+- 全部代码基于 MIT 许可开源，纯标准库零第三方依赖。
