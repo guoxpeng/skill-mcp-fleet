@@ -6,6 +6,56 @@
 
 ---
 
+## [5.0.6] — 2026-10-18 · Termux 一键安装 + 中文交互菜单（git tag: v5.0.6）
+
+**打通安卓端：Termux 用户一条命令装主控 CLI（免 git clone），节点安装自动 nohup
+守护；fleet.py 新增中文交互菜单（手机/桌面通用），降低非技术用户门槛。**
+
+### 新增
+- **Termux 主控 CLI 一键部署**：`install.sh --cli-only` —— 自动 pkg 装 python，
+  从 GitHub 拉 fleet.py 部署到 `$HOME/.mcp-fleet-cli/`，单文件零依赖，免 git clone。
+  部署后直接 `python3 ~/.mcp-fleet-cli/fleet.py menu` 进入中文菜单。
+- **Termux 节点安装**：`install.sh` 自动检测 Termux（`uname -o=Android`），
+  路径 root 用 `$PREFIX/opt`，普通用户用 `$HOME/.fleet/`，强制 nohup 模式，
+  supervisor 3s 拉起 + kill -9 自动复活（与 Linux systemd 同语义）。
+- **fleet.py 中文交互菜单**：`fleet.py menu`（无参数默认进入）—— 16 项操作，
+  覆盖节点管理/诊断体检/远程操控/消息拓扑/安装发现，纯 input 零依赖，
+  手机 Termux 与桌面终端都能跑，降低非技术用户门槛。
+- **install.sh 参数 `--cli-only` / `--invite` / `--uninstall` 完整闭环。**
+
+### 修复
+- **_TERMUX_PREFIX 被覆盖（历史 bug）**：行 51 的 `_TERMUX_PREFIX="${PREFIX:-}"`
+  把环境变量清掉，导致 Termux 检测在测试/特殊环境失效。修复为保留已有值。
+- **CLI_ONLY 未初始化**：`set -u` 下未设 CLI_ONLY 时节点安装报 unbound variable。
+- **fleet.py build_parser 缺 return p**：菜单子命令插入时意外丢失，导致无参数时
+  报 `NoneType.parse_args`。
+- **连接可靠性加固（v5.0.6.1，C1-C8）**：单播投递 `_http_deliver` 加 2 次重试
+  （指数退避 1s/3s），网络抖动时消息不进死信；`_broadcast_loop` 广播 sock 异常
+  路径泄漏（finally 兜底关闭）；`_listen_loop` 端口被占用/权限不足时不再静默
+  退出（指数退避重试，最大 60s，前 3 次告警）；gossip 同步/拉信失败输出调试
+  日志；`t_peers --check` 401/403 显示「在线(需令牌)」不再误报「不通」；
+  `cmd_add`/`cmd_doctor` 路径提示改通用（不再硬编码特定用户目录）；
+  install-cmd 帮助文本补 Termux 说明；三处 setsid 改为存在性检测 + nohup
+  兜底（Termux 未装 coreutils 时安装失败）；curl 下载失败加 python urllib
+  兜底（Termux 无 curl 场景）。
+- **中文菜单参数 bug（v5.0.6.2，M1-M6）**：菜单选项 5/6 的 `name→target`
+  参数名错误；选项 9 缺 `timeout/agent/port`；选项 12 缺 `text/file`；
+  选项 14 缺 16 个参数导致调用必报错；选项 15 改为提示信息（无对应子命令）。
+
+### 新增（v5.0.6.3）
+- **`fleet` 无参数显示本机状态摘要**：已登记副端数 + 在线/离线 + 令牌配置
+  状态 + 中文命令说明 + 快速开始指南，新用户零门槛上手。
+
+### 测试
+- **112 用例全绿**：新增 TestTermuxInstall 6 项——CLI 一键安装（真 HTTP 源）、
+  Termux 节点安装（nohup 守护 + /health）、supervisor kill-9 复活、
+  _TERMUX_PREFIX 保留、CLI_ONLY 初始化、菜单子命令存在；新增
+  TestWinHardening 6 项（代理豁免/探活禁代理/pythonw 回退链）与
+  TestPlatformGuard 11 项（三平台守护等价性）。
+- Termux 冒烟全流程：mock Termux 环境验证 CLI 一键安装 + 节点安装 + 守护。
+
+---
+
 ## [5.0.5] — 2026-10-17 · Windows 代理穿透修复版本（git tag: v5.0.5）
 
 **第五轮审查聚焦 Windows 端。实锤并修复一个贯穿协议层与安装器的同源根因：

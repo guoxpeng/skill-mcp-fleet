@@ -48,7 +48,8 @@
 set -euo pipefail
 
 # Termux 的环境变量 $PREFIX 会被下面的 PREFIX=""（工具名前缀参数）清掉，先存下来
-_TERMUX_PREFIX="${PREFIX:-}"
+# v5.0.6: 优先用调用方已设置的 _TERMUX_PREFIX（测试钩子），否则取 Termux 环境 $PREFIX
+_TERMUX_PREFIX="${_TERMUX_PREFIX:-${PREFIX:-}}"
 
 NAME=""
 PORT="3100"
@@ -75,6 +76,7 @@ DIRECTORY_TOKEN=""
 KEEPALIVE="1"
 REQUIRE_AUTH="0"
 GEN_TOKEN="0"
+CLI_ONLY="0"
 
 # 先存一份原始参数：下面的解析会把 $@ shift 光，非 root 自动 sudo 重执行时要用
 ORIG_ARGS=("$@")
@@ -109,8 +111,9 @@ while [ $# -gt 0 ]; do
     --mode)       CONN_MODE="${2:-permanent}"; shift 2 ;;
     --control)    CTRL_MODE="${2:-direct}"; shift 2 ;;
     --ttl)        TTL="${2:-0}"; shift 2 ;;
-    --invite)     INVITE_CODE="${2:-}"; shift 2 ;;
-    --uninstall)  UNINSTALL="1"; shift ;;
+--invite)     INVITE_CODE="${2:-}"; shift 2 ;;
+     --cli-only)   CLI_ONLY="1"; shift ;;
+     --uninstall)  UNINSTALL="1"; shift ;;
     -h|--help)    sed -n '2,44p' "$0" 2>/dev/null || echo "(管道方式不支持 --help，请见 README)"; exit 0 ;;
     *) echo "[!] 未知参数: $1"; exit 1 ;;
   esac
@@ -415,6 +418,88 @@ pm_install() {  # $1=包管理器 $2..=包名；返回 0 表示成功
     *)       return 1 ;;
   esac
 }
+# ============================================================================
+# v5.0.6: 主控 CLI 一键部署（--cli-only）
+# Termux / 任何装得上 python3 的机器，一条命令拿到 fleet.py（免 git clone）。
+# 部署到 $HOME/.mcp-fleet-cli/fleet.py —— fleet.py 零依赖自包含，
+# peers 登记表写在它自己旁边，单文件即可完整工作。
+# 测试钩子：_CLI_SRC_URL 可覆盖下载地址（单元测试用本地 HTTP 源）。
+# ============================================================================
+install_cli() {
+  echo ""
+  echo "==========================================="
+  echo "  mcp-fleet 主控 CLI 一键部署 v5.0.6 (--cli-only)"
+  echo "==========================================="
+  local PM; PM="$(detect_pm)"
+  case "$PM" in
+    pkg)
+      pkg install -y python >/dev/null 2>&1 || pkg install -y python3 >/dev/null 2>&1 \
+        || die "pkg 安装 python 失败，请手动执行：pkg install python"
+      log "python 已就绪 (Termux/pkg)" ;;
+    apt-get)
+      run_priv env DEBIAN_FRONTEND=noninteractive apt-get update -qq >/dev/null 2>&1 || true
+      run_priv env DEBIAN_FRONTEND=noninteractive apt-get install -y -qq python3 >/dev/null 2>&1 \
+        || die "apt 安装 python3 失败，请手动执行：apt-get install -y python3"
+      log "python3 已就绪 (apt)" ;;
+    dnf|yum)
+      run_priv "$PM" install -y -q python3 >/dev/null 2>&1 \
+        || die "$PM 安装 python3 失败"
+      log "python3 已就绪 ($PM)" ;;
+    *)
+      if command -v python3 >/dev/null 2>&1 || command -v python >/dev/null 2>&1; then
+        log "检测到已有 python，跳过包安装"
+      else
+        die "识别不出包管理器且无 python，请手动安装 python3 后再跑"
+      fi ;;
+  esac
+  local CLIDIR="$HOME/.mcp-fleet-cli"
+  mkdir -p "$CLIDIR"
+  local SRC="${_CLI_SRC_URL:-}"
+  local OK=""
+  # 阶段 1：curl 下载（3 个镜像源轮询）
+  if [ -z "$SRC" ]; then
+    for _u in \
+        "https://raw.githubusercontent.com/guoxpeng/skill-mcp-fleet/main/scripts/fleet.py" \
+        "https://ghproxy.net/https://raw.githubusercontent.com/guoxpeng/skill-mcp-fleet/main/scripts/fleet.py" \
+        "https://ghfast.top/https://raw.githubusercontent.com/guoxpeng/skill-mcp-fleet/main/scripts/fleet.py"; do
+      if curl -fsSL --connect-timeout 8 "$_u" -o "$CLIDIR/fleet.py" 2>/dev/null; then
+        SRC="$_u"; OK="1"; break
+      fi
+    done
+  else
+    curl -fsSL --connect-timeout 8 "$SRC" -o "$CLIDIR/fleet.py" 2>/dev/null && OK="1"
+  fi
+  # 阶段 2：curl 失败 -> python urllib 兜底（Termux 卸载了 curl / 系统无 curl 等场景）
+  if [ -z "$OK" ] && [ -n "$SRC" ]; then
+    local PYTRY=""
+    command -v python3 >/dev/null 2>&1 && PYTRY="python3"
+    command -v python >/dev/null 2>&1 && PYTRY="python"
+    if [ -n "$PYTRY" ]; then
+      log "curl 失败，用 $PYTRY urllib 兜底下载..."
+      $PYTRY -c "import urllib.request,sys; urllib.request.urlretrieve(sys.argv[1], sys.argv[2])" \
+        "$SRC" "$CLIDIR/fleet.py" 2>/dev/null && OK="1"
+    fi
+  fi
+  if [ -z "$OK" ] || [ ! -s "$CLIDIR/fleet.py" ]; then
+    die "下载 fleet.py 失败。兜底：git clone https://github.com/guoxpeng/skill-mcp-fleet.git && cd skill-mcp-fleet && python3 scripts/fleet.py add ..."
+  fi
+  chmod +x "$CLIDIR/fleet.py"
+  local PY="python"
+  command -v python >/dev/null 2>&1 || PY="python3"
+  log "fleet.py 已部署到 $CLIDIR/fleet.py"
+  echo ""
+  echo "  把某台机器（云服务器 / 电脑 / 另一台手机）加进来："
+  echo "    $PY $CLIDIR/fleet.py add --name sandbox --url http://<地址>:<端口>/mcp --token <auth_token>"
+  echo ""
+  echo "  常用命令："
+  echo "    $PY $CLIDIR/fleet.py list               # 已登记的节点"
+  echo "    $PY $CLIDIR/fleet.py probe <名字>       # 连通性 + 工具清单体检"
+  echo "    $PY $CLIDIR/fleet.py exec <名字> <命令> # 在远端设备执行"
+  echo "    $PY $CLIDIR/fleet.py tools <名字>       # 列远端工具"
+  echo "    $PY $CLIDIR/fleet.py health             # 批量体检全部节点"
+  echo ""
+  echo "  提示：双方都装上后，任意一方执行 pair 即可互相登记（双向控制）。"
+}
 # 包管理器升级也压掉交互（修 curl 这类依赖错位时用）
 pm_upgrade() {
   local _pm="$1"
@@ -444,6 +529,14 @@ ensure_cmd() {  # $1=命令名 $2=包名(apt/dnf/yum/apk/pacman) $3=包名(terms
 }
 PM="$(detect_pm)"
 log "包管理器: ${PM:-未知}"
+
+# ---------- 主控 CLI 模式：只装 fleet.py，不装节点 ----------
+# Termux 一键（免 git clone 全仓库）：curl -fsSL <URL> | bash -s -- --cli-only
+if [ "$CLI_ONLY" = "1" ]; then
+  install_cli
+  exit 0
+fi
+
 ensure_cmd python3 python3 python || die "没有 python3，agent 跑不起来"
 ensure_cmd curl curl curl || warn "没有 curl：隧道下载与自检会受影响"
 # ---- curl 能跑≠好用：Termux 常见 curl 与 nghttp2 版本错位导致链接失败 ----
@@ -3998,7 +4091,12 @@ wd_start() {
   [ -x "$DIR/mcp-watchdog.sh" ] || return 0
   [ -f "$DIR/.no_keepalive" ] && return 0
   if wd_running; then return 0; fi
-  setsid nohup bash "$DIR/mcp-watchdog.sh" >> "$DIR/watchdog.log" 2>&1 < /dev/null &
+  # v5.0.6.1: setsid 可能不存在（Termux 未装 coreutils），用 nohup 兜底
+  if command -v setsid >/dev/null 2>&1; then
+    setsid nohup bash "$DIR/mcp-watchdog.sh" >> "$DIR/watchdog.log" 2>&1 < /dev/null &
+  else
+    nohup bash "$DIR/mcp-watchdog.sh" >> "$DIR/watchdog.log" 2>&1 < /dev/null &
+  fi
   sleep 1
   wd_running && echo "保活守护已启动 (pid $(cat "$WDPIDF"))" || echo "保活守护启动失败（见 watchdog.log）"
 }
@@ -4027,7 +4125,12 @@ start() {
   if command -v termux-wake-lock >/dev/null 2>&1; then
     termux-wake-lock >/dev/null 2>&1 || true
   fi
-  setsid nohup "$DIR/_supervisor.sh" >> "$LOG" 2>&1 < /dev/null &
+  # v5.0.6.1: setsid 可能不存在（Termux 未装 coreutils）—— 用 nohup 兜底
+  if command -v setsid >/dev/null 2>&1; then
+    setsid nohup "$DIR/_supervisor.sh" >> "$LOG" 2>&1 < /dev/null &
+  else
+    nohup "$DIR/_supervisor.sh" >> "$LOG" 2>&1 < /dev/null &
+  fi
   for _ in $(seq 1 20); do
     running && break
     sleep 0.3
@@ -4288,7 +4391,11 @@ if [ -n "${CF_TOKEN:-}" ]; then
     echo "[i] 固定隧道已在运行（pid $(cat "$PIDF")），复用。"
   else
     : > "$LOG"
-    setsid nohup "$BIN" tunnel --no-autoupdate run --token "$CF_TOKEN" >> "$LOG" 2>&1 < /dev/null &
+    if command -v setsid >/dev/null 2>&1; then
+      setsid nohup "$BIN" tunnel --no-autoupdate run --token "$CF_TOKEN" >> "$LOG" 2>&1 < /dev/null &
+    else
+      nohup "$BIN" tunnel --no-autoupdate run --token "$CF_TOKEN" >> "$LOG" 2>&1 < /dev/null &
+    fi
     sleep 2
     REAL="$(pgrep -f "$BIN tunnel --no-autoupdate run --token" 2>/dev/null | head -1 || true)"
     if [ -n "$REAL" ]; then echo "$REAL" > "$PIDF"; else echo $! > "$PIDF"; fi
@@ -4319,7 +4426,11 @@ CREATED="1"
 PROTO_ARGS=""
 [ -n "${CF_PROTO:-}" ] && PROTO_ARGS="--protocol ${CF_PROTO}"
 # shellcheck disable=SC2086
-setsid nohup "$BIN" tunnel --url "http://127.0.0.1:$PORT" --no-autoupdate $PROTO_ARGS >> "$LOG" 2>&1 < /dev/null &
+if command -v setsid >/dev/null 2>&1; then
+  setsid nohup "$BIN" tunnel --url "http://127.0.0.1:$PORT" --no-autoupdate $PROTO_ARGS >> "$LOG" 2>&1 < /dev/null &
+else
+  nohup "$BIN" tunnel --url "http://127.0.0.1:$PORT" --no-autoupdate $PROTO_ARGS >> "$LOG" 2>&1 < /dev/null &
+fi
 # 记真实 cloudflared pid：setsid 可能 fork，$! 未必是最终进程
 sleep 1
 REAL="$(pgrep -f "$BIN tunnel --url http://127.0.0.1:$PORT" 2>/dev/null | head -1 || true)"

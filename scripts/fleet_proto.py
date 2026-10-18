@@ -11,7 +11,7 @@ fleet_proto -- MCP-Fleet 自研通讯协议层（零依赖，纯 Python 标准�
   - store-and-forward：消息不会因节点离线而丢失
 """
 
-import json, os, re, socket, threading, time, uuid, io
+import json, os, re, socket, sys, threading, time, uuid, io
 import urllib.request, urllib.parse, urllib.error
 import ipaddress
 import base64, hashlib, hmac
@@ -636,6 +636,7 @@ class DiscoveryLayer:
 
     def _broadcast_loop(self):
         while not self._stop.is_set():
+            sock = None
             try:
                 sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
                 sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
@@ -648,51 +649,71 @@ class DiscoveryLayer:
                         sock.sendto(hello, (subnet, self.discover_port))
                     except Exception:
                         pass
-                sock.close()
             except Exception:
+                # v5.0.6.1: 端口/权限异常等不中断线程，等下一轮重试
                 pass
+            finally:
+                if sock:
+                    sock.close()
             self._stop.wait(DISCOVER_INTERVAL)
 
     def _listen_loop(self):
-        try:
-            self._sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            try:
-                self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
-            except Exception:
-                pass
-            self._sock.bind(("", self.discover_port))
-            self._sock.settimeout(5)
-        except Exception:
-            return
+        bind_failures = 0
         while not self._stop.is_set():
             try:
-                data, addr = self._sock.recvfrom(4096)
-                if not data:
-                    continue
+                self._sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
                 try:
-                    pkt = json.loads(data.decode("utf-8"))
-                except (ValueError, UnicodeDecodeError):
-                    continue
-                if pkt.get("proto") != PROTO_NAME:
-                    continue
-                if pkt.get("name") == self.node_name:
-                    continue
-                # v5.0: 伪造已知节点（签名不符）直接丢弃
-                if not self._verify_hello(pkt):
-                    self._rejected += 1
-                    continue
-                name = pkt.get("name", "")
-                port = pkt.get("port", DEFAULT_HTTP_PORT)
-                caps = pkt.get("caps", {})
-                ip = addr[0]
-                self._known[name] = time.time()
-                if self.on_discover:
-                    self.on_discover(name, ip, port, caps)
-            except socket.timeout:
+                    self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+                except Exception:
+                    pass
+                self._sock.bind(("", self.discover_port))
+                self._sock.settimeout(5)
+                bind_failures = 0  # 重置失败计数
+            except Exception as e:
+                bind_failures += 1
+                wait = min(2 ** bind_failures, 60)  # 指数退避，最大 60s
+                # v5.0.6.1: 端口被占用/权限不足时不退订，等重试
+                if bind_failures <= 3:
+                    print("[mcp-fleet/warn] UDP 监听端口 %d 失败: %s — %ds 后重试"
+                             % (self.discover_port, e, wait), file=sys.stderr)
+                self._stop.wait(wait)
                 continue
+            # 正常接收循环
+            while not self._stop.is_set():
+                try:
+                    data, addr = self._sock.recvfrom(4096)
+                    if not data:
+                        continue
+                    try:
+                        pkt = json.loads(data.decode("utf-8"))
+                    except (ValueError, UnicodeDecodeError):
+                        continue
+                    if pkt.get("proto") != PROTO_NAME:
+                        continue
+                    if pkt.get("name") == self.node_name:
+                        continue
+                    # v5.0: 伪造已知节点（签名不符）直接丢弃
+                    if not self._verify_hello(pkt):
+                        self._rejected += 1
+                        continue
+                    name = pkt.get("name", "")
+                    port = pkt.get("port", DEFAULT_HTTP_PORT)
+                    caps = pkt.get("caps", {})
+                    ip = addr[0]
+                    self._known[name] = time.time()
+                    if self.on_discover:
+                        self.on_discover(name, ip, port, caps)
+                except socket.timeout:
+                    continue
+                except Exception:
+                    continue
+            # 退出接收循环（_stop 已设置），清理 socket
+            try:
+                self._sock.close()
             except Exception:
-                continue
+                pass
+            self._sock = None
 
     def known_nodes(self):
         return dict(self._known)
@@ -777,36 +798,46 @@ class MessageDelivery:
         # v5.0.2: 冷却中的 peer 直接跳过——不让挂死的主机每轮白等一次超时
         if not self.health.is_available(url):
             return False
-        try:
-            base = url.rstrip("/")
-            for suffix in ["/mcp", "/sse", "/rpc"]:
-                if base.endswith(suffix):
-                    base = base[:-len(suffix)]
-                    break
-            deliver_url = base + "/fleet/mail"
-            payload = {
-                "msg_id": msg.get("msg_id", uuid.uuid4().hex[:16]),
-                "from": msg.get("from", ""),
-                "to": msg.get("to", ""),
-                "text": msg.get("text", ""),
-                "topic": msg.get("topic", ""),
-                "ts": msg.get("ts", time.strftime("%Y-%m-%d %H:%M:%S")),
-                "source_node": self.mail.node_name,
-                "hops": msg.get("hops", 0) + 1,
-            }
-            data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-            req = urllib.request.Request(deliver_url, data=data, method="POST")
-            req.add_header("Content-Type", "application/json; charset=utf-8")
-            if token:
-                req.add_header("Authorization", "Bearer " + token)
-            with _opener_for(deliver_url).open(req, timeout=HTTP_TIMEOUT) as r:
-                ok = (r.status == 200)
-            self.health.record_success(url)
-            return ok
-        except Exception:
-            # v5.0.2: 失败计入熔断——连续 2 次后进入冷却，不再每轮白等
-            self.health.record_failure(url)
-            return False
+        base = url.rstrip("/")
+        for suffix in ["/mcp", "/sse", "/rpc"]:
+            if base.endswith(suffix):
+                base = base[:-len(suffix)]
+                break
+        deliver_url = base + "/fleet/mail"
+        payload = {
+            "msg_id": msg.get("msg_id", uuid.uuid4().hex[:16]),
+            "from": msg.get("from", ""),
+            "to": msg.get("to", ""),
+            "text": msg.get("text", ""),
+            "topic": msg.get("topic", ""),
+            "ts": msg.get("ts", time.strftime("%Y-%m-%d %H:%M:%S")),
+            "source_node": self.mail.node_name,
+            "hops": msg.get("hops", 0) + 1,
+        }
+        data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        req = urllib.request.Request(deliver_url, data=data, method="POST")
+        req.add_header("Content-Type", "application/json; charset=utf-8")
+        if token:
+            req.add_header("Authorization", "Bearer " + token)
+        # v5.0.6.1: 重试 2 次（指数退避 1s/3s），网络抖动时消息不进死信
+        attempts = 0
+        while attempts < 3:
+            try:
+                with _opener_for(deliver_url).open(req, timeout=HTTP_TIMEOUT) as r:
+                    ok = (r.status == 200)
+                if ok:
+                    self.health.record_success(url)
+                    return True
+                # 非 200 状态码（非网络错误）——不重试，直接失败
+                self.health.record_failure(url)
+                return False
+            except Exception:
+                attempts += 1
+                if attempts < 3:
+                    time.sleep(2 ** attempts)  # 1s, 3s 退避
+        # 3 次均失败
+        self.health.record_failure(url)
+        return False
 
     def _broadcast(self, msg):
         peers = self.get_peers() if self.get_peers else {}
@@ -918,9 +949,12 @@ class SyncEngine:
                 for m in msgs:
                     self.mail.inbox_append(m)
             return resp
-        except Exception:
+        except Exception as e:
             # v5.0.2: gossip 失败计入熔断（与投递共享冷却状态）
             self.health.record_failure(url)
+            # v5.0.6.1: 失败日志便于调试连接问题
+            print("[mcp-fleet/debug] sync_with_peer %s failed: %s"
+                  % (url, e), file=sys.stderr)
             return None
 
     def _poll_peer(self, base, token, agent_name):
@@ -932,7 +966,9 @@ class SyncEngine:
                 req.add_header("Authorization", "Bearer " + token)
             with _opener_for(poll_url).open(req, timeout=HTTP_TIMEOUT) as r:
                 return json.loads(r.read().decode("utf-8")).get("messages", [])
-        except Exception:
+        except Exception as e:
+            print("[mcp-fleet/debug] _poll_peer %s failed: %s"
+                  % (base, e), file=sys.stderr)
             return []
 
     def sync_loop(self):

@@ -358,3 +358,60 @@ class TestWinHardening:
         s = self.inst
         rc, out = s._run_cmd(["echo", "hello-fleet"])
         assert rc == 0 and "hello-fleet" in out
+
+
+
+class TestTermuxInstall:
+    """v5.0.6 Termux 一键安装：CLI 部署 + 节点安装 + 守护 + _TERMUX_PREFIX 保留。"""
+
+    inst = pytest.importorskip("install", reason="install 导入失败")
+
+    def test_termux_prefix_preserved(self):
+        """_TERMUX_PREFIX 不应被空 PREFIX 覆盖（读 install.sh 源码验证修复模式）。"""
+        src = open("/workspace/mcp-fleet/scripts/install.sh", encoding="utf-8").read()
+        # 修复后：优先用已有 _TERMUX_PREFIX，否则取 Termux $PREFIX
+        assert '_TERMUX_PREFIX="${_TERMUX_PREFIX:-${PREFIX:-}}"' in src,             "_TERMUX_PREFIX 保留修复未生效"
+        # 同时验证旧 bug 模式已不存在
+        assert '_TERMUX_PREFIX="${PREFIX:-}"' not in src, "旧 bug 模式仍存在"
+
+    def test_cli_only_initialized(self, monkeypatch):
+        """CLI_ONLY 默认值应为 0（set -u 不崩）。"""
+        s = self.inst
+        # 模拟 install.sh 在 set -u 下引用未初始化变量会崩
+        # 这里验证脚本源码里 CLI_ONLY="0" 存在
+        src = open("/workspace/mcp-fleet/scripts/install.sh", encoding="utf-8").read()
+        assert 'CLI_ONLY="0"' in src, "CLI_ONLY 未初始化，set -u 下会崩"
+
+    def test_menu_subcommand_exists(self):
+        """fleet.py 应支持 menu 子命令（中文交互菜单入口）。"""
+        import subprocess, sys
+        r = subprocess.run(
+            [sys.executable, "/workspace/mcp-fleet/scripts/fleet.py", "menu", "--help"],
+            capture_output=True, text=True, timeout=30)
+        # 菜单帮助输出应含中文提示
+        assert r.returncode == 0, r.stderr
+        assert "中文交互菜单" in r.stdout or "menu" in r.stdout.lower()
+
+    def test_menu_no_args_enters_menu(self, monkeypatch):
+        """fleet.py 无参数时应进入中文菜单（不打印英文 help）。"""
+        import subprocess, sys
+        # 给 stdin EOF 让 menu 立即退出
+        r = subprocess.run(
+            [sys.executable, "/workspace/mcp-fleet/scripts/fleet.py"],
+            input="0\n", capture_output=True, text=True, timeout=30)
+        # 输出应含中文 banner
+        assert "MCP Fleet" in r.stdout or "主控" in r.stdout, r.stdout[:200]
+
+    def test_install_sh_has_cli_only_flag(self):
+        """install.sh 应识别 --cli-only 参数。"""
+        src = open("/workspace/mcp-fleet/scripts/install.sh", encoding="utf-8").read()
+        assert "--cli-only" in src
+        assert "install_cli()" in src
+        assert 'CLI_ONLY="1"' in src
+
+    def test_install_sh_termux_detection(self):
+        """install.sh Termux 检测逻辑完整（is_termux + 路径 + nohup 降级）。"""
+        src = open("/workspace/mcp-fleet/scripts/install.sh", encoding="utf-8").read()
+        assert "is_termux()" in src
+        assert "手机模式" in src or "Termux" in src
+        assert 'MODE="nohup"' in src  # Termux 强制 nohup

@@ -721,9 +721,9 @@ def cmd_doctor(a):
               % (info.get("server"), info.get("version"), info.get("tools"), info.get("root")))
     except Exception as e:
         print(err("  [2/7] HTTP") + " 失败：%r" % (e,))
-        fails.append("HTTP 探活失败：副端进程可能没起。容器里跑 "
-                     "`bash /opt/%s_mcp/mcp-ctl.sh status`；systemd 机器跑 "
-                     "`systemctl status %s-mcp`。" % (a.target, a.target))
+        fails.append("HTTP 探活失败：副端进程可能没起。"
+                     "容器里跑 `bash 副端安装目录/mcp-ctl.sh status`；"
+                     "systemd 机器跑 `systemctl status <name>-mcp`。")
 
     # 3 MCP
     c = MCPClient(url, a.timeout, token=meta.get("token", ""))
@@ -1113,6 +1113,7 @@ def cmd_install_cmd(a):
         url = MIRRORS.get(a.mirror, a.mirror)
         print("curl -fsSL %s -o install.sh && sudo bash install.sh %s" % (url, opts))
     print()
+    print(dim("# Termux 用户（无 sudo）：bash install.sh %s" % opts))
     print(dim("装完看输出里的「服务状态: active」+「本机自检通过」。"))
     print(dim("然后在主端：python fleet.py add --name %s --ip <副端IP> --port %d" % (a.name, a.port)))
     return 0
@@ -1289,11 +1290,11 @@ def cmd_add(a):
                   % (info.get("server"), info.get("version"), info.get("tools")))
             if info.get("auth") and not token:
                 print(warn("[!] ") + "副端开了鉴权，但没给 --token —— 工具调用会被 401 拒绝。")
-                print(dim("    取令牌：在副端跑  grep auth_token /opt/%s_mcp/mcp_agent_config.json" % a.name))
+                print(dim("    取令牌：在副端跑  grep auth_token 副端安装目录/mcp_agent_config.json"))
         except urllib.error.HTTPError as e:
             if e.code in (401, 403):
                 print(err("[x] ") + "副端在线但拒绝访问（HTTP %d）—— 需要 --token" % e.code)
-                print(dim("    取令牌：在副端跑  grep auth_token /opt/%s_mcp/mcp_agent_config.json" % a.name))
+                print(dim("    取令牌：在副端跑  grep auth_token 副端安装目录/mcp_agent_config.json"))
                 if not a.force:
                     return 2
                 print(warn("[force] ") + "仍然写入配置。")
@@ -1305,7 +1306,7 @@ def cmd_add(a):
             print(err("[x] ") + "连不上 %s（%r）" % (url, e))
             print("\n排查：")
             print("  内网机型 → 确认副端装好了，且主端能访问该 IP:端口")
-            print("  容器/云主机 → 内网 IP 主端够不到，到副端跑：bash /opt/%s_mcp/mcp-tunnel.sh" % a.name)
+            print("  容器/云主机 → 内网 IP 主端够不到，到副端跑：bash 副端安装目录/mcp-tunnel.sh")
             print("  装副端     → python fleet.py install-cmd --name %s --port %d" % (a.name, a.port))
             if not a.force:
                 return 2
@@ -2102,11 +2103,352 @@ def build_parser():
 
     # v4.1: fleet discover -- UDP 广播发现
     sp = sub.add_parser("discover", help="UDP 广播发现同网段 fleet 节点（v4.1 自研协议）")
-    sp.add_argument("--discover-port", type=int, default=3199, help="UDP 发现端口")
-    sp.add_argument("--timeout", type=int, default=10, help="等待应答秒数")
-    sp.set_defaults(func=cmd_discover_proto)
+    sp.add_argument("--deep", action="store_true", help="主动 ping 所有 254 个 IP（慢但全）")
+
+    # ==========================================================================
+    # v5.0.6: 中文交互菜单（手机/桌面通用，无参数时默认进入）
+    # ==========================================================================
+    sp = sub.add_parser("menu", help="中文交互菜单（无参数时默认进入）")
+    sp.add_argument("--no-clear", action="store_true", help="不清屏（调试用）")
 
     return p
+
+
+def show_fleet_status():
+    """v5.0.6.3: 无参数时显示本机状态 + 中文命令说明。"""
+    import urllib.request
+    # 清屏
+    os.system("clear" if os.name != "nt" else "cls")
+    print("=" * 60)
+    print("  MCP Fleet · AI 对等协作网 · 主控 CLI v5.0.6")
+    print("=" * 60)
+
+    # ---- 本机状态 ----
+    nodes = load_registry().get("nodes", {})
+    print("\n  【本机状态】")
+    if not nodes:
+        print("    还没有任何副端。")
+    else:
+        print("    已登记副端：%d 个" % len(nodes))
+        for i, (n, m) in enumerate(sorted(nodes.items()), 1):
+            url = m.get("url", "?")
+            has_token = bool(m.get("token", ""))
+            # 探活
+            status = "  在线" if probe_anonymous(url, timeout=3) else "  离线"
+            print("    [%d] %-15s %-40s %s %s" % (
+                i, n, url[:40], status, "(已配令牌)" if has_token else "(无令牌)"))
+
+    # ---- 本机 agent 信息（如果有） ----
+    for cfg_path in agent_config_paths().get("workbuddy", []):
+        if os.path.isfile(cfg_path):
+            try:
+                cfg = load_json_config(cfg_path)
+                servers = cfg.get(servers_key(cfg), {})
+                if servers:
+                    print("\n  【本机 agent】")
+                    for name, v in list(servers.items())[:3]:
+                        url = v.get("url", "")
+                        token = _token_from_headers(v)
+                        print("    %s  %s  %s" % (
+                            name, url[:45], "已配令牌" if token else "未配令牌"))
+                    break
+            except Exception:
+                pass
+            break
+
+    # ---- 常用命令 ----
+    print("\n  【常用命令】")
+    print("    fleet list                    列出已登记的副端")
+    print("    fleet add --name x --url ...  添加副端")
+    print("    fleet probe <名字>            连通性体检")
+    print("    fleet doctor <名字>           完整链路体检")
+    print("    fleet exec <名字> <命令>      在副端执行命令")
+    print("    fleet tools <名字>            列副端工具清单")
+    print("    fleet health                  批量体检全部节点")
+    print("    fleet menu                    进入中文交互菜单")
+    print("    fleet install-cmd --name pi   打印副端安装命令")
+    print("    fleet pair <地址> --token T   双向配对")
+
+    print("\n  【快速开始】")
+    print("    1. 在副端安装：bash <(curl -fsSL <URL>) --name my-pc")
+    print("    2. 在主端注册：fleet add --name my-pc --url http://IP:3100/mcp --token <令牌>")
+    print("    3. 远程操控：fleet exec my-pc \"hostname; df -h\"")
+    print()
+    print("  输入 fleet menu 进入中文交互菜单")
+    print("=" * 60)
+    return 0
+
+
+def cmd_menu(a):
+    """中文交互菜单：零依赖纯 input，手机 Termux / 桌面终端都能跑。"""
+    try:
+        import readline  # 行编辑（历史上下键），无副作用
+    except Exception:
+        pass  # 某些环境缺失 readline 时忽略，不影响功能
+    clear = (not a.no_clear)
+    nodes = load_registry().get("nodes", {})
+
+    def _banner():
+        if clear:
+            os.system("clear" if os.name != "nt" else "cls")
+        print("=" * 56)
+        print("  MCP Fleet · AI 对等协作网 · 主控 CLI v5.0.6")
+        print("=" * 56)
+
+    def _node_list():
+        ns = load_registry().get("nodes", {})
+        if not ns:
+            print("  还没有任何副端。")
+            return []
+        print("\n  已登记副端：")
+        for i, (n, m) in enumerate(sorted(ns.items()), 1):
+            url = m.get("url", "?")
+            desc = m.get("description", "")
+            print(f"    [{i:>2}] {n:<15} {url:<40} {desc}")
+        return list(sorted(ns.keys()))
+
+    def _probe(name, timeout=5):
+        url, meta = resolve_target(name)
+        token = meta.get("token", "")
+        try:
+            info = http_probe(url, timeout=timeout, token=token)
+            return True, info
+        except Exception as e:
+            return False, str(e)
+
+    def _pick_node(prompt="选择副端编号: "):
+        ns = load_registry().get("nodes", {})
+        if not ns:
+            print("  没有副端。先用 [11] 添加一个。")
+            input("  按回车继续...")
+            return None
+        names = list(sorted(ns.keys()))
+        for i, n in enumerate(names, 1):
+            print(f"    [{i:>2}] {n}")
+        try:
+            c = int(input("\n  " + prompt).strip() or "0")
+            return names[c - 1] if 1 <= c <= len(names) else None
+        except (ValueError, IndexError):
+            return None
+
+    while True:
+        _banner()
+        print("""
+  请选择操作：
+
+  【节点管理】
+   [1] 列出已登记的副端          [2] 添加副端
+   [3] 移除副端                  [4] 双向配对（pair）
+
+  【诊断与体检】
+   [5] 连通性体检（probe）       [6] 完整链路体检（doctor）
+   [7] 批量体检全部节点（health）
+
+  【远程操控】
+   [8] 执行命令（exec）          [9] 调用工具（call）
+  [10] 列远端工具清单（tools）
+
+  【消息与拓扑】
+  [11] 发送消息（msg send）     [12] 查看消息历史
+  [13] 打印 mesh 拓扑图
+
+  【安装与发现】
+  [14] 一键安装副端命令（install-cmd）
+  [15] SSH 远程装副端（bootstrap）
+  [16] 局域网发现（discover）
+
+  [0] 退出""")
+        print()
+        try:
+            choice = input("  请选择 (0-16): ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print("\n  再见！")
+            return 0
+
+        if choice == "0":
+            print("  再见！")
+            return 0
+
+        # ---- 1: list ----
+        elif choice == "1":
+            _banner()
+            _node_list()
+            input("\n  按回车继续...")
+
+        # ---- 2: add ----
+        elif choice == "2":
+            _banner()
+            print("\n  添加副端")
+            print("  " + "-" * 40)
+            name = input("  副端名字: ").strip()
+            if not name:
+                input("  名字不能为空，按回车..."); continue
+            url = input("  地址 (如 http://192.168.1.10:3100/mcp): ").strip()
+            if not url:
+                input("  地址不能为空，按回车..."); continue
+            token = input("  令牌 (没有则留空): ").strip()
+            no_test = input("  跳过连通测试? (y/N): ").strip().lower() == "y"
+            args = argparse.Namespace(name=name, url=url, ip=None, port=3100,
+                                      token=token, no_test=no_test, timeout=5,
+                                      force=False)
+            r = cmd_add(args)
+            if r == 0:
+                print(f"\n  已添加 {name}")
+            else:
+                print(f"\n  添加失败，返回码 {r}")
+            input("  按回车继续...")
+
+        # ---- 3: remove ----
+        elif choice == "3":
+            _banner()
+            name = _pick_node("要删除的副端编号: ")
+            if name:
+                args = argparse.Namespace(name=name)
+                cmd_remove(args)
+                print(f"  已移除 {name}")
+            input("  按回车继续...")
+
+        # ---- 4: pair ----
+        elif choice == "4":
+            _banner()
+            print("\n  双向配对")
+            print("  格式：设备码@地址  或  直接地址")
+            target = input("  输入对方地址: ").strip()
+            if not target:
+                input("  不能为空，按回车..."); continue
+            token = input("  对方令牌 (没有则留空): ").strip() or None
+            port = 3100
+            args = argparse.Namespace(target=target, port=port, token=token)
+            r = cmd_pair(args)
+            if r == 0:
+                print("  配对成功！")
+            else:
+                print(f"  配对失败，返回码 {r}")
+            input("  按回车继续...")
+
+        # ---- 5: probe ----
+        elif choice == "5":
+            _banner()
+            name = _pick_node("要体检的副端编号: ")
+            if name:
+                args = argparse.Namespace(target=name, timeout=5)
+                r = cmd_probe(args)
+            input("\n  按回车继续...")
+
+        # ---- 6: doctor ----
+        elif choice == "6":
+            _banner()
+            name = _pick_node("要体检的副端编号: ")
+            if name:
+                args = argparse.Namespace(target=name, timeout=10, deep=False)
+                r = cmd_doctor(args)
+            input("\n  按回车继续...")
+
+        # ---- 7: health ----
+        elif choice == "7":
+            _banner()
+            args = argparse.Namespace(deep=False)
+            cmd_health(args)
+            input("\n  按回车继续...")
+
+        # ---- 8: exec ----
+        elif choice == "8":
+            _banner()
+            name = _pick_node("要执行的副端编号: ")
+            if name:
+                cmd = input("  命令: ").strip()
+                if cmd:
+                    args = argparse.Namespace(target=name, command=[cmd], sudo=False,
+                                              timeout=None, work_dir=None, stdin=None)
+                    r = cmd_exec(args)
+            input("\n  按回车继续...")
+
+        # ---- 9: call ----
+        elif choice == "9":
+            _banner()
+            name = _pick_node("要调用的副端编号: ")
+            if name:
+                tool = input("  工具名: ").strip()
+                args_json = input("  参数 JSON (如 {\"path\":\"/\"}): ").strip() or "{}"
+                if tool:
+                    args = argparse.Namespace(target=name, tool=tool, args=args_json,
+                                              timeout=30, agent=None, port=3100)
+                    r = cmd_call(args)
+            input("\n  按回车继续...")
+
+        # ---- 10: tools ----
+        elif choice == "10":
+            _banner()
+            name = _pick_node("要列工具的副端编号: ")
+            if name:
+                args = argparse.Namespace(target=name)
+                r = cmd_tools(args)
+            input("\n  按回车继续...")
+
+        # ---- 11: msg send ----
+        elif choice == "11":
+            _banner()
+            name = _pick_node("发送给副端编号: ")
+            if name:
+                text = input("  消息内容: ").strip()
+                if text:
+                    args = argparse.Namespace(target=name, text=text, file=None)
+                    r = cmd_msg(args)
+            input("\n  按回车继续...")
+
+        # ---- 12: msg history ----
+        elif choice == "12":
+            _banner()
+            name = _pick_node("要查看消息历史的副端编号: ")
+            if name:
+                args = argparse.Namespace(target=name, limit=20, text="", file=None)
+                r = cmd_msg(args)
+            input("\n  按回车继续...")
+
+        # ---- 13: mesh ----
+        elif choice == "13":
+            _banner()
+            args = argparse.Namespace(deep=False)
+            cmd_mesh(args)
+            input("\n  按回车继续...")
+
+        # ---- 14: install-cmd ----
+        elif choice == "14":
+            _banner()
+            name = input("  副端名字 (默认 pi): ").strip() or "pi"
+            args = argparse.Namespace(name=name, port=3100, prefix=None,
+                                      sudo_pass=None, tunnel=False, mode=None,
+                                      auth_token=None, allow_ips=None,
+                                      directory=None, directory_token=None,
+                                      no_keepalive=False, generate_token=False,
+                                      require_auth=False, mirror="auto",
+                                      offline=False, uninstall=False)
+            cmd_install_cmd(args)
+            input("\n  按回车继续...")
+
+        # ---- 15: bootstrap ----
+        elif choice == "15":
+            _banner()
+            print(warn("  bootstrap 需要较多参数（SSH 用户/密钥/密码等），"))
+            print(warn("  请直接在终端用命令行执行："))
+            print()
+            print("  python3 fleet.py bootstrap --help")
+            print()
+            print("  示例：")
+            print("  python3 fleet.py bootstrap pi@192.168.1.10 --name pi --generate-token")
+            input("\n  按回车继续...")
+
+        # ---- 16: discover ----
+        elif choice == "16":
+            _banner()
+            deep = input("  深度扫描（慢）? (y/N): ").strip().lower() == "y"
+            args = argparse.Namespace(deep=deep)
+            cmd_discover_proto(args)
+            input("\n  按回车继续...")
+
+        else:
+            print("  无效选择，按回车继续...")
+            input()
 
 
 def main():
@@ -2114,8 +2456,8 @@ def main():
     p = build_parser()
     a = p.parse_args()
     if not getattr(a, "cmd", None):
-        p.print_help()
-        return 0
+        # v5.0.6.3: 无参数显示本机状态 + 中文命令说明
+        return show_fleet_status()
     if a.cmd == "exec" and not a.command:
         return die("命令为空")
     # 地址自动跟随：--no-sync 或 FLEET_NO_SYNC=1 关掉（离线/隔离网络里更省事）

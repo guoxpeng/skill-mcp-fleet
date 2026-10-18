@@ -90,7 +90,7 @@ for _stream in (sys.stdout, sys.stderr):
 DEFAULT_CONFIG = {
     "name": "node",             # 副端标识（显示在状态页与 serverInfo）
     "tool_prefix": "",          # 工具名前缀，如 "nas_"；留空则用裸名（exec/read/...）
-    "version": "5.0.5",
+    "version": "5.0.6",
     "sudo_password": "",        # 留空且非 root 时会尝试免密 sudo
     "work_dir": "/",            # 默认工作目录
     "command_timeout": 120,     # 秒
@@ -1232,16 +1232,23 @@ def t_peers(a):
         v = nodes[n]
         st = ""
         if a.get("check"):
-            try:
-                import urllib.request
-                base = re.sub(r"/(mcp|sse)$", "", v.get("url", ""))
-                req = urllib.request.Request(base + "/health")
-                if v.get("token"):
-                    req.add_header("Authorization", "Bearer " + v["token"])
-                with _peer_opener(base).open(req, timeout=5) as r:
-                    st = "  在线" if r.status == 200 else "  HTTP %s" % r.status
-            except Exception as e:
-                st = "  不通(%s)" % (getattr(e, "reason", None) or type(e).__name__)
+                try:
+                    import urllib.request
+                    base = re.sub(r"/(mcp|sse)$", "", v.get("url", ""))
+                    req = urllib.request.Request(base + "/health")
+                    if v.get("token"):
+                        req.add_header("Authorization", "Bearer " + v.get("token", ""))
+                    try:
+                        with _peer_opener(base).open(req, timeout=5) as r:
+                            st = "  在线" if r.status == 200 else "  HTTP %s" % r.status
+                    except urllib.error.HTTPError as e:
+                        # v5.0.6.1: 401/403 = 在线但需鉴权，不算「不通」
+                        if e.code in (401, 403):
+                            st = "  在线(需令牌)"
+                        else:
+                            st = "  HTTP %s" % e.code
+                except Exception as e:
+                    st = "  不通(%s)" % (getattr(e, "reason", None) or type(e).__name__)
         lines.append("- %s  %s  %s%s" % (n, v.get("url"), "带令牌" if v.get("token") else "无令牌", st))
     return "\n".join(lines), False
 
