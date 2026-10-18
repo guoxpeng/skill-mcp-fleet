@@ -11,7 +11,7 @@ fleet_proto -- MCP-Fleet 自研通讯协议层（零依赖，纯 Python 标准�
   - store-and-forward：消息不会因节点离线而丢失
 """
 
-import json, os, re, socket, sys, threading, time, uuid, io
+import json, os, re, socket, sys, threading, time, uuid, io, collections
 import urllib.request, urllib.parse, urllib.error
 import ipaddress
 import base64, hashlib, hmac
@@ -241,6 +241,11 @@ class MailEngine:
         # blob 内仍自带 salt 字段，旧格式（每条独立 salt）解密自动兼容。
         self._salt = self._load_or_create_salt() if self.secret else None
         self._next_id = self._calc_next_id()
+        # v5.0.7: 收件箱 msg_id 去重滑动窗口 —— gossip 双路径（直投 /fleet/mail
+        # + 同步 /fleet/poll）在重试/重连场景可能把同一条消息投两次，
+        # 窗口内重复 msg_id 直接丢弃。deque 做淘汰顺序，set 做 O(1) 查询。
+        self._seen_ids = collections.deque(maxlen=4096)
+        self._seen_set = set()
 
     def _load_or_create_salt(self):
         p = os.path.join(self.dir, ".salt")
@@ -304,12 +309,24 @@ class MailEngine:
     # -- inbox --
     def inbox_append(self, msg):
         with self._cond:
+            mid = msg.get("msg_id") or msg.get("id")
+            # v5.0.7: 滑动窗口去重（同一条消息重复投递只入一次）。无 msg_id
+            # 的本地消息（如 agent 间直写）不受影响。
+            if mid is not None:
+                if mid in self._seen_set:
+                    return False
+                if len(self._seen_ids) >= 4096:
+                    old = self._seen_ids.popleft()
+                    self._seen_set.discard(old)
+                self._seen_ids.append(mid)
+                self._seen_set.add(mid)
             if "id" not in msg:
                 msg["id"] = self._next_id
                 self._next_id += 1
             with io.open(self.inbox_path, "a", encoding="utf-8") as f:
                 f.write(json.dumps(self._encrypt_field(msg), ensure_ascii=False) + "\n")
             self._cond.notify_all()
+            return True
 
     def inbox_read(self, agent_name, after_id=0, topic=None, mark_read=True):
         with self._lock:

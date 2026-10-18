@@ -6,6 +6,49 @@
 
 ---
 
+## [5.0.7] — 2026-10-18 · 外部审查落地：消息去重 + 连接限流 + 只读模式
+
+**对一份外部系统化审查报告（6 项运行时隐患 + 5 项架构建议）逐项核查后落地。
+核查结论：6 项隐患中 5 项已由前四轮审查防御（RLock 全方法覆盖、1MB body
+上限 + Content-Length 校验、exec 超时 + killpg 进程组、realpath + allowed_roots
+路径白名单、UDP hello 包 <200B 无工具清单），仅「消息去重」为真实缺口；
+架构建议中 SQLite / asyncio / 动态工具加载属重写级，记录进 roadmap 不落地
+（会推翻现有 122 用例测试套件的存储与网络层假设）。**
+
+### 修复
+- **收件箱 msg_id 去重（真实缺口）**：gossip 双路径（直投 /fleet/mail + 同步
+  /fleet/poll）在重试/重连场景可能把同一条消息投两次。新增 4096 条滑动窗口
+  （deque 淘汰顺序 + set O(1) 查询），重复 msg_id 直接丢弃，本地无 msg_id 的
+  直写消息不受影响。
+- **修复 example.json 版本号污染**：mcp_agent_config.example.json 的 version
+  被早期快照回滚为 4.0.0 并误传至 GitHub，统一为 5.0.7。
+
+### 新增（加固）
+- **HTTP 并发连接限流**：`max_http_threads=64`（默认）—— ThreadingHTTPServer
+  每连接一线程且无上限，网络扫描/并发洪水可打满线程。信号量在连接入口
+  非阻塞抢槽，超限直接回 503；SSE 常驻连接同样占槽（16 < 64 余量充足）。
+- **`--read-only` 只读模式**：审计观察节点专用。exec/write/edit/upload/
+  docker_restart/systemctl/exec_async/exec_kill/kill/msg_send/request_assist/
+  assist_queue/peer_call/peer_add/peer_remove/delegate/group_form/group_disband
+  共 19 个变更类工具调用直接拒绝（带前缀调用同样拦截）；查询类
+  （read/list_dir/sysinfo/docker_ps/docker_logs/ps/mesh_caps 等）全部放行；
+  tools/list 仍返回完整 41 工具（拦截发生在调用层，计入审计日志）。
+
+### 测试
+- **122 用例全绿**（+10）：TestInboxDedup 5 项（重复去重/首条保留/无 id 不受
+  影响/加密去重/窗口淘汰）、TestReadOnlyMode 5 项（变更类拒绝/查询放行/
+  前缀拦截/未知工具/清单完整）。
+
+### Roadmap（不落地说明）
+- **SQLite 替代 JSONL 存储**：现 RLock 全方法覆盖 + 原子逐行追加，单进程多
+  线程写入已安全；SQLite 迁移将推翻存储层测试假设，收益与应用场景不匹配。
+- **asyncio 重写网络层**：现 ThreadingHTTPServer + daemon_threads + 连接级
+  限流已可控；重写为 asyncio 属架构演进，非缺陷修复。
+- **动态工具加载**（两阶段发现）：41 工具 schema 约数千 token，后续可做
+  工具分组按需暴露；本期未改以保证大赛工具声明稳定。
+
+---
+
 ## [5.0.6] — 2026-10-18 · Termux 一键安装 + 中文交互菜单（git tag: v5.0.6）
 
 **打通安卓端：Termux 用户一条命令装主控 CLI（免 git clone），节点安装自动 nohup

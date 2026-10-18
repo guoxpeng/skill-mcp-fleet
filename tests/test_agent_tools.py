@@ -415,3 +415,77 @@ class TestTermuxInstall:
         assert "is_termux()" in src
         assert "手机模式" in src or "Termux" in src
         assert 'MODE="nohup"' in src  # Termux 强制 nohup
+
+
+class TestReadOnlyMode:
+    """v5.0.7: read_only 只读模式 —— 变更类工具拒绝、查询类工具放行。"""
+
+    def _set(self, v):
+        mp.CFG["read_only"] = v
+
+    def test_exec_blocked_when_read_only(self):
+        self._set(True)
+        try:
+            r = mp.call_tool("exec", {"command": "true"})
+            assert r["isError"] and "只读" in r["content"][0]["text"]
+        finally:
+            self._set(False)
+        # 关闭后恢复正常
+        r = mp.call_tool("exec", {"command": "true"})
+        assert not r["isError"]
+
+    def test_write_edit_and_ops_blocked(self):
+        self._set(True)
+        try:
+            assert mp.call_tool("write", {"filePath": "/tmp/x", "content": "1"})["isError"]
+            assert mp.call_tool("edit", {"filePath": "/tmp/x", "oldText": "a", "newText": "b"})["isError"]
+            assert mp.call_tool("upload", {"filePath": "/tmp/x", "content": "YQ=="})["isError"]
+            assert mp.call_tool("systemctl", {"action": "restart", "unit": "x"})["isError"]
+            assert mp.call_tool("docker_restart", {"name": "x"})["isError"]
+            assert mp.call_tool("exec_async", {"command": "true"})["isError"]
+            assert mp.call_tool("exec_kill", {"job_id": "1"})["isError"]
+            assert mp.call_tool("kill", {"pid": 1})["isError"]
+            assert mp.call_tool("msg_send", {"to": "y", "text": "z"})["isError"]
+            assert mp.call_tool("peer_call", {})["isError"]
+            assert mp.call_tool("delegate", {})["isError"]
+            assert mp.call_tool("group_form", {})["isError"]
+        finally:
+            self._set(False)
+
+    def test_query_tools_allowed(self):
+        self._set(True)
+        try:
+            assert not mp.call_tool("read", {"filePath": "/etc/hostname"})["isError"]
+            assert not mp.call_tool("list_dir", {"filePath": "/"})["isError"]
+            assert not mp.call_tool("sysinfo", {})["isError"]
+            assert not mp.call_tool("mesh_caps", {})["isError"]
+        finally:
+            self._set(False)
+
+    def test_unknown_tool_still_unknown(self):
+        self._set(True)
+        try:
+            r = mp.call_tool("no_such_tool", {})
+            assert r["isError"] and "未知工具" in r["content"][0]["text"]
+        finally:
+            self._set(False)
+
+    def test_prefixed_call_blocked(self):
+        """带 PREFIX 的调用同样被拦截（如 nas_exec）。"""
+        prefix = mp.PREFIX or ""
+        if not prefix:
+            pytest.skip("PREFIX 为空，无前缀调用场景")
+        self._set(True)
+        try:
+            r = mp.call_tool(prefix + "exec", {"command": "true"})
+            assert r["isError"] and "只读" in r["content"][0]["text"]
+        finally:
+            self._set(False)
+
+    def test_lists_full_toolchain_even_read_only(self):
+        """tools/list 仍返回完整 41 工具（read-only 靠调用层拦截，工具数声明不变）。"""
+        self._set(True)
+        try:
+            assert len(mp.TOOLS) == 41
+        finally:
+            self._set(False)

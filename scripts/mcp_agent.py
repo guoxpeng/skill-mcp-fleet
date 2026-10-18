@@ -90,7 +90,7 @@ for _stream in (sys.stdout, sys.stderr):
 DEFAULT_CONFIG = {
     "name": "node",             # 副端标识（显示在状态页与 serverInfo）
     "tool_prefix": "",          # 工具名前缀，如 "nas_"；留空则用裸名（exec/read/...）
-    "version": "5.0.6",
+    "version": "5.0.7",
     "sudo_password": "",        # 留空且非 root 时会尝试免密 sudo
     "work_dir": "/",            # 默认工作目录
     "command_timeout": 120,     # 秒
@@ -114,10 +114,18 @@ DEFAULT_CONFIG = {
     # MCP 客户端是程序不是浏览器，本就不需要 CORS；
     # 只有确有浏览器端调用需求时，才填具体来源，如 ["http://localhost:3000"]。
     "cors_allow_origins": [],
+    # v5.0.7: 只读模式（审计观察节点）。True 时 exec/write/edit 等变更类
+    # 工具调用全部拒绝；tools/list 仍返回完整清单（工具数声明不变，拒绝
+    # 发生在调用层并计入审计日志）。命令行 --read-only 可直接开启。
+    "read_only": False,
     # 单请求体上限（字节），防止 Content-Length 撑爆内存/线程。
     "max_body_bytes": 1048576,       # 1 MB
     # SSE 并发连接上限，防止线程被常驻连接打满。
     "max_sse_conns": 16,
+    # v5.0.7: 并发连接总数上限（信号量，连接级）——ThreadingHTTPServer 每连接
+    # 一线程且无上限，网络扫描/并发洪水可打满线程。SSE 常驻连接也占槽位，
+    # 默认 64 保证 SSE(16) 之外仍有 48 个普通请求额度。超限连接直接 503。
+    "max_http_threads": 64,
     # ---- 对等消息（v5.0.3）------------------------------------------------
     # /fleet/mail 入站消息限流（每分钟令牌数）。与工具层限流独立——节点间
     # 消息（广播一条 = 每个 peer 一次 POST + 投递重试）天然比人工调用高频，
@@ -2362,6 +2370,19 @@ TOOLS = []
 for _base, _desc, _schema in BASE_TOOLS:
     TOOLS.append({"name": PREFIX + _base, "description": _desc, "inputSchema": _schema})
 
+# v5.0.7: read-only 模式禁用的工具（变更/对外副作用类）。只读节点纯观察：
+# 本机命令执行/文件写入/服务与容器变更/消息发送/后台任务与外联控制全部拒绝；
+# 查询类（read/list_dir/sysinfo/docker_ps/docker_logs/service_logs/http_get/
+# exec_poll/exec_result/exec_jobs/search/download/ps/net_check/msg_recv/
+# msg_history/node_mode/peers/peer_info/caps/mesh_caps/mesh/group_list）放行。
+READ_ONLY_BLOCKED = {
+    "exec", "write", "edit", "upload", "docker_restart", "systemctl",
+    "exec_async", "exec_kill", "kill", "msg_send", "request_assist",
+    "assist_queue",
+    # 对端/协作控制类：不主动指使其他节点执行动作
+    "peer_call", "peer_add", "peer_remove", "delegate", "group_form", "group_disband",
+}
+
 # 查找表：带前缀名、裸名、以及旧版 nas_ 前缀名都接受（向后兼容）
 TOOL_FUNCS = {}
 for _base, _fn in BASE_FUNCS.items():
@@ -2400,6 +2421,13 @@ def call_tool(name, args, _bypass_assisted=False):
     fn = TOOL_FUNCS.get(name)
     if not fn:
         return {"content": [{"type": "text", "text": "Unknown tool / 未知工具: %s" % name}], "isError": True}
+    # v5.0.7: read-only 只读模式 —— 变更类工具直接拒绝（带前缀的调用容错）
+    if CFG.get("read_only"):
+        _base_check = name[len(PREFIX):] if PREFIX and name.startswith(PREFIX) else name
+        if _base_check in READ_ONLY_BLOCKED:
+            return {"content": [{"type": "text",
+                    "text": "节点处于只读模式（read_only），工具 %s 已禁用（变更类）" % name}],
+                    "isError": True}
     # v4.2: assisted 模式下，远程 agent 只能用白名单工具
     # node_mode/request_assist/assist_queue 始终可用
     # _bypass_assisted=True 时跳过限制（本机 agent approve 时用）
@@ -2495,6 +2523,12 @@ class FleetHTTPServer(ThreadingHTTPServer):
 SSE_LOCK = threading.Lock()
 SSE_ACTIVE = 0
 
+# v5.0.7: 并发连接总数信号量（连接级）。ThreadingHTTPServer 为每个连接创建
+# 独立线程且无上限，恶意洪水/网络扫描可瞬间打满线程导致内存激增。在
+# Handler.handle() 入口非阻塞抢槽，超限连接直接回 503；SSE 常驻连接
+# 同样占用槽位（max_sse_conns=16 < max_http_threads=64，余量充足）。
+HTTP_SLOT = threading.Semaphore(int(CFG.get("max_http_threads", 64)))
+
 
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
@@ -2506,11 +2540,30 @@ class Handler(BaseHTTPRequestHandler):
         _enable_tcp_keepalive(self.connection)
 
     def handle(self):
+        # v5.0.7: 连接级并发限流 —— 抢不到槽直接回 503，不进入业务处理。
+        # （__init__ 已完成 setup，rfile/wfile 已就绪，可以安全发响应。）
+        if not HTTP_SLOT.acquire(blocking=False):
+            try:
+                body = (b'{"error":"server busy - too many concurrent connections, '
+                        b'retry later"}')
+                self.send_response(503)
+                self.send_header("Content-Type", "application/json; charset=utf-8")
+                self.send_header("Content-Length", str(len(body)))
+                self.send_header("Connection", "close")
+                self.end_headers()
+                self.wfile.write(body)
+                self.wfile.flush()
+            except Exception:
+                pass
+            self.close_connection = True
+            return
         try:
             super().handle()
         except (ConnectionError, socket.timeout, TimeoutError, OSError):
             # 客户端断开/超时属正常现象，静默收尾，别把 traceback 刷进日志
             self.close_connection = True
+        finally:
+            HTTP_SLOT.release()
 
     def log_message(self, fmt, *args):
         pass
@@ -2979,6 +3032,9 @@ def main():
                     help="TLS 证书文件路径（PEM 格式），启用 HTTPS")
     ap.add_argument("--tls-key", default=None,
                     help="TLS 私钥文件路径（PEM 格式），启用 HTTPS")
+    ap.add_argument("--read-only", action="store_true",
+                    help="只读模式：exec/write/edit/systemctl/docker_restart 等"
+                         "变更类工具全部禁用（审计观察节点）")
     args = ap.parse_args()
 
     # ---- 鉴权前置校验（v3.1）---------------------------------------------
@@ -2998,6 +3054,9 @@ def main():
 
     global LISTEN_PORT
     LISTEN_PORT = args.port
+    # v5.0.7: --read-only 运行时开启只读模式（不写回配置文件）
+    if args.read_only:
+        CFG["read_only"] = True
     httpd = FleetHTTPServer((args.host, args.port), Handler)
     # P1-1: TLS 支持
     if args.tls_cert and args.tls_key:

@@ -442,3 +442,42 @@ class TestMaintenance:
         me.inbox_append({"from": "r", "to": "a", "text": "hello"})
         st2 = me.stats()
         assert st2["inbox_total"] == 1 and st2["inbox_bytes"] > 0
+
+
+class TestInboxDedup:
+    """v5.0.7: 收件箱 msg_id 滑动窗口去重 —— gossip 双路径（直投 /fleet/mail
+    + 同步 /fleet/poll）在重试/重连场景重复投递同一条消息时只入一次。"""
+
+    def test_duplicate_msg_id_skipped(self, tmp_engine):
+        ok1 = tmp_engine.inbox_append({"msg_id": "m1", "from": "b", "to": "node-a", "text": "hi"})
+        ok2 = tmp_engine.inbox_append({"msg_id": "m1", "from": "b", "to": "node-a", "text": "hi-dup"})
+        assert ok1 is True and ok2 is False
+        assert tmp_engine.inbox_count("node-a") == 1
+
+    def test_same_id_twice_keeps_first(self, tmp_engine):
+        tmp_engine.inbox_append({"msg_id": "m2", "from": "b", "to": "node-a", "text": "first"})
+        tmp_engine.inbox_append({"msg_id": "m2", "from": "b", "to": "node-a", "text": "second"})
+        got = tmp_engine.inbox_read("node-a", mark_read=False)
+        assert len(got) == 1 and got[0]["text"] == "first"
+
+    def test_no_msg_id_not_deduped(self, tmp_engine):
+        """本地直写消息（无 msg_id）不受去重影响，每次都入箱。"""
+        tmp_engine.inbox_append({"from": "b", "to": "node-a", "text": "x"})
+        tmp_engine.inbox_append({"from": "b", "to": "node-a", "text": "y"})
+        assert tmp_engine.inbox_count("node-a") == 2
+
+    def test_encrypted_dedup(self, enc_engine):
+        """加密存储下去重同样生效，且保留首条文本。"""
+        ok1 = enc_engine.inbox_append({"msg_id": "m3", "from": "b", "to": "node-a", "text": "sec"})
+        ok2 = enc_engine.inbox_append({"msg_id": "m3", "from": "b", "to": "node-a", "text": "sec"})
+        assert ok1 is True and ok2 is False
+        got = enc_engine.inbox_read("node-a")
+        assert len(got) == 1 and got[0]["text"] == "sec"
+
+    def test_dedup_window_eviction(self, tmp_engine):
+        """窗口（4096）溢出后最旧 msg_id 被淘汰，可再次入箱。"""
+        for i in range(4100):
+            tmp_engine.inbox_append({"msg_id": "m%d" % i, "from": "b", "to": "node-a", "text": str(i)})
+        ok = tmp_engine.inbox_append({"msg_id": "m0", "from": "b", "to": "node-a", "text": "again"})
+        assert ok is True
+        assert tmp_engine.inbox_count("node-a") == 4101
