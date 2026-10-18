@@ -1,6 +1,6 @@
 # MCP Fleet · 参赛作品提交包（v5.0）
 
-![Release](https://img.shields.io/github/v/release/guoxpeng/skill-mcp-fleet) ![Stars](https://img.shields.io/github/stars/guoxpeng/skill-mcp-fleet) ![License](https://img.shields.io/badge/license-MIT-blue) ![Python](https://img.shields.io/badge/python-3.6%2B-blue) ![Tests](https://img.shields.io/badge/tests-125%20passed-brightgreen)
+![CI](https://github.com/guoxpeng/skill-mcp-fleet/actions/workflows/ci.yml/badge.svg) ![CodeQL](https://github.com/guoxpeng/skill-mcp-fleet/actions/workflows/codeql.yml/badge.svg) ![Release](https://img.shields.io/github/v/release/guoxpeng/skill-mcp-fleet) ![Stars](https://img.shields.io/github/stars/guoxpeng/skill-mcp-fleet) ![License](https://img.shields.io/badge/license-MIT-blue) ![Python](https://img.shields.io/badge/python-3.6%2B-blue) ![Tests](https://img.shields.io/badge/tests-125%20passed-brightgreen)
 
 > **2026 华为开发者大赛 · 小红书 Skill 创新赛**
 > 赛道：**通用赛道 · 开发工具**

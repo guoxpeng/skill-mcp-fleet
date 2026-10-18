@@ -1152,6 +1152,14 @@ def _norm_mcp_url(u):
     return u
 
 
+def _strip_suffix(s, suffix):
+    """v5.0.8: str.removesuffix 的 3.6 兼容版（3.9 前无此方法，
+    老 NAS/软路由常驻 3.6/3.7）。"""
+    if suffix and s.endswith(suffix):
+        return s[:-len(suffix)]
+    return s
+
+
 def _peer_opener(url):
     """内网/本机地址不走 http_proxy（设备上配了代理时，局域网对等节点会被代理成 404/超时）。"""
     import urllib.request
@@ -1450,9 +1458,11 @@ def t_msg_recv(a):
                     url = pinfo.get("url", "")
                     token = pinfo.get("token", "")
                     if url:
-                        polled = _sync_engine._poll_peer(
-                            url.rstrip("/").removesuffix("/mcp").removesuffix("/sse"),
-                            token, me)
+                        # v5.0.8: 3.6 兼容 —— removesuffix 是 3.9+，老 NAS/
+                        # 软路由常驻 3.6/3.7，README 承诺 3.6+ 必须兑现
+                        base = _strip_suffix(
+                            _strip_suffix(url.rstrip("/"), "/mcp"), "/sse")
+                        polled = _sync_engine._poll_peer(base, token, me)
                         for m in polled:
                             _mail_engine.inbox_append(m)
             except Exception:
