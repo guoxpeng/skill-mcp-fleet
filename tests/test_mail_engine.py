@@ -481,3 +481,27 @@ class TestInboxDedup:
         ok = tmp_engine.inbox_append({"msg_id": "m0", "from": "b", "to": "node-a", "text": "again"})
         assert ok is True
         assert tmp_engine.inbox_count("node-a") == 4101
+
+    def test_peer_id_collision_not_deduped(self, tmp_engine):
+        """v5.0.8 回归：无 msg_id 的消息绝不参与去重。
+
+        gossip poll 拉回的消息携带对端 inbox 的自增 id（poll_for_agent
+        原样返回对端落盘数据），各节点 id 空间独立且都是小整数。v5.0.7
+        误用 "msg_id or id" 做去重键，两个不同 peer 的 id 碰撞时后到的
+        消息被静默丢弃。"""
+        ok1 = tmp_engine.inbox_append({"id": 42, "from": "peerA", "to": "node-a", "text": "from A"})
+        ok2 = tmp_engine.inbox_append({"id": 42, "from": "peerC", "to": "node-a", "text": "from C"})
+        assert ok1 is True and ok2 is True
+        assert tmp_engine.inbox_count("node-a") == 2
+
+    def test_dedup_window_rebuilt_on_restart(self, tmp_path):
+        """v5.0.8 回归：去重窗口启动时从 inbox.jsonl 回填。
+
+        v5.0.7 窗口纯内存，进程重启即清空——重启前已入箱的 msg_id 若被
+        对端重投（投递响应丢失后 outbox 重试跨越本端重启）会再次入箱。"""
+        me1 = MailEngine(str(tmp_path), "node-a")
+        assert me1.inbox_append({"msg_id": "r1", "from": "b", "to": "node-a", "text": "first"}) is True
+        # 同一 mailbox 目录新建引擎 = 模拟进程重启
+        me2 = MailEngine(str(tmp_path), "node-a")
+        assert me2.inbox_append({"msg_id": "r1", "from": "b", "to": "node-a", "text": "dup"}) is False
+        assert me2.inbox_count("node-a") == 1

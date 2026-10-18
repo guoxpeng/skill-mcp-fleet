@@ -246,6 +246,19 @@ class MailEngine:
         # 窗口内重复 msg_id 直接丢弃。deque 做淘汰顺序，set 做 O(1) 查询。
         self._seen_ids = collections.deque(maxlen=4096)
         self._seen_set = set()
+        # v5.0.8: 去重窗口启动回填 —— v5.0.7 窗口纯内存，进程重启即清空，
+        # 重启前已入箱的 msg_id 若被对端重投（投递响应丢失后 outbox 重试
+        # 跨越本端重启）会再次入箱造成重复消息。启动时从 inbox.jsonl 末尾
+        # 回填最近窗口大小（4096）条的 msg_id。msg_id 是结构字段不参与
+        # 落盘加密，直接读取；_calc_next_id 已全量读过一次，成本可接受。
+        try:
+            for m in self._load_jsonl(self.inbox_path)[-4096:]:
+                _mid = m.get("msg_id")
+                if _mid is not None and _mid not in self._seen_set:
+                    self._seen_ids.append(_mid)
+                    self._seen_set.add(_mid)
+        except Exception:
+            pass  # 邮箱文件损坏等极端场景：窗口留空，仅退化为重启后无去重
 
     def _load_or_create_salt(self):
         p = os.path.join(self.dir, ".salt")
@@ -309,7 +322,12 @@ class MailEngine:
     # -- inbox --
     def inbox_append(self, msg):
         with self._cond:
-            mid = msg.get("msg_id") or msg.get("id")
+            # v5.0.8: 去重键只认 msg_id —— v5.0.7 误用 "msg_id or id"，
+            # gossip poll 拉回的消息携带对端 inbox 的自增 id（poll_for_agent
+            # 原样返回对端落盘数据），各节点 id 空间独立且都是小整数自增，
+            # 跨节点碰撞会把无 msg_id 的消息误判为重复而静默丢弃。
+            # msg_id 由发件端生成（outbox/直投兜底 uuid），才是全局标识。
+            mid = msg.get("msg_id")
             # v5.0.7: 滑动窗口去重（同一条消息重复投递只入一次）。无 msg_id
             # 的本地消息（如 agent 间直写）不受影响。
             if mid is not None:

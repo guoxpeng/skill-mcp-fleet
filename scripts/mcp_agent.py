@@ -90,7 +90,7 @@ for _stream in (sys.stdout, sys.stderr):
 DEFAULT_CONFIG = {
     "name": "node",             # 副端标识（显示在状态页与 serverInfo）
     "tool_prefix": "",          # 工具名前缀，如 "nas_"；留空则用裸名（exec/read/...）
-    "version": "5.0.7",
+    "version": "5.0.8",
     "sudo_password": "",        # 留空且非 root 时会尝试免密 sudo
     "work_dir": "/",            # 默认工作目录
     "command_timeout": 120,     # 秒
@@ -2422,8 +2422,15 @@ def call_tool(name, args, _bypass_assisted=False):
     if not fn:
         return {"content": [{"type": "text", "text": "Unknown tool / 未知工具: %s" % name}], "isError": True}
     # v5.0.7: read-only 只读模式 —— 变更类工具直接拒绝（带前缀的调用容错）
+    # v5.0.8: 前缀剥离与 assisted 模式对齐（PREFIX 和旧版 nas_ 都剥）——
+    # v5.0.7 只剥 PREFIX，用旧版 nas_ 前缀调用（nas_write 等仍为有效
+    # 工具名）可完全绕过只读拦截，实测 read_only 下真实写入了文件。
     if CFG.get("read_only"):
-        _base_check = name[len(PREFIX):] if PREFIX and name.startswith(PREFIX) else name
+        _base_check = name
+        if PREFIX and name.startswith(PREFIX):
+            _base_check = name[len(PREFIX):]
+        if _base_check.startswith("nas_"):
+            _base_check = _base_check[4:]
         if _base_check in READ_ONLY_BLOCKED:
             return {"content": [{"type": "text",
                     "text": "节点处于只读模式（read_only），工具 %s 已禁用（变更类）" % name}],
@@ -2541,17 +2548,20 @@ class Handler(BaseHTTPRequestHandler):
 
     def handle(self):
         # v5.0.7: 连接级并发限流 —— 抢不到槽直接回 503，不进入业务处理。
-        # （__init__ 已完成 setup，rfile/wfile 已就绪，可以安全发响应。）
+        # v5.0.8: 503 改为直接写原始响应字节。原实现调 send_response()，
+        # 但它依赖 parse_request() 初始化的 requestline/request_version
+        # （handle() 阶段尚未解析请求，属性不存在）必然 AttributeError，
+        # 被 except 吞掉后客户端只收到空响应/连接重置，503 从未真正发出。
         if not HTTP_SLOT.acquire(blocking=False):
             try:
                 body = (b'{"error":"server busy - too many concurrent connections, '
                         b'retry later"}')
-                self.send_response(503)
-                self.send_header("Content-Type", "application/json; charset=utf-8")
-                self.send_header("Content-Length", str(len(body)))
-                self.send_header("Connection", "close")
-                self.end_headers()
-                self.wfile.write(body)
+                self.wfile.write(
+                    b"HTTP/1.1 503 Service Unavailable\r\n"
+                    b"Content-Type: application/json; charset=utf-8\r\n"
+                    b"Content-Length: " + str(len(body)).encode("ascii") + b"\r\n"
+                    b"Connection: close\r\n"
+                    b"\r\n" + body)
                 self.wfile.flush()
             except Exception:
                 pass
@@ -2950,7 +2960,11 @@ class Handler(BaseHTTPRequestHandler):
                         self.wfile.flush()
                     time.sleep(0.2)
                     idle += 1
-                    if idle % 100 == 0:
+                    # v5.0.8: keepalive 周期 20s -> 5s。客户端断开后 SSE
+                    # 线程要等下一次 keepalive 写失败才能退出、归还
+                    # HTTP_SLOT；20s 周期意味着断开的连接最长占槽 20s
+                    # （v5.0.7 动态验证实测），缩到 5s 释放更及时。
+                    if idle % 25 == 0:
                         self.wfile.write(b": keepalive\n\n")
                         self.wfile.flush()
             except Exception:

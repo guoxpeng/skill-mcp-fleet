@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
 """mcp_agent 工具表完整性测试（import 安全：load_config 只读无副作用）。"""
+import os
 import pytest
 
 mp = pytest.importorskip("mcp_agent", reason="mcp_agent 导入失败")
@@ -487,5 +488,22 @@ class TestReadOnlyMode:
         self._set(True)
         try:
             assert len(mp.TOOLS) == 41
+        finally:
+            self._set(False)
+
+    def test_legacy_nas_prefix_blocked(self, tmp_path):
+        """v5.0.8 回归：旧版 nas_ 前缀调用同样被拦截。
+
+        v5.0.7 前缀剥离只认 PREFIX，而 TOOL_FUNCS 同时注册了旧版
+        nas_ 前缀名（nas_write 等仍为有效工具）——用 nas_write 可
+        完全绕过只读拦截，实测 read_only 下真实写入了文件。"""
+        target = str(tmp_path / "bypass.txt")
+        self._set(True)
+        try:
+            r = mp.call_tool("nas_write", {"filePath": target, "content": "x"})
+            assert r["isError"] and "只读" in r["content"][0]["text"]
+            assert not os.path.exists(target)   # 文件绝不能被写入
+            r2 = mp.call_tool("nas_exec", {"command": "true"})
+            assert r2["isError"] and "只读" in r2["content"][0]["text"]
         finally:
             self._set(False)
