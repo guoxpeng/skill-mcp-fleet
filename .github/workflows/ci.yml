@@ -6,6 +6,9 @@ on:
   pull_request:
     branches: [main]
 
+permissions:
+  contents: write
+
 jobs:
   test:
     runs-on: ubuntu-latest
@@ -24,3 +27,30 @@ jobs:
         run: python3 -m compileall -q scripts/ tests/
       - name: Run test suite
         run: python3 -m pytest tests/ -q
+
+  coverage:
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install pytest-cov
+        run: pip install pytest pytest-cov
+      - name: Run tests with coverage
+        run: python3 -m pytest tests/ -q --cov=scripts --cov-report=json --cov-report=term
+      - name: Update coverage badge (core proto)
+        run: |
+          COV=$(python3 -c "import json;d=json.load(open('coverage.json'));print(round(d['files']['scripts/fleet_proto.py']['summary']['percent_covered']))")
+          COLOR=$(python3 -c "c=$COV;print('brightgreen' if c>=90 else 'green' if c>=70 else 'yellow' if c>=50 else 'red')")
+          printf '{"schemaVersion":1,"label":"core proto coverage","message":"%s%%","color":"%s"}\n' "$COV" "$COLOR" > .github/coverage-badge.json
+          cat .github/coverage-badge.json
+          if git diff --quiet -- .github/coverage-badge.json; then
+            echo "badge unchanged"; exit 0
+          fi
+          git config user.name "ci-bot"
+          git config user.email "ci@users.noreply.github.com"
+          git add .github/coverage-badge.json
+          git commit -m "chore: update coverage badge [skip ci]"
+          git push
