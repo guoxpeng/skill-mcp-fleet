@@ -1,0 +1,8 @@
+#!/data/data/com.termux/files/usr/bin/sh
+# MCP Fleet 节点 {{DISPLAY_NAME}}（Termux：sv 托管 + 唤醒锁）
+# 安装位置：$PREFIX/var/service/{{UNIT_LABEL}}/run（需 pkg install termux-services）
+# 开机自启需要另外安装 Termux:Boot 插件，并把本脚本的启动命令放进 ~/.termux/boot/
+# 先拿唤醒锁：Android 冻结后台进程会导致节点失联
+command -v termux-wake-lock >/dev/null 2>&1 && termux-wake-lock || true
+exec 2>&1
+exec {{CMD_PYTHON}} -u {{CMD_AGENT}} --host {{HOST}} --port {{PORT}}{{EXTRA_ARGS}}

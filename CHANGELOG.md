@@ -6,6 +6,75 @@
 
 ---
 
+## [5.1.0] — 2026-10-22 · 参赛版重构：标准 Skill + 安全身份 + 全平台一键接入 + Agent 自对话
+
+**主题：从"能连"升级为"敢连、好连、会自己想"。**
+相对 v5.0.9 是一次大改：新增 3 个核心模块（`fleet_core.py` / `fleet_install.py` /
+`fleet_agent.py`），重写安装引导与 Skill 文档，保留 v5 全部协议与工具兼容。
+
+### Skill 规范
+- `SKILL.md` 重写为 Agent Skills 规范：frontmatter 仅保留 `name` / `description` /
+  `license` / `compatibility`；正文 < 300 行，按渐进披露拆到 `references/`；
+  description 覆盖触发场景（NAS/云主机/软路由/手机/PC/多 Agent 协作）。
+- 新增 `LICENSE`（MIT）、`AGENTS.md`（仓库内 AI 协作约定）、`SECURITY.md` 六层安全模型。
+- 新增 `docs/V5.1-CONTRACT.md`（模块契约）、`references/architecture.md`、`references/faq.md`。
+- `scripts/build_package.py`：一键生成 ≤30 文件、含 `SHA256SUMS` 的参赛提交包。
+
+### 安全（v5.1 六层）
+- **身份**：每节点 Ed25519 身份 + 指纹；邀请链接签名 + 公钥交换 + 6 位 SAS 人工核对，
+  防中间人；公钥 pinning，指纹变化告警（X25519 原语已实现，CLI 暂走公钥交换）。
+- **请求**：跨节点请求 Ed25519 签名 + 时间窗 + nonce 防重放；可选 TLS 自签自动生成与指纹展示；
+  旧 token 鉴权兼容。
+- **数据**：邮箱认证加密 `enc2$`（HKDF + SHA-256 CTR + HMAC，encrypt-then-MAC，AAD）；
+  旧 `enc1$` 可读。
+- **策略**：`ExecPolicy` 默认拒绝 `rm -rf /`、`mkfs`、`dd of=/dev/*`、关机等；路径 jail、
+  超时/输出上限、`--read-only`、`assisted` 审批。
+- **审计**：哈希链审计（`prev_hash`），`fleet audit verify` 定位篡改行；关键安全事件计数。
+- **供应链**：安装引导 SHA256 校验、固定版本、离线包、`--dry-run`；systemd 服务加固。
+
+### 稳定连接
+- 对端状态机（discovered → pairing → trusted → degraded → offline）、退避+抖动、
+  熔断与恢复；消息 `msg_id` 去重、退避重试、死信截断；上线自动补投。
+- 多路径：局域网 UDP 发现 / 邀请直连 / Tailscale（`--relay` 配置预留）；
+  `/fleet/health` + `/fleet/metrics`（Prometheus）+ `fleet doctor` 12 项自检。
+- 优雅关闭、配置校验、版本协商、连接/请求限流与超时。
+
+### 全平台一键接入
+- 统一 `scripts/fleet_install.py`：识别 systemd / openrc / procd(OpenWrt) / launchd /
+  schtasks(Windows) / Termux(sv) / Docker / nohup，生成服务、开机自启、健康检查。
+- `scripts/install.sh` 重写为 POSIX 薄引导：SHA256 校验、`--offline`、`--version`、
+  `--dry-run`，不再内嵌 5000 行源码。
+- Android/Termux、飞牛 fnOS、群晖 DSM、威联通、绿联、OpenWrt、Linux、macOS、Windows、
+  Docker、云主机安装矩阵与限制见 `references/platform-matrix.md`。
+- `scripts/make-offline.py` 生成带校验和的离线包。
+
+### Agent 自对话
+- MCP `initialize.instructions` 内置操作手册；`prompts/list|get` 提供 7 个提示词
+  （playbook/diagnose/plan/self-review/delegate/incident/onboard）。
+- 新增自对话工具：`fleet_help` / `fleet_think` / `fleet_plan` / `fleet_reflect` /
+  `fleet_review` / `fleet_handoff`；结构化消息信封（propose/accept/counter/progress/
+  result/fail/review/handoff）与线程/验收/超时；确定性 Orchestrator + 可选 LLM 适配。
+- `references/agent-playbook.md`、`self-dialogue-protocol.md`、`prompt-pack.md`。
+
+### 工具与运维
+- 新增 `fleet_doctor` / `fleet_metrics` / `fleet_identity` / `fleet_audit_verify` /
+  `fleet_token_rotate` 等运维工具；MCP 工具带 annotations（readOnly/destructive）。
+- `fleet` CLI 统一入口：`install / up / down / join / invite / pair / nodes / status /
+  doctor / send / exec / logs / audit / token / relay / update / uninstall / demo / menu`。
+
+### 测试与质量
+- 新增 `tests/test_core_51.py`、`test_installer_51.py`、`test_agent_brain.py`、
+  `test_integration_51.py`；修复 7 个 macOS 平台相关失败用例；CI 覆盖 3.9/3.12。
+- 全量回归：**578 passed + 1 skipped**（原 130）；含 183 安装器、134 安全核心、
+  116 Agent、16 v5.1 端到端集成用例。
+
+### 升级注意
+- v5 节点可继续与 v5.1 互通（token/enc1 兼容）；建议全部升级后执行 `fleet pair --reset`
+  重建公钥信任，再关闭 `compat_v5`。
+- 旧 `install.sh` 参数保留；`scripts/install.py` 保留但推荐 `fleet_install.py`。
+
+---
+
 ## [5.0.9] — 2026-10-21 · 深度自检：3 处 CLI/协议层历史缺陷修复
 
 **对全仓库做静态扫描（pyflakes）+ 未测试覆盖脚本审查 + 运行时端点冒烟，

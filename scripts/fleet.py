@@ -53,6 +53,8 @@ target 写法
   python fleet.py sync cloud
 """
 import argparse
+import base64
+import hashlib
 import json
 import os
 import re
@@ -1545,12 +1547,92 @@ def local_node(self_url=None):
             return ""
     url = (self_url or cfg.get("self_url") or _read("current_url.txt") or "").strip()
     if not url:
-        url = "http://%s:%s" % (_lan_ip(), _read("port.txt") or "3100")
+        _port = _read("port.txt") or str(cfg.get("port") or "3100")
+        url = "http://%s:%s" % (_lan_ip(), _port)
     url = url.rstrip("/")
     if not re.search(r"/(mcp|sse)$", url):
         url += "/mcp"
+    ident = node_identity(d)
     return {"name": cfg.get("name") or socket.gethostname(), "url": url,
-            "token": cfg.get("auth_token") or "", "dir": d}
+            "token": cfg.get("auth_token") or "", "dir": d,
+            "public_key": ident["public_key"], "node_id": ident["node_id"],
+            "fingerprint": ident["fingerprint"]}
+
+
+def node_identity(dirpath=None):
+    """读取本机节点身份（fleet_core identity.json）；没有则返回空字段。
+
+    兼容两种布局：identity.json 在安装目录，或在配置的 data_dir/ 下。
+    """
+    d = dirpath
+    if not d:
+        env = os.environ.get("FLEET_NODE_DIR") or ""
+        d = env if env else HERE
+    candidates = [os.path.join(d, "identity.json")]
+    try:
+        with open(os.path.join(d, "mcp_agent_config.json"), encoding="utf-8") as cf:
+            _cfg = json.load(cf)
+        if _cfg.get("data_dir"):
+            candidates.insert(0, os.path.join(_cfg["data_dir"], "identity.json"))
+    except Exception:
+        pass
+    for cand in candidates:
+        try:
+            with open(cand, encoding="utf-8") as f:
+                ident = json.load(f)
+            break
+        except Exception:
+            ident = None
+    if not ident:
+        return {"public_key": "", "node_id": "", "fingerprint": ""}
+    try:
+        return {"public_key": ident.get("public_key_b64", ""),
+                "node_id": ident.get("node_id", ""),
+                "fingerprint": ident.get("fingerprint", "")}
+    except Exception:
+        return {"public_key": "", "node_id": "", "fingerprint": ""}
+
+
+def pair_sas(pub_a, pub_b):
+    """双方公钥排序后派生 6 位 SAS；两边算出来必须一致。"""
+    if not pub_a or not pub_b:
+        return ""
+    basis = "fleet-sas|" + "|".join(sorted([pub_a, pub_b]))
+    digest = hashlib.sha256(basis.encode("utf-8")).digest()
+    return "%06d" % (int.from_bytes(digest[:4], "big") % 1000000)
+
+
+def _node_peer_add(node_dir, name, url, token, ident):
+    """把对端写入本机节点的 peers.json（0600），供节点验签/peer_call 使用。"""
+    if not node_dir:
+        return False
+    path = os.path.join(node_dir, "peers.json")
+    try:
+        data = {"nodes": {}}
+        if os.path.isfile(path):
+            with open(path, encoding="utf-8") as f:
+                loaded = json.load(f)
+            if isinstance(loaded.get("nodes"), dict):
+                data = loaded
+        data["nodes"][name] = {
+            "url": url, "token": token or "", "added_by": "pair",
+            "updated": int(time.time()),
+            "public_key": ident.get("public_key", ""),
+            "node_id": ident.get("node_id", ""),
+            "fingerprint": ident.get("fingerprint", ""),
+        }
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+            f.write("\n")
+        try:
+            os.chmod(tmp, 0o600)
+        except OSError:
+            pass
+        os.replace(tmp, path)
+        return True
+    except Exception:
+        return False
 
 
 def cmd_pair(a):
@@ -1592,17 +1674,65 @@ def cmd_pair(a):
         print(warn("[!] ") + "两边名字都叫 %s，会互相覆盖。用 --name 给对方换个名字，或改一边的 name。" % rname)
         return 2
 
+    # v5.1 首选：调用对端 /fleet/pair 交换公钥（双方互存，后续请求可签名）
+    base = url[:-4] if url.endswith("/mcp") else url.rstrip("/")
+    peer_ident = {}
+    registered = False
     try:
-        text, is_err = c.call("peer_add", {"name": me["name"], "url": me["url"], "token": me["token"]},
-                              timeout=a.timeout)
-    except MCPError as e:
-        text, is_err = str(e), True
-    if is_err:
-        print(err("[x] ") + "对方登记本机失败：%s" % text.strip()[:300])
-        if "未知工具" in text:
-            print("    对方节点版本太旧（< v3.5），先在对方重跑一次安装命令升级。")
-        return 2
-    print(ok("[+] ") + "%s → 本机：%s" % (rname, text.strip()))
+        import urllib.request as _ur
+        payload = {"name": me["name"], "url": me["url"], "token": me["token"],
+                   "public_key": me.get("public_key", ""),
+                   "node_id": me.get("node_id", ""),
+                   "fingerprint": me.get("fingerprint", "")}
+        req = _ur.Request(base + "/fleet/pair",
+                          data=json.dumps(payload).encode("utf-8"), method="POST")
+        req.add_header("Content-Type", "application/json")
+        if token:
+            req.add_header("Authorization", "Bearer " + token)
+        with _ur.urlopen(req, timeout=a.timeout) as resp:
+            pair_resp = json.loads(resp.read().decode("utf-8"))
+        if pair_resp.get("ok"):
+            peer_ident = {"public_key": pair_resp.get("my_public_key", ""),
+                          "node_id": pair_resp.get("my_node_id", ""),
+                          "fingerprint": pair_resp.get("my_fingerprint", "")}
+            registered = True
+            _node_peer_add(me["dir"], rname, url, token, peer_ident)
+            print(ok("[+] ") + "%s → 本机：已交换身份公钥（%s）" %
+                  (rname, peer_ident.get("fingerprint") or "v5 节点"))
+    except Exception as _e:
+        registered = False
+
+    if not registered:
+        # 兼容 v5 节点：退回 peer_add（无公钥，仅 token）
+        try:
+            text, is_err = c.call("peer_add", {
+                "name": me["name"], "url": me["url"], "token": me["token"]}, timeout=a.timeout)
+        except MCPError as e:
+            text, is_err = str(e), True
+        if is_err:
+            print(err("[x] ") + "对方登记本机失败：%s" % text.strip()[:300])
+            if "未知工具" in text:
+                print("    对方节点版本太旧（< v3.5），先在对方重跑一次安装命令升级。")
+            return 2
+        print(ok("[+] ") + "%s → 本机：%s" % (rname, text.strip()))
+
+    # 取对方身份公钥（v5.1 端点或 MCP peer_info），并写入本机 registry
+    if not peer_ident.get("public_key"):
+        try:
+            info_text, info_err = c.call("peer_info", {}, timeout=a.timeout)
+            if not info_err:
+                peer_ident = json.loads(info_text)
+                if peer_ident.get("public_key"):
+                    _node_peer_add(me["dir"], rname, url, token, peer_ident)
+        except Exception:
+            peer_ident = peer_ident or {}
+    if peer_ident.get("public_key"):
+        reg = load_registry()
+        node = reg.setdefault("nodes", {}).get(rname, {})
+        node.update({"public_key": peer_ident.get("public_key", ""),
+                     "node_id": peer_ident.get("node_id", ""),
+                     "fingerprint": peer_ident.get("fingerprint", "")})
+        save_registry(reg)
 
     # 回连验证：让对方用刚登记的地址调本机一次
     try:
@@ -1616,7 +1746,13 @@ def cmd_pair(a):
         print("    办法：本机开隧道（bash %s/mcp-tunnel.sh），或用 --self-url 指定对方能访问的地址后重跑 pair。"
               % me["dir"])
         return 3
+    sas = pair_sas(me.get("public_key", ""),
+                   peer_ident.get("public_key", "") or info.get("public_key", ""))
     print(ok("[+] ") + "配对成功！%s ↔ %s 双向通讯已建立" % (me["name"], rname))
+    if sas:
+        print(ok("[+] ") + "v5.1 SAS 校验码：%s（两端显示必须一致）" % sas)
+        print("    对方指纹：%s" % (peer_ident.get("fingerprint")
+                                     or info.get("fingerprint") or "未提供（v5 节点）"))
     print("")
     print("  本机控制对方： fleet exec %s 'uptime'" % rname)
     print("  对方控制本机： 在 %s 上 fleet exec %s 'uptime'" % (rname, me["name"]))
@@ -1725,11 +1861,15 @@ def cmd_accept(a):
     my_token = me["token"] if me else ""
     try:
         import urllib.request as _ur
+        my_ident = node_identity()
         req_data = json.dumps({
             "invite_id": invite_id,
             "name": my_name,
             "url": my_url,
-            "token": my_token
+            "token": my_token,
+            "public_key": my_ident.get("public_key", ""),
+            "node_id": my_ident.get("node_id", ""),
+            "fingerprint": my_ident.get("fingerprint", "")
         }).encode()
         req = _ur.Request(verify_url, data=req_data, method="POST")
         req.add_header("Content-Type", "application/json")
@@ -1745,9 +1885,16 @@ def cmd_accept(a):
     if me:
         reg = load_registry()
         reg.setdefault("nodes", {})[device_code] = {
-            "url": url, "token": token, "description": "邀请配对"}
+            "url": url, "token": token, "description": "邀请配对",
+            "public_key": result.get("my_public_key", ""),
+            "node_id": result.get("my_node_id", ""),
+            "fingerprint": result.get("my_fingerprint", "")}
         save_registry(reg)
     print(ok("[+] ") + "确权通过！已与 %s 建立连接" % device_code)
+    _sas = pair_sas(node_identity().get("public_key", ""),
+                    result.get("my_public_key", ""))
+    if _sas:
+        print(ok("[+] ") + "v5.1 SAS 校验码：%s（与对方屏幕核对）" % _sas)
     print("  对方设备码 : %s" % device_code)
     print("  对方地址   : %s" % url)
     print("  本机设备码 : %s" % my_name)
@@ -1893,6 +2040,195 @@ def cmd_discover_proto(a):
     else:
         print(ok("[*] ") + "发现 %d 个节点" % len(found))
     return 0
+
+
+
+# ---------------------------------------------------------------- v5.1 命令
+
+def _local_mcp(a):
+    """返回本机节点的 (name, MCPClient) 或 None。"""
+    me = local_node(getattr(a, "self_url", None))
+    if not me:
+        return None
+    return me, MCPClient(me["url"], getattr(a, "timeout", 30), token=me.get("token") or "")
+
+
+def _http_json(url, token="", timeout=10):
+    import urllib.request as _ur
+    req = _ur.Request(url)
+    if token:
+        req.add_header("Authorization", "Bearer " + token)
+    with _ur.urlopen(req, timeout=timeout) as resp:
+        return json.loads(resp.read().decode("utf-8"))
+
+
+def cmd_join(a):
+    """v5.1: 解析 fleet://join/<...> 邀请并配对（节点未装则给安装命令）。"""
+    uri = (getattr(a, "uri", "") or "").strip()
+    if not uri.startswith("fleet://join/"):
+        return die("邀请格式不对，应为 fleet://join/...（可用 fleet invite 生成）")
+    try:
+        from fleet_core import Invite
+    except Exception as e:
+        return die("缺少 fleet_core，无法校验邀请：%s" % e)
+    try:
+        inv = Invite.parse(uri)
+    except Exception as e:
+        return die("邀请无效或已过期：%s" % e)
+    print(ok("[+] ") + "邀请来自 %s（指纹 %s）" % (
+        getattr(inv, "name", "?"), getattr(inv, "fingerprint", "?")))
+    me = local_node(getattr(a, "self_url", None))
+    if not me:
+        print(warn("[i] ") + "本机还没有节点。先安装再加入：")
+        print("    sh scripts/install.sh --join '%s'" % uri)
+        return 1
+    target = "%s@http://%s:%s/mcp" % (inv.name, inv.host, inv.port)
+    ns = argparse.Namespace(target=target, name=inv.name, token=inv.token,
+                            port=inv.port, timeout=getattr(a, "timeout", 30),
+                            self_url=getattr(a, "self_url", None), one_way=False)
+    print(dim("    正在配对 %s ..." % target))
+    return cmd_pair(ns)
+
+
+def cmd_nodes(a):
+    """列出本机节点认识的所有对等节点。"""
+    got = _local_mcp(a)
+    if not got:
+        return die("本机没有运行中的节点；先 sh scripts/install.sh --name <名字>")
+    me, client = got
+    try:
+        text, is_err = client.call("peers", {"check": bool(getattr(a, "check", False))})
+    except MCPError as e:
+        return die("读取节点失败：%s" % e)
+    if is_err:
+        return die(text.strip())
+    print(text)
+    return 0
+
+
+def cmd_status(a):
+    """本机节点健康 + 身份摘要。"""
+    got = _local_mcp(a)
+    if not got:
+        return die("本机没有运行中的节点")
+    me, _client = got
+    base = me["url"].rstrip("/")
+    if base.endswith("/mcp"):
+        base = base[:-4]
+    health = _http_json(base + "/fleet/health", me.get("token") or "")
+    ident = _http_json(base + "/fleet/identity", me.get("token") or "")
+    print("节点      : %s (%s)" % (health.get("name"), health.get("version")))
+    print("节点 ID   : %s" % ident.get("node_id"))
+    print("指纹      : %s" % ident.get("fingerprint"))
+    print("信任等级  : %s" % ident.get("trust"))
+    print("对端数量  : %s" % health.get("peers"))
+    print("收件箱    : %s 条 / 待投递 %s" % (health.get("inbox"), health.get("outbox")))
+    print("运行时长  : %ss" % health.get("uptime_s"))
+    return 0
+
+
+def cmd_metrics(a):
+    """打印本机节点 Prometheus 指标。"""
+    got = _local_mcp(a)
+    if not got:
+        return die("本机没有运行中的节点")
+    me, _client = got
+    base = me["url"].rstrip("/")
+    if base.endswith("/mcp"):
+        base = base[:-4]
+    import urllib.request as _ur
+    req = _ur.Request(base + "/fleet/metrics")
+    if me.get("token"):
+        req.add_header("Authorization", "Bearer " + me["token"])
+    try:
+        with _ur.urlopen(req, timeout=10) as resp:
+            sys.stdout.write(resp.read().decode("utf-8"))
+    except Exception as e:
+        return die("读取指标失败：%s" % e)
+    return 0
+
+
+def cmd_audit(a):
+    """校验本机节点审计哈希链。"""
+    got = _local_mcp(a)
+    if not got:
+        return die("本机没有运行中的节点")
+    me, client = got
+    try:
+        text, is_err = client.call("fleet_audit_verify",
+                                   {"tail": int(getattr(a, "tail", 20))})
+    except MCPError as e:
+        return die("审计校验失败：%s" % e)
+    print(text)
+    return 1 if is_err else 0
+
+
+def cmd_token(a):
+    """轮换本机节点访问 token（旧 token 立即失效）。"""
+    got = _local_mcp(a)
+    if not got:
+        return die("本机没有运行中的节点")
+    me, client = got
+    if not getattr(a, "yes", False):
+        try:
+            ans = input("轮换后旧 token 立即失效，确认？(输入 yes 继续): ").strip()
+        except Exception:
+            ans = ""
+        if ans != "yes":
+            print("已取消。")
+            return 1
+    try:
+        text, is_err = client.call("fleet_token_rotate", {"confirm": me["name"]})
+    except MCPError as e:
+        return die("轮换失败：%s" % e)
+    print(text)
+    return 1 if is_err else 0
+
+
+
+def cmd_send(a):
+    """v5.1: 通过本机节点给另一个节点/agent 发消息（在线直投或离线信箱）。"""
+    got = _local_mcp(a)
+    if not got:
+        return die("本机没有运行中的节点")
+    me, client = got
+    try:
+        text, is_err = client.call("msg_send", {
+            "from": getattr(a, "sender", "") or "cli-" + me["name"],
+            "to": a.to, "text": a.text,
+            "topic": getattr(a, "topic", "") or ""}, timeout=max(a.timeout, 30))
+    except MCPError as e:
+        return die("发送失败：%s" % e)
+    print(text)
+    return 1 if is_err else 0
+
+
+def cmd_logs(a):
+    """v5.1: 查看本机节点日志尾部（安装器日志或 systemd journal）。"""
+    me = local_node(getattr(a, "self_url", None))
+    if not me:
+        return die("本机没有安装节点")
+    n = int(getattr(a, "tail", 100) or 100)
+    candidates = [
+        os.path.join(me["dir"], "data", "logs", "agent.log"),
+        os.path.join(me["dir"], "data", "node.log"),
+        os.path.join(me["dir"], "agent.log"),
+    ]
+    for path in candidates:
+        if os.path.isfile(path):
+            try:
+                with open(path, encoding="utf-8", errors="replace") as f:
+                    lines = f.readlines()[-n:]
+                sys.stdout.write("".join(lines))
+                return 0
+            except Exception as e:
+                return die("读取 %s 失败：%s" % (path, e))
+    # 没有日志文件时尝试 journalctl
+    try:
+        return subprocess.call(["journalctl", "-u", "mcp-fleet-" + me["name"],
+                                "-n", str(n), "--no-pager"])
+    except Exception:
+        return die("未找到日志文件（%s）" % ", ".join(candidates))
 
 
 def build_parser():
@@ -2075,6 +2411,35 @@ def build_parser():
     sp.add_argument("--timeout", type=int, default=10)
     sp.set_defaults(func=cmd_invite)
 
+    def local(sp):
+        common(sp, need_target=False)
+        sp.add_argument("--self-url", dest="self_url", default=None,
+                        help="本机节点回连地址（NAT/容器场景显式指定）")
+        return sp
+
+    sp = local(sub.add_parser("join", help="v5.1: 用 fleet://join/... 邀请加入并配对"))
+    sp.add_argument("uri", help="fleet://join/...")
+    sp.set_defaults(func=cmd_join)
+    sp = local(sub.add_parser("nodes", help="v5.1: 列出本机节点认识的对等节点"))
+    sp.add_argument("--check", action="store_true", help="顺带探活")
+    sp.set_defaults(func=cmd_nodes)
+    local(sub.add_parser("status", help="v5.1: 本机节点健康与身份摘要")).set_defaults(func=cmd_status)
+    local(sub.add_parser("metrics", help="v5.1: 打印节点 Prometheus 指标")).set_defaults(func=cmd_metrics)
+    sp = local(sub.add_parser("send", help="v5.1: 通过本机节点给其他节点/agent 发消息"))
+    sp.add_argument("to", help="接收方节点/agent 名，* 为广播")
+    sp.add_argument("text", help="消息正文")
+    sp.add_argument("--from", dest="sender", default="", help="发送方名字（默认 cli-<本机名>）")
+    sp.add_argument("--topic", default="", help="消息主题")
+    sp.set_defaults(func=cmd_send)
+    sp = local(sub.add_parser("logs", help="v5.1: 查看本机节点日志尾部"))
+    sp.add_argument("--tail", type=int, default=100)
+    sp.set_defaults(func=cmd_logs)
+    sp = local(sub.add_parser("audit", help="v5.1: 校验本机节点审计哈希链"))
+    sp.add_argument("--tail", type=int, default=20)
+    sp.set_defaults(func=cmd_audit)
+    sp = local(sub.add_parser("token", help="v5.1: 轮换本机节点访问 token"))
+    sp.add_argument("--yes", action="store_true")
+    sp.set_defaults(func=cmd_token)
     sp = sub.add_parser("accept", help="v4.4: 接受邀请码 → 确权 → 自动配对")
     sp.add_argument("invite_code", help="邀请码（base64 编码字符串）")
     sp.add_argument("--name", help="本机设备名（默认用配置中的 name）")

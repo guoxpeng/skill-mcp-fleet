@@ -1,0 +1,38 @@
+[Unit]
+Description=MCP Fleet 节点 {{DISPLAY_NAME}}（HTTP {{PORT}}，v{{VERSION}}）
+Documentation=https://github.com/mcp-fleet/mcp-fleet
+After=network-online.target
+Wants=network-online.target
+# 常驻服务应当一直重试：关闭 systemd 的启动频率限制
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+WorkingDirectory={{INSTALL_DIR}}
+ExecStart={{CMD_PYTHON}} -u {{CMD_AGENT}} --host {{HOST}} --port {{PORT}}{{EXTRA_ARGS}}
+Restart=always
+RestartSec=3
+TimeoutStopSec=10
+KillMode=mixed
+StandardOutput=append:{{LOG_DIR}}/agent.log
+StandardError=append:{{LOG_DIR}}/agent.log
+UMask=0077
+{{USER_LINE}}
+{{HOME_LINE}}
+{{WATCHDOG_LINE}}
+
+# ---- 安全加固（v5.1 契约：只允许写数据/日志/安装目录，其余只读）----
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+RestrictRealtime=yes
+SystemCallArchitectures=native
+ReadWritePaths={{INSTALL_DIR}} {{DATA_DIR}} {{LOG_DIR}}
+
+[Install]
+WantedBy=multi-user.target

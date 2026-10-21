@@ -75,6 +75,20 @@ try:
 except ImportError:
     _HAS_DASHBOARD = False
 
+# v5.1: 安全核心与 Agent 智能层（可选依赖，缺失时优雅降级）
+try:
+    import fleet_core as _core
+    _HAS_CORE = True
+except Exception:                       # pragma: no cover - 文件缺失/导入失败
+    _core = None
+    _HAS_CORE = False
+try:
+    import fleet_agent as _agent_layer
+    _HAS_AGENT = True
+except Exception:                       # pragma: no cover
+    _agent_layer = None
+    _HAS_AGENT = False
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 CONFIG_PATH = os.path.join(HERE, "mcp_agent_config.json")
 
@@ -90,7 +104,7 @@ for _stream in (sys.stdout, sys.stderr):
 DEFAULT_CONFIG = {
     "name": "node",             # 副端标识（显示在状态页与 serverInfo）
     "tool_prefix": "",          # 工具名前缀，如 "nas_"；留空则用裸名（exec/read/...）
-    "version": "5.0.9",
+    "version": "5.1.0",
     "sudo_password": "",        # 留空且非 root 时会尝试免密 sudo
     "work_dir": "/",            # 默认工作目录
     "command_timeout": 120,     # 秒
@@ -166,6 +180,27 @@ DEFAULT_CONFIG = {
                        "node_mode", "request_assist"],
     # assisted_queue: 本机 agent 待处理的辅助请求队列文件
     "assisted_queue": "",
+    # ---- v5.1: 身份 / 签名 / 策略 / 审计 / Agent 智能层 -------------------
+    # 数据目录：身份、任务、审计、指标都放这里；留空 = 配置所在目录。
+    "data_dir": "",
+    # 要求所有跨节点请求必须携带 v5.1 签名（公网/多用户场景建议 True）。
+    # 旧 token 鉴权在 compat_v5=True 时仍接受，便于与 v5 节点混跑。
+    "require_signature": False,
+    "compat_v5": True,
+    # TLS 证书/私钥路径（installer --tls auto 写入）
+    "tls_cert": "",
+    "tls_key": "",
+    # 运行模式：off=不启用自对话工具；local=启用提示词与任务记录；
+    # assist=允许本机编排器执行只读任务（默认最保守）
+    "agent_autonomy": "local",
+    # 自对话任务记录上限（条），防磁盘膨胀
+    "max_task_events": 2000,
+    # 审计哈希链与旧日志的最大字节数
+    "max_audit_bytes": 5242880,
+    # 中继模式：本节点可为无公网入口的节点转发消息（需显式开启）
+    "relay_enabled": False,
+    # 低资源模式（手机/软路由）：关闭 Docker 工具、缩小限制
+    "lite": False,
 }
 
 
@@ -211,6 +246,59 @@ SERVER_NAME = CFG.get("name", "node")
 AGENT_VERSION = DEFAULT_CONFIG["version"]
 SERVER_VERSION = AGENT_VERSION
 PREFIX = CFG.get("tool_prefix", "") or ""
+PROCESS_START = time.time()
+
+# 无 fleet_agent 模块时的最小操作手册（保证任何客户端都能拿到指引）
+FALLBACK_INSTRUCTIONS = """你是 MCP Fleet 节点「%s」上的操作 Agent。
+
+工作方式：先观察（sysinfo/ps/docker_ps/service_logs/net_check/peers），再计划，
+然后执行，最后自检。查询类工具优先；变更类操作要先说明影响并取得用户确认。
+
+工具：exec/exec_async（命令）、read/write/edit/list_dir/search（文件）、
+docker_*（容器）、systemctl/service_logs（服务）、ps/kill/net_check（诊断）、
+peers/peer_call/mesh（跨节点）、msg_*（消息）、caps/delegate（委派）、
+fleet_plan/fleet_reflect/fleet_review（自对话）。
+
+安全红线：不执行 rm -rf /、mkfs、dd of=/dev/*、关机等危险命令；不泄露 token/
+私钥/邀请码；跨设备操作前确认目标节点与验收标准。""" % (SERVER_NAME)
+
+
+DATA_DIR = CFG.get("data_dir") or HERE
+try:
+    os.makedirs(DATA_DIR, mode=0o700, exist_ok=True)
+except Exception:
+    pass
+
+IDENTITY = None
+REPLAY_GUARD = None
+AUDIT_CHAIN = None
+METRICS = None
+EXEC_POLICY = None
+TASK_STORE = None
+
+if _HAS_CORE:
+    try:
+        IDENTITY = _core.Identity.load_or_create(os.path.join(DATA_DIR, "identity.json"))
+    except Exception as _e:
+        print("[warn] 节点身份初始化失败（降级为 token 模式）: %s" % _e, file=sys.stderr)
+    REPLAY_GUARD = _core.ReplayGuard()
+    METRICS = _core.Metrics()
+    try:
+        EXEC_POLICY = _core.ExecPolicy.with_defaults(CFG.get("exec_policy") or {})
+    except Exception as _e:
+        print("[warn] 执行策略初始化失败，使用默认策略: %s" % _e, file=sys.stderr)
+        EXEC_POLICY = _core.ExecPolicy.default()
+    try:
+        AUDIT_CHAIN = _core.AuditChain(os.path.join(DATA_DIR, "audit.log"))
+    except Exception as _e:
+        print("[warn] 审计链初始化失败，降级为旧审计: %s" % _e, file=sys.stderr)
+
+if _HAS_AGENT:
+    try:
+        TASK_STORE = _agent_layer.TaskStore(os.path.join(DATA_DIR, "agent"))
+    except Exception as _e:
+        print("[warn] 任务存储初始化失败，自对话降级: %s" % _e, file=sys.stderr)
+
 
 
 def _is_root():
@@ -316,6 +404,43 @@ def check_access(ip, headers):
     if not got:
         return 401, "缺少凭据。请在请求头带 Authorization: Bearer <token>"
     return 401, "token 不正确"
+
+
+# ---------------------------------------------------------------------------
+# v5.1: 公钥查表 + 请求签名校验
+# ---------------------------------------------------------------------------
+def _peer_public_key(node_id):
+    """按 node_id / fingerprint 在 peers.json 中查已配对公钥；查不到返回 ""。"""
+    if not node_id:
+        return ""
+    try:
+        nodes = load_peers().get("nodes", {})
+    except Exception:
+        return ""
+    for _name, info in nodes.items():
+        if not isinstance(info, dict):
+            continue
+        if info.get("node_id") == node_id:
+            return info.get("public_key") or info.get("pubkey") or ""
+        if (info.get("fingerprint") or "") == node_id:
+            return info.get("public_key") or info.get("pubkey") or ""
+    return ""
+
+
+def _request_path(raw_path):
+    """签名基串里的路径规范：去掉 query、末尾斜杠；根路径为 "/"。"""
+    return (raw_path or "/").split("?")[0].rstrip("/") or "/"
+
+
+def _sign_outbound_headers(method, path, body):
+    """给跨节点请求附加 v5.1 签名头；没有身份时返回空 dict（降级 token）。"""
+    if not (_HAS_CORE and IDENTITY):
+        return {}
+    try:
+        return _core.sign_request(IDENTITY, method, _request_path(path), body or b"")
+    except Exception:
+        return {}
+
 
 
 def _check_path(p):
@@ -983,13 +1108,50 @@ def _note_peer_agents(peer_name, agents):
             save_peers(d)
 
 
+
+def _mailbox_secret():
+    """邮箱落盘加密密钥。
+
+    优先复用 auth_token（v5 行为，便于旧数据解密）；未配 token 时生成并持久化
+    独立的 32 字节随机密钥（0600），保证**默认就有静态加密**，而不是裸明文。
+    """
+    tok = (CFG.get("auth_token") or "").strip()
+    if tok:
+        return tok
+    path = os.path.join(DATA_DIR, "mailbox.key")
+    try:
+        with open(path, encoding="ascii") as f:
+            val = f.read().strip()
+        if len(val) >= 32:
+            return val
+    except Exception:
+        pass
+    val = uuid.uuid4().hex + uuid.uuid4().hex
+    try:
+        if _HAS_CORE:
+            _core.atomic_write(path, val, 0o600)
+        else:
+            tmp = path + ".tmp"
+            with open(tmp, "w", encoding="ascii") as f:
+                f.write(val)
+            try:
+                os.chmod(tmp, 0o600)
+            except OSError:
+                pass
+            os.replace(tmp, path)
+    except Exception as e:
+        print("[warn] 邮箱密钥落盘失败（加密仍生效，重启后旧消息不可读）: %s" % e,
+              file=sys.stderr)
+    return val
+
 def _init_proto():
     """初始化自研通讯协议层（在 main() 中配置加载后调用）。"""
     global _mail_engine, _delivery_engine, _sync_engine
     if not _HAS_PROTO:
         return
-    # v5.0: 邮箱落盘加密密钥 = 节点 auth_token（PBKDF2 派生，零新增配置）
-    _proto_secret = CFG.get("auth_token", "") or None
+    # v5.1: 有 token 用 token（兼容旧数据），否则用独立持久化密钥——
+    # 保证即使未开鉴权，邮箱也不是明文落盘。
+    _proto_secret = _mailbox_secret()
     _mail_engine = MailEngine(HERE, SERVER_NAME, secret=_proto_secret)
     def _get_peers():
         return load_peers().get("nodes", {})
@@ -1179,11 +1341,18 @@ def _peer_opener(url):
 def _peer_rpc(url, token, payload, sid, hops, timeout):
     import urllib.request
     import urllib.error
-    req = urllib.request.Request(url, data=json.dumps(payload).encode("utf-8"), method="POST",
-                                 headers={"Content-Type": "application/json",
-                                          "Accept": "application/json, text/event-stream",
-                                          "X-Fleet-Hops": str(hops),
-                                          "X-Fleet-From": SERVER_NAME})
+    body = json.dumps(payload).encode("utf-8")
+    headers = {"Content-Type": "application/json",
+               "Accept": "application/json, text/event-stream",
+               "X-Fleet-Hops": str(hops),
+               "X-Fleet-From": SERVER_NAME}
+    # v5.1: 对端已配对公钥时附加 Ed25519 签名（token 仍保留，兼容 v5）
+    try:
+        _spath = urllib.parse.urlsplit(url).path or "/"
+        headers.update(_sign_outbound_headers("POST", _spath, body))
+    except Exception:
+        pass
+    req = urllib.request.Request(url, data=body, method="POST", headers=headers)
     if token:
         req.add_header("Authorization", "Bearer " + token)
     if sid:
@@ -1307,7 +1476,10 @@ def t_peer_add(a):
         d = load_peers()
         old = d["nodes"].get(name)
         d["nodes"][name] = {"url": url, "token": (a.get("token") or "").strip(),
-                            "added_by": a.get("_from") or "", "updated": int(time.time())}
+                            "added_by": a.get("_from") or "", "updated": int(time.time()),
+                            "public_key": (a.get("public_key") or "").strip(),
+                            "node_id": (a.get("node_id") or "").strip(),
+                            "fingerprint": (a.get("fingerprint") or "").strip()}
         save_peers(d)
     return "%s对等节点 %s → %s" % ("已更新" if old else "已添加", name, url), False
 
@@ -1322,9 +1494,16 @@ def t_peer_remove(a):
 
 
 def t_peer_info(a):
-    """配对用：告诉对方「回连我用哪个地址」。令牌不在这里返回（对方本来就持有）。"""
-    return json.dumps({"name": SERVER_NAME, "url": self_url(), "version": SERVER_VERSION,
-                       "peers": sorted(load_peers()["nodes"])}, ensure_ascii=False), False
+    """配对用：告诉对方「回连我用哪个地址 + 我的 v5.1 身份公钥」。
+
+    公钥是公开信息；token 不在这里返回（对方本来就持有或走签名）。
+    """
+    return json.dumps({
+        "name": SERVER_NAME, "url": self_url(), "version": SERVER_VERSION,
+        "node_id": IDENTITY.node_id if IDENTITY else "",
+        "fingerprint": IDENTITY.fingerprint if IDENTITY else "",
+        "public_key": IDENTITY.public_key_b64 if IDENTITY else "",
+        "peers": sorted(load_peers()["nodes"])}, ensure_ascii=False), False
 
 
 PEER_TOOLS = [
@@ -1388,8 +1567,10 @@ def _mail_load():
 
 def _mail_name(v, field):
     v = (v or "").strip()
+    if field == "to" and v == "*":
+        return v                      # 广播：投递给所有已配对节点
     if not _NAME_RE.match(v):
-        raise ValueError("%s 只能是 1-32 位字母/数字/_.-" % field)
+        raise ValueError("%s 只能是 1-32 位字母/数字/_.-（to 可用 * 广播）" % field)
     return v
 
 
@@ -2387,6 +2568,8 @@ READ_ONLY_BLOCKED = {
     "assist_queue",
     # 对端/协作控制类：不主动指使其他节点执行动作
     "peer_call", "peer_add", "peer_remove", "delegate", "group_form", "group_disband",
+    # v5.1 运维/自对话中会改变外部状态的
+    "fleet_token_rotate", "fleet_handoff",
 }
 
 # 查找表：带前缀名、裸名、以及旧版 nas_ 前缀名都接受（向后兼容）
@@ -2395,6 +2578,224 @@ for _base, _fn in BASE_FUNCS.items():
     TOOL_FUNCS[PREFIX + _base] = _fn
     TOOL_FUNCS[_base] = _fn
     TOOL_FUNCS["nas_" + _base] = _fn
+
+
+# ---------------------------------------------------------------------------
+# v5.1 运维 / 自对话工具
+# ---------------------------------------------------------------------------
+_AGENT_CLIENT = None
+_AGENT_CTX = None
+
+
+def _agent_ctx():
+    """延迟构造 Agent 工具上下文（依赖 call_tool 已在运行时可用）。"""
+    global _AGENT_CLIENT, _AGENT_CTX
+    if _AGENT_CTX is not None:
+        return _AGENT_CTX
+    client = None
+    if _HAS_AGENT:
+        try:
+            client = _agent_layer.FleetClient(call_tool, name=SERVER_NAME,
+                                              policy=EXEC_POLICY)
+        except Exception:
+            client = None
+    _AGENT_CLIENT = client
+    _AGENT_CTX = {"store": TASK_STORE, "client": client, "policy": EXEC_POLICY,
+                  "agent": SERVER_NAME, "cfg": CFG, "identity": IDENTITY,
+                  "call_tool": call_tool}
+    return _AGENT_CTX
+
+
+def _json_text(obj):
+    return json.dumps(obj, ensure_ascii=False, indent=2)
+
+
+def t_fleet_identity(a):
+    """返回本节点 v5.1 身份与信任状态。"""
+    d = {"name": SERVER_NAME, "version": SERVER_VERSION,
+         "node_id": IDENTITY.node_id if IDENTITY else "",
+         "fingerprint": IDENTITY.fingerprint if IDENTITY else "",
+         "public_key": IDENTITY.public_key_b64 if IDENTITY else "",
+         "trust": "S2/S3" if IDENTITY else ("S1" if CFG.get("auth_token") else "S0"),
+         "require_signature": bool(CFG.get("require_signature")),
+         "compat_v5": bool(CFG.get("compat_v5", True)),
+         "data_dir": DATA_DIR,
+         "peers": len(load_peers().get("nodes", {}))}
+    return _json_text(d), False
+
+
+def t_fleet_metrics(a):
+    """返回指标快照；format=prometheus 时返回 Prometheus 文本。"""
+    if METRICS is None:
+        return "fleet_core 未启用，指标不可用", True
+    if (a or {}).get("format") == "prometheus":
+        return METRICS.render_prometheus(), False
+    return _json_text(METRICS.snapshot()), False
+
+
+def t_fleet_audit_verify(a):
+    """校验哈希链审计是否被篡改，返回最近记录。"""
+    if AUDIT_CHAIN is None:
+        return "fleet_core 未启用，审计链不可用", True
+    ok, bad = AUDIT_CHAIN.verify()
+    tail = []
+    try:
+        tail = AUDIT_CHAIN.tail(int((a or {}).get("tail", 10)))
+    except Exception:
+        pass
+    return _json_text({"ok": ok, "bad_index": bad, "tail": tail}), not ok
+
+
+def t_fleet_doctor(a):
+    """12 项自检：环境、身份、端口、磁盘、审计、策略、对端、TLS 等。"""
+    import shutil
+    checks = []
+
+    def add(name, fn):
+        try:
+            ok, detail = fn()
+        except Exception as e:
+            ok, detail = False, "检查异常: %r" % (e,)
+        checks.append({"name": name, "ok": bool(ok), "detail": detail})
+
+    add("python", lambda: (sys.version_info >= (3, 6),
+                           "%s.%s.%s" % sys.version_info[:3]))
+    add("identity", lambda: (IDENTITY is not None,
+                             IDENTITY.fingerprint if IDENTITY else "缺失（token 降级）"))
+    add("config_perm", lambda: (
+        not os.path.exists(CONFIG_PATH) or (os.stat(CONFIG_PATH).st_mode & 0o077) == 0,
+        oct(os.stat(CONFIG_PATH).st_mode & 0o777) if os.path.exists(CONFIG_PATH) else "无配置"))
+    add("auth", lambda: (bool(CFG.get("auth_token") or CFG.get("require_signature")),
+                         "token=%s signature=%s" % (
+                             "有" if CFG.get("auth_token") else "无",
+                             "必须" if CFG.get("require_signature") else "可选")))
+    add("policy", lambda: (EXEC_POLICY is not None, "enabled" if EXEC_POLICY else "disabled"))
+    add("audit", lambda: (AUDIT_CHAIN is not None and AUDIT_CHAIN.verify()[0],
+                          "chain-ok" if AUDIT_CHAIN and AUDIT_CHAIN.verify()[0] else "未启用/损坏"))
+    add("disk", lambda: (
+        shutil.disk_usage(DATA_DIR).free > 50 * 1024 * 1024,
+        "%.1f GB free" % (shutil.disk_usage(DATA_DIR).free / 1024.0 / 1024.0 / 1024.0)))
+    add("port", lambda: _doctor_port())
+    add("peers", lambda: (True, "%d 个已配对节点" % len(load_peers().get("nodes", {}))))
+    add("tls", lambda: (bool(CFG.get("tls_cert")),
+                        "已配置" if CFG.get("tls_cert") else "未配置（局域网可接受）"))
+    add("time", lambda: _doctor_time())
+    add("read_only", lambda: (True, "只读" if CFG.get("read_only") else "可写"))
+    # 只有关键项失败才让自检整体失败；权限/鉴权/TLS/对端属于加固建议，
+    # 仍逐项展示，避免“内网未配 TLS”被误判为不可用。
+    critical = {"python", "identity", "policy", "audit", "disk", "port", "time"}
+    ok = all(c["ok"] for c in checks if c["name"] in critical)
+    return _json_text({"ok": ok, "checks": checks,
+                       "summary": "%d/%d 通过" % (sum(1 for c in checks if c["ok"]),
+                                                  len(checks))}), not ok
+
+
+def _doctor_port():
+    """确认本机监听端口可连（不依赖外部网络）。"""
+    port = int(CFG.get("port") or LISTEN_PORT or 3100)
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.settimeout(1.5)
+    try:
+        s.connect(("127.0.0.1", port))
+        return True, "127.0.0.1:%d 可连" % port
+    except Exception as e:
+        return False, "127.0.0.1:%d 不可连: %s" % (port, e)
+    finally:
+        s.close()
+
+
+def _doctor_time():
+    """检查系统时间是否合理（防止签名时间窗全失败）。"""
+    now = time.time()
+    if now < 1600000000:
+        return False, "系统时间异常（%s），签名校验会失败" % time.ctime(now)
+    return True, time.strftime("%F %T")
+
+
+def t_fleet_token_rotate(a):
+    """轮换 auth_token（需要 confirm=节点名，防误触发）。"""
+    if not (a or {}).get("confirm"):
+        return "需要确认：带上 confirm=%s 才会轮换 token" % SERVER_NAME, True
+    if (a or {}).get("confirm") != SERVER_NAME and (a or {}).get("confirm") is not True:
+        return "确认值不匹配：confirm 必须是 %s" % SERVER_NAME, True
+    old = CFG.get("auth_token") or ""
+    new = gen_token()
+    CFG["auth_token"] = new
+    save_config(CFG)
+    _audit_call("fleet_token_rotate", {"rotated": bool(old)}, "ok", "token rotated")
+    return _json_text({"ok": True, "token": new,
+                       "warning": "旧 token 立即失效；请把新 token 配置到对端后重启对端。",
+                       "config": CONFIG_PATH}), False
+
+
+def t_fleet_invite(a):
+    """生成 v5.1 邀请 URI（Ed25519 签名 + 过期 + 一次性 nonce）。"""
+    if IDENTITY is None:
+        return "节点身份不可用（fleet_core 未启用）", True
+    host = (a or {}).get("host") or _lan_ip()
+    port = int((a or {}).get("port") or LISTEN_PORT or 3100)
+    ttl = int((a or {}).get("ttl") or 3600)
+    try:
+        inv = _core.Invite.create(IDENTITY, SERVER_NAME, host, port, ttl=ttl,
+                                  caps=get_caps())
+        return _json_text({"ok": True, "uri": inv.to_uri(),
+                           "fingerprint": IDENTITY.fingerprint,
+                           "expires": time.strftime(
+                               "%Y-%m-%d %H:%M:%S", time.localtime(time.time() + ttl)),
+                           "next": "在目标设备执行 fleet join '<uri>'，并核对 SAS"}), False
+    except Exception as e:
+        return "生成邀请失败: %r" % (e,), True
+
+
+OPERATIONAL_TOOLS = [
+    ("fleet_identity", "查询本节点 v5.1 身份：节点 ID、指纹、公钥、信任等级、对端数量。",
+     {"type": "object", "properties": {}}),
+    ("fleet_metrics", "查看节点指标快照（工具调用/投递/安全事件）；format=prometheus 返回 Prometheus 文本。",
+     {"type": "object", "properties": {"format": {"type": "string",
+                                                  "enum": ["json", "prometheus"]}}}),
+    ("fleet_audit_verify", "校验哈希链审计日志是否被篡改，并返回最近记录。",
+     {"type": "object", "properties": {"tail": {"type": "number"}}}),
+    ("fleet_doctor", "节点自检：Python/身份/配置权限/鉴权/策略/审计/磁盘/端口/对端/TLS/时间/只读。",
+     {"type": "object", "properties": {}}),
+    ("fleet_token_rotate", "轮换访问 token（confirm=节点名 才执行）；旧 token 立即失效。",
+     {"type": "object", "properties": {"confirm": {"type": "string"}}}),
+    ("fleet_invite", "生成 v5.1 邀请 URI（签名+过期），供另一台设备 fleet join 配对。",
+     {"type": "object", "properties": {"host": {"type": "string"},
+                                       "port": {"type": "number"},
+                                       "ttl": {"type": "number"}}}),
+]
+
+OPERATIONAL_FUNCS = {
+    "fleet_identity": t_fleet_identity,
+    "fleet_metrics": t_fleet_metrics,
+    "fleet_audit_verify": t_fleet_audit_verify,
+    "fleet_doctor": t_fleet_doctor,
+    "fleet_token_rotate": t_fleet_token_rotate,
+    "fleet_invite": t_fleet_invite,
+}
+
+# 合并自对话工具（fleet_help/think/plan/reflect/review/handoff）
+V51_TOOLS = []
+V51_FUNCS = {}
+for _name, _desc, _schema in OPERATIONAL_TOOLS:
+    V51_TOOLS.append({"name": _name, "description": _desc, "inputSchema": _schema,
+                     "annotations": {"readOnlyHint": _name in (
+                         "fleet_identity", "fleet_metrics", "fleet_audit_verify",
+                         "fleet_doctor", "fleet_invite")}})
+    V51_FUNCS[_name] = OPERATIONAL_FUNCS[_name]
+if _HAS_AGENT:
+    try:
+        for _t in _agent_layer.SELF_DIALOGUE_TOOLS:
+            V51_TOOLS.append(_t)
+            V51_FUNCS[_t["name"]] = None      # 走 dispatch_tool
+    except Exception as _e:
+        print("[warn] 自对话工具注册失败: %s" % _e, file=sys.stderr)
+
+for _t in V51_TOOLS:
+    TOOLS.append(_t)
+    for _prefix in ("", PREFIX, "nas_"):
+        TOOL_FUNCS[(_prefix + _t["name"])] = _t["name"]   # 名称映射，call_tool 再分发
+
 
 
 
@@ -2424,8 +2825,33 @@ def _audit_log(tool_name, args_dict, client_ip=""):
         pass  # 审计日志写入失败不应影响主流程
 
 def call_tool(name, args, _bypass_assisted=False):
+    _bare = name
+    if PREFIX and _bare.startswith(PREFIX):
+        _bare = _bare[len(PREFIX):]
+    if _bare.startswith("nas_"):
+        _bare = _bare[4:]
+    # v5.1: 运维工具 + 自对话工具
+    if _bare in V51_FUNCS:
+        # read-only 优先于分发：fleet_handoff/fleet_token_rotate 等变更类必须被拦
+        if CFG.get("read_only") and _bare in READ_ONLY_BLOCKED:
+            return {"content": [{"type": "text",
+                    "text": "节点处于只读模式（read_only），工具 %s 已禁用（变更类）" % name}],
+                    "isError": True}
+        if _HAS_AGENT and _bare in getattr(_agent_layer, "SELF_DIALOGUE_FUNCS", {}):
+            return _agent_layer.dispatch_tool(_bare, args or {}, _agent_ctx())
+        fn6 = OPERATIONAL_FUNCS.get(_bare)
+        if fn6 is None:
+            return {"content": [{"type": "text", "text": "v5.1 工具不可用: %s" % _bare}],
+                    "isError": True}
+        try:
+            text6, err6 = fn6(args or {})
+            return {"content": [{"type": "text", "text": text6}],
+                    "isError": bool(err6)}
+        except Exception as e:
+            return {"content": [{"type": "text", "text": "错误: %r" % (e,)}],
+                    "isError": True}
     fn = TOOL_FUNCS.get(name)
-    if not fn:
+    if not fn or not callable(fn):
         return {"content": [{"type": "text", "text": "Unknown tool / 未知工具: %s" % name}], "isError": True}
     # v5.0.7: read-only 只读模式 —— 变更类工具直接拒绝（带前缀的调用容错）
     # v5.0.8: 前缀剥离与 assisted 模式对齐（PREFIX 和旧版 nas_ 都剥）——
@@ -2456,13 +2882,45 @@ def call_tool(name, args, _bypass_assisted=False):
                 "[assisted 模式] 工具 %s 需要本机 agent 批准。\n"
                 "请用 request_assist 提交辅助请求，或用 node_mode action=set_control control_mode=direct 切换为直接控制。" % name}],
                 "isError": True}
-    # P1-2: 审计危险工具
+    # v5.1: 执行策略（危险命令默认拒绝/需确认）。策略不可用时跳过，保持 v5 行为。
+    if EXEC_POLICY is not None:
+        try:
+            decision, reason, rule_id = EXEC_POLICY.check(_bare, args or {})
+        except Exception:
+            decision, reason, rule_id = "allow", "", ""
+        if decision == "deny":
+            _audit_call(name, args, "denied", "%s (%s)" % (reason, rule_id))
+            return {"content": [{"type": "text", "text":
+                "执行策略拒绝：%s（规则 %s）" % (reason, rule_id)}], "isError": True}
+        if decision == "ask" and not (args or {}).get("confirm"):
+            _audit_call(name, args, "needs_confirm", "%s (%s)" % (reason, rule_id))
+            return {"content": [{"type": "text", "text":
+                "该操作需要用户确认：%s（规则 %s）。\n"
+                "请先向用户说明影响；获得明确同意后，带 confirm=true 重新调用。" % (reason, rule_id)}],
+                "isError": True}
+    # P1-2: 审计危险工具（v5.1 改为哈希链，失败自动降级旧日志）
     _dangerous = {"exec", "exec_async", "write", "edit", "docker_restart", "systemctl"}
-    _bare = name.replace(PREFIX, "").replace("nas_", "")
     if _bare in _dangerous:
         _audit_log(name, args)
+    _t0 = time.time()
     try:
         text, is_err = fn(args or {})
+        if METRICS is not None:
+            try:
+                METRICS.inc("fleet_tool_calls_total", tool=_bare,
+                            status="error" if is_err else "ok")
+                METRICS.observe("fleet_tool_duration_ms", (time.time() - _t0) * 1000.0,
+                                tool=_bare)
+            except Exception:
+                pass
+        if AUDIT_CHAIN is not None:
+            try:
+                AUDIT_CHAIN.append({"tool": _bare, "status": "error" if is_err else "ok",
+                                    "args": _redact_args(args),
+                                    "peer": getattr(_REQ, "peer_node", "") or "",
+                                    "ms": int((time.time() - _t0) * 1000)})
+            except Exception:
+                pass
         return {"content": [{"type": "text", "text": text}], "isError": bool(is_err)}
     except KeyError as e:
         return {"content": [{"type": "text", "text": "Missing parameter / 缺少参数: %s" % e}], "isError": True}
@@ -2470,6 +2928,34 @@ def call_tool(name, args, _bypass_assisted=False):
         return {"content": [{"type": "text", "text": str(e)}], "isError": True}
     except Exception as e:
         return {"content": [{"type": "text", "text": "错误: %r" % (e,)}], "isError": True}
+
+
+def _redact_args(args):
+    """审计/日志用参数摘要：截断 + 脱敏，避免把 token/密码写进审计链。"""
+    try:
+        if _HAS_CORE:
+            return json.loads(_core.redact(json.dumps(args or {}, ensure_ascii=False)))
+    except Exception:
+        pass
+    summary = {}
+    for k, v in (args or {}).items():
+        s = str(v)
+        summary[k] = s[:120] + "..." if len(s) > 120 else s
+    return summary
+
+
+def _audit_call(tool, args, status, detail=""):
+    """策略拒绝/待确认等安全事件的统一审计入口。"""
+    if AUDIT_CHAIN is not None:
+        try:
+            AUDIT_CHAIN.append({"tool": tool, "status": status, "detail": detail,
+                                "args": _redact_args(args),
+                                "peer": getattr(_REQ, "peer_node", "") or ""})
+            return
+        except Exception:
+            pass
+    _audit_log(tool, args or {})
+
 
 
 # ---------------------------------------------------------------------------
@@ -2481,10 +2967,19 @@ def handle_rpc(msg):
     mid, method, params = msg.get("id"), msg.get("method"), msg.get("params") or {}
 
     if method == "initialize":
+        caps = {"tools": {}, "resources": {}}
+        instructions = FALLBACK_INSTRUCTIONS
+        if _HAS_AGENT:
+            try:
+                caps["prompts"] = {}
+                instructions = _agent_layer.build_instructions(CFG)
+            except Exception as _e:
+                print("[warn] Agent 提示词生成失败，使用内置简版: %s" % _e, file=sys.stderr)
         return {"jsonrpc": "2.0", "id": mid, "result": {
             "protocolVersion": params.get("protocolVersion") or "2024-11-05",
-            "capabilities": {"tools": {}},
+            "capabilities": caps,
             "serverInfo": {"name": SERVER_NAME, "version": SERVER_VERSION},
+            "instructions": instructions,
         }}
     if method in ("notifications/initialized", "initialized", "notifications/cancelled"):
         return None
@@ -2498,7 +2993,24 @@ def handle_rpc(msg):
     if method == "resources/list":
         return {"jsonrpc": "2.0", "id": mid, "result": {"resources": []}}
     if method == "prompts/list":
-        return {"jsonrpc": "2.0", "id": mid, "result": {"prompts": []}}
+        prompts = []
+        if _HAS_AGENT:
+            try:
+                prompts = _agent_layer.list_prompts()
+            except Exception as _e:
+                print("[warn] prompts/list 失败: %s" % _e, file=sys.stderr)
+        return {"jsonrpc": "2.0", "id": mid, "result": {"prompts": prompts}}
+    if method == "prompts/get":
+        if not _HAS_AGENT:
+            return {"jsonrpc": "2.0", "id": mid,
+                    "error": {"code": -32601, "message": "prompts unavailable"}}
+        try:
+            return {"jsonrpc": "2.0", "id": mid,
+                    "result": _agent_layer.get_prompt(
+                        params.get("name"), params.get("arguments") or {})}
+        except Exception as _e:
+            return {"jsonrpc": "2.0", "id": mid,
+                    "error": {"code": -32602, "message": "invalid prompt: %s" % _e}}
     if mid is not None:
         return {"jsonrpc": "2.0", "id": mid,
                 "error": {"code": -32601, "message": "Method not found: %s" % method}}
@@ -2603,9 +3115,43 @@ class Handler(BaseHTTPRequestHandler):
                              "Authorization, Content-Type, Mcp-Session-Id, X-Fleet-Token")
             self.send_header("Access-Control-Allow-Methods", "GET,POST,OPTIONS,DELETE")
 
-    def _guard(self):
-        """鉴权闸门。返回 True 表示已拦截（响应也发完了）。"""
+    def _guard(self, body=b""):
+        """鉴权闸门。返回 True 表示已拦截（响应也发完了）。
+
+        v5.1 顺序：IP 白名单 → Ed25519 签名（如带 X-Fleet-Sig）→ require_signature
+        → 旧 token 兼容。签名请求通过后 `_trusted=True` 且记录 `_peer_node`。
+        """
         ip = self.client_address[0] if self.client_address else "?"
+        self._trusted = False
+        self._peer_node = ""
+        if not _ip_allowed(ip):
+            _note_auth_fail(ip)
+            return self._deny(403, "来源 IP %s 不在 allow_ips 白名单内" % ip)
+
+        sig = (self.headers.get("X-Fleet-Sig") or "").strip()
+        if sig:
+            if not (_HAS_CORE and REPLAY_GUARD):
+                return self._deny(401, "服务端未启用 v5.1 签名校验")
+            node_id = (self.headers.get("X-Fleet-Node") or "").strip()
+            pub = _peer_public_key(node_id)
+            if not pub:
+                _note_auth_fail(ip)
+                return self._deny(401, "未知节点 %s：未配对或公钥缺失" % (node_id or "?"))
+            ok, why = _core.verify_request(
+                pub, self.command, _request_path(self.path), body or b"",
+                dict(self.headers), REPLAY_GUARD,
+                max_skew_s=int(CFG.get("signature_max_skew_s", 300)))
+            if ok:
+                AUTH_FAILS.pop(ip, None)
+                self._trusted = True
+                self._peer_node = node_id
+                return False
+            _note_auth_fail(ip)
+            return self._deny(401, "请求签名校验失败: %s" % why)
+
+        if CFG.get("require_signature"):
+            return self._deny(401, "已开启 require_signature：所有请求必须带 v5.1 签名")
+
         denied = check_access(ip, self.headers)
         if denied is None:
             # 只有「配了 token 且校验通过」才算可信；裸奔模式下不算，
@@ -2613,7 +3159,13 @@ class Handler(BaseHTTPRequestHandler):
             self._trusted = bool(CFG.get("auth_token") or "")
             return False
         code, why = denied
-        body = json.dumps({"error": why, "hint": "auth_token 配置见 mcp_agent_config.json"},
+        return self._deny(code, why)
+
+    def _deny(self, code, why):
+        """统一的鉴权失败响应（不泄露内部细节）。"""
+        body = json.dumps({"error": why,
+                           "hint": "v5.1 签名见 references/security-model.md；"
+                                   "token 配置见 mcp_agent_config.json"},
                           ensure_ascii=False).encode("utf-8")
         self.send_response(code)
         self.send_header("Content-Type", "application/json; charset=utf-8")
@@ -2646,8 +3198,6 @@ class Handler(BaseHTTPRequestHandler):
         self._empty(204)
 
     def do_POST(self):
-        if self._guard():
-            return
         try:
             _REQ.hops = max(0, int(self.headers.get("X-Fleet-Hops") or 0))
         except ValueError:
@@ -2664,6 +3214,10 @@ class Handler(BaseHTTPRequestHandler):
             self._json(413, {"error": "Content-Length 非法或超过上限 %d 字节" % limit})
             return
         raw = self.rfile.read(length) if length else b""
+
+        # v5.1: 签名校验需要 body，因此放在读取之后（body 已受上限保护）
+        if self._guard(raw):
+            return
 
         if path == "/messages":
             sid = self.path.split("sessionId=")[-1] if "sessionId=" in self.path else None
@@ -2776,21 +3330,29 @@ class Handler(BaseHTTPRequestHandler):
             peer_name = payload.get("name", "")
             peer_url = payload.get("url", "")
             peer_token = payload.get("token", "")
+            peer_pub = payload.get("public_key", "")
+            peer_nid = payload.get("node_id", "")
+            peer_fp = payload.get("fingerprint", "")
             if not peer_name or not peer_url:
                 self._json(400, {"error": "need name and url"})
                 return
-            # 本机 peer_add 对方
+            # 本机 peer_add 对方（v5.1: 一并保存公钥，后续请求走签名）
             with PEERS_LOCK:
                 d = load_peers()
                 d["nodes"][peer_name] = {"url": peer_url, "token": peer_token,
-                                         "added_by": "pair", "updated": int(time.time())}
+                                         "added_by": "pair", "updated": int(time.time()),
+                                         "public_key": peer_pub, "node_id": peer_nid,
+                                         "fingerprint": peer_fp}
                 save_peers(d)
-            # 回传本机信息
+            # 回传本机信息（公钥是公开信息；token 仅兼容 v5）
             self._json(200, {
                 "ok": True,
                 "my_name": SERVER_NAME,
                 "my_url": self_url(),
                 "my_token": CFG.get("auth_token", ""),
+                "my_public_key": IDENTITY.public_key_b64 if IDENTITY else "",
+                "my_node_id": IDENTITY.node_id if IDENTITY else "",
+                "my_fingerprint": IDENTITY.fingerprint if IDENTITY else "",
                 "my_version": SERVER_VERSION,
                 "message": "已登记 %s" % peer_name
             })
@@ -2852,6 +3414,9 @@ class Handler(BaseHTTPRequestHandler):
             peer_name = payload.get("name", "")
             peer_url = payload.get("url", "")
             peer_token = payload.get("token", "")
+            peer_pub = payload.get("public_key", "")
+            peer_nid = payload.get("node_id", "")
+            peer_fp = payload.get("fingerprint", "")
             if not invite_id or not peer_name or not peer_url:
                 self._json(400, {"error": "need invite_id, name, url"})
                 return
@@ -2875,7 +3440,9 @@ class Handler(BaseHTTPRequestHandler):
             with PEERS_LOCK:
                 d = load_peers()
                 d["nodes"][peer_name] = {"url": peer_url, "token": peer_token,
-                                         "added_by": "invite", "updated": int(time.time())}
+                                         "added_by": "invite", "updated": int(time.time()),
+                                         "public_key": peer_pub, "node_id": peer_nid,
+                                         "fingerprint": peer_fp}
                 save_peers(d)
             # 标记邀请码已使用
             inv["used"] = True
@@ -2891,6 +3458,9 @@ class Handler(BaseHTTPRequestHandler):
                 "my_name": SERVER_NAME,
                 "my_url": self_url(),
                 "my_token": CFG.get("auth_token", ""),
+                "my_public_key": IDENTITY.public_key_b64 if IDENTITY else "",
+                "my_node_id": IDENTITY.node_id if IDENTITY else "",
+                "my_fingerprint": IDENTITY.fingerprint if IDENTITY else "",
                 "my_version": SERVER_VERSION,
                 "message": "确权通过，已与 %s 建立连接" % peer_name
             })
@@ -2921,7 +3491,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         global SSE_ACTIVE
-        if self._guard():
+        if self._guard(b""):
             return
         path = self.path.split("?")[0].rstrip("/") or "/"
         if path in ("/", "/health", "/status"):
@@ -3013,6 +3583,45 @@ class Handler(BaseHTTPRequestHandler):
             self._json(200, _dashboard_data())
             return
 
+        if path == "/fleet/health":
+            mb = _mail_engine.stats() if _mail_engine else {}
+            self._json(200, {
+                "status": "ok", "name": SERVER_NAME, "version": SERVER_VERSION,
+                "node_id": IDENTITY.node_id if IDENTITY else "",
+                "fingerprint": IDENTITY.fingerprint if IDENTITY else "",
+                "uptime_s": int(time.time() - PROCESS_START),
+                "peers": len(load_peers().get("nodes", {})),
+                "inbox": mb.get("inbox_total"), "outbox": mb.get("outbox_pending"),
+                "read_only": bool(CFG.get("read_only")),
+                "require_signature": bool(CFG.get("require_signature")),
+            })
+            return
+
+        if path == "/fleet/identity":
+            self._json(200, {
+                "name": SERVER_NAME, "version": SERVER_VERSION,
+                "node_id": IDENTITY.node_id if IDENTITY else "",
+                "fingerprint": IDENTITY.fingerprint if IDENTITY else "",
+                "public_key": IDENTITY.public_key_b64 if IDENTITY else "",
+                "trust": "S2" if IDENTITY else ("S1" if CFG.get("auth_token") else "S0"),
+                "relay_enabled": bool(CFG.get("relay_enabled")),
+            })
+            return
+
+        if path == "/fleet/metrics":
+            if METRICS is None:
+                self._json(503, {"error": "metrics unavailable"})
+                return
+            text = METRICS.render_prometheus()
+            body = text.encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self._cors()
+            self.end_headers()
+            self.wfile.write(body)
+            return
+
         if path == "/fleet/status":
             if _mail_engine:
                 self._json(200, _mail_engine.stats())
@@ -3033,7 +3642,7 @@ class Handler(BaseHTTPRequestHandler):
         self._json(404, {"error": "not found"})
 
     def do_DELETE(self):
-        if self._guard():
+        if self._guard(b""):
             return
         self._empty(204)
 

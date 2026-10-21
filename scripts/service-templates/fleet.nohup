@@ -1,0 +1,59 @@
+#!/bin/sh
+# MCP Fleet 节点 {{DISPLAY_NAME}} 控制脚本（无服务管理器时的降级方案）
+# 用法：sh {{CTL_PATH}} start|stop|restart|status|log
+set -eu
+NAME="{{UNIT_LABEL}}"
+DIR="{{INSTALL_DIR}}"
+PY={{CMD_PYTHON}}
+AGENT={{CMD_AGENT}}
+PORT="{{PORT}}"
+PIDF="{{PID_FILE}}"
+LOG="{{LOG_DIR}}/agent.log"
+
+start() {
+    if status >/dev/null 2>&1; then
+        echo "[$NAME] 已在运行 (pid $(cat "$PIDF"))"
+        return 0
+    fi
+    mkdir -p "$(dirname "$PIDF")" "$(dirname "$LOG")"
+    cd "$DIR"
+    nohup "$PY" -u "$AGENT" --host {{HOST}} --port "$PORT"{{EXTRA_ARGS}} >>"$LOG" 2>&1 &
+    echo $! > "$PIDF"
+    echo "[$NAME] 已启动 (pid $(cat "$PIDF"))，日志: $LOG"
+}
+
+stop() {
+    if [ -f "$PIDF" ]; then
+        PID="$(cat "$PIDF" 2>/dev/null || echo)"
+        if [ -n "$PID" ] && kill -0 "$PID" 2>/dev/null; then
+            kill "$PID" 2>/dev/null || true
+            sleep 1
+            kill -9 "$PID" 2>/dev/null || true
+            echo "[$NAME] 已停止 (pid $PID)"
+        fi
+        rm -f "$PIDF"
+    else
+        echo "[$NAME] 未运行"
+    fi
+}
+
+status() {
+    if [ -f "$PIDF" ]; then
+        PID="$(cat "$PIDF" 2>/dev/null || echo)"
+        if [ -n "$PID" ] && kill -0 "$PID" 2>/dev/null; then
+            echo "[$NAME] 运行中 (pid $PID)"
+            return 0
+        fi
+    fi
+    echo "[$NAME] 未运行"
+    return 1
+}
+
+case "${1:-status}" in
+    start) start ;;
+    stop) stop ;;
+    restart) stop; start ;;
+    status) status ;;
+    log) tail -n "${2:-40}" "$LOG" ;;
+    *) echo "用法: sh $0 {start|stop|restart|status|log [n]}"; exit 2 ;;
+esac

@@ -4,14 +4,14 @@ import base64
 
 import pytest
 
-from fleet_proto import (CRYPTO_PREFIX, decrypt_text, encrypt_text,
+from fleet_proto import (CRYPTO_PREFIX, CRYPTO_V2_PREFIX, decrypt_text, encrypt_text,
                          hello_signature, verify_hello_signature)
 
 
 class TestEncryptDecrypt:
     def test_roundtrip_unicode(self):
         ct = encrypt_text("tok", "帮我看看NAS硬盘还剩多少 🛰")
-        assert ct.startswith(CRYPTO_PREFIX)
+        assert ct.startswith((CRYPTO_PREFIX, CRYPTO_V2_PREFIX))
         assert decrypt_text("tok", ct) == "帮我看看NAS硬盘还剩多少 🛰"
 
     def test_roundtrip_long_text(self):
@@ -35,10 +35,11 @@ class TestEncryptDecrypt:
 
     def test_tamper_detected(self):
         ct = encrypt_text("k", "secret")
-        raw = bytearray(base64.b64decode(ct[len(CRYPTO_PREFIX):]))
-        raw[40] ^= 0x01
+        prefix = CRYPTO_V2_PREFIX if ct.startswith(CRYPTO_V2_PREFIX) else CRYPTO_PREFIX
+        raw = bytearray(base64.b64decode(ct[len(prefix):]))
+        raw[len(raw) // 2] ^= 0x01
         with pytest.raises(ValueError):
-            decrypt_text("k", CRYPTO_PREFIX + base64.b64encode(bytes(raw)).decode())
+            decrypt_text("k", prefix + base64.b64encode(bytes(raw)).decode())
 
     def test_not_a_blob_rejected(self):
         with pytest.raises(ValueError):
@@ -46,7 +47,8 @@ class TestEncryptDecrypt:
 
     def test_corrupt_base64_rejected(self):
         with pytest.raises(Exception):
-            decrypt_text("k", CRYPTO_PREFIX + "!!!not-base64!!!")
+            decrypt_text("k", (CRYPTO_V2_PREFIX if _HAS_V2() else CRYPTO_PREFIX)
+                         + "!!!not-base64!!!")
 
 
 class TestHelloSignature:
@@ -73,6 +75,10 @@ class TestHelloSignature:
         wire = json.dumps({"name": "cloud-b2c3", "port": 3100,
                            "ts": time_ts(), "sig": sig})
         assert verify_hello_signature("t", json.loads(wire)) is True
+
+
+def _HAS_V2():
+    return encrypt_text("k", "x").startswith(CRYPTO_V2_PREFIX)
 
 
 def time_ts():

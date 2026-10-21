@@ -1,7 +1,7 @@
 {
   "name": "node",
   "tool_prefix": "",
-  "version": "5.0.9",
+  "version": "5.1.0",
   "sudo_password": "",
   "work_dir": "/",
   "command_timeout": 120,
@@ -25,5 +25,15 @@
   "tailnet_auto_trust": true,
   "collab_tools": true,
   "audit_log": true,
-  "rate_limit_per_min": 120
+  "rate_limit_per_min": 120,
+  "data_dir": "",
+  "require_signature": false,
+  "compat_v5": true,
+  "tls_cert": "",
+  "tls_key": "",
+  "agent_autonomy": "local",
+  "max_task_events": 2000,
+  "max_audit_bytes": 5242880,
+  "relay_enabled": false,
+  "lite": false
 }

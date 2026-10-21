@@ -6,7 +6,8 @@ import threading
 
 import pytest
 
-from fleet_proto import CRYPTO_PREFIX, MailEngine, MessageDelivery
+from fleet_proto import (CRYPTO_PREFIX, CRYPTO_V2_PREFIX, MailEngine,
+                         MessageDelivery)
 
 
 @pytest.fixture
@@ -106,7 +107,7 @@ class TestEncryption:
         enc_engine.inbox_append({"from": "b", "to": "node-a", "text": "机密内容123"})
         disk = open(enc_engine.inbox_path, encoding="utf-8").read()
         assert "机密内容123" not in disk
-        assert CRYPTO_PREFIX in disk
+        assert (CRYPTO_PREFIX in disk or CRYPTO_V2_PREFIX in disk)
 
     def test_read_returns_plaintext(self, enc_engine):
         enc_engine.inbox_append({"from": "b", "to": "node-a", "text": "hello 加密"})
@@ -391,7 +392,7 @@ class TestMaintenance:
 
     def test_compaction_keeps_encryption(self, enc_engine):
         """清理路径复用 _save_jsonl 加密回写：maintenance 后落盘仍密文（B1 交互）。"""
-        from fleet_proto import CRYPTO_PREFIX, INBOX_KEEP_READ
+        from fleet_proto import CRYPTO_PREFIX, CRYPTO_V2_PREFIX, INBOX_KEEP_READ
         me = enc_engine                                 # secret="my-secret"
         for i in range(INBOX_KEEP_READ + 10):
             me.inbox_append({"from": "r", "to": "a1", "text": "m%d" % i})
@@ -399,7 +400,7 @@ class TestMaintenance:
         cleaned = me.maintenance()
         assert cleaned["inbox"] == 10
         raw = open(me.inbox_path, encoding="utf-8").read()
-        assert CRYPTO_PREFIX in raw                     # 密文保持
+        assert (CRYPTO_PREFIX in raw or CRYPTO_V2_PREFIX in raw)  # 密文保持
         # 且解密读取正常
         assert len(me.inbox_read("a1", after_id=0)) == INBOX_KEEP_READ
 

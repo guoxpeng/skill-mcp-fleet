@@ -115,7 +115,7 @@ class TestDashboard:
         code, body = get("/fleet/ui/data")
         d = json.loads(body)
         assert d["node"] == "it-node" and d["encryption"] is True
-        assert d["version"].startswith("5.0") and d["tools"] == 41
+        assert d["version"].startswith("5.1") and d["tools"] == 53
         assert isinstance(d["peers"], list) and "sys" in d
 
 
@@ -126,7 +126,7 @@ class TestMailboxEncrypted:
         disk = open(os.path.join(node["dir"], "mailbox", "inbox.jsonl"),
                     encoding="utf-8").read()
         assert "集成测试机密内容xyz" not in disk
-        assert disk.startswith("{") and "enc1$" in disk
+        assert disk.startswith("{") and ("enc1$" in disk or "enc2$" in disk)
         # 通过 poll 拉取的是解密后明文
         code, body = get("/fleet/poll?name=it-node")
         msgs = json.loads(body)["messages"]
@@ -162,7 +162,7 @@ class TestInvite:
 
 class TestMcpProtocol:
     def test_initialize_and_tools_list(self, node):
-        """MCP 握手：initialize -> tools/list 应返回 41 个工具。"""
+        """MCP 握手：initialize -> tools/list 应返回 53 个工具（41 设备 + 6 自对话 + 6 运维）。"""
         code, resp = post("/mcp", {
             "jsonrpc": "2.0", "id": 1, "method": "initialize",
             "params": {"protocolVersion": "2024-11-05",
@@ -172,4 +172,4 @@ class TestMcpProtocol:
         code, resp = post("/mcp", {
             "jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}})
         tools = resp.get("result", {}).get("tools", [])
-        assert len(tools) == 41
+        assert len(tools) == 53

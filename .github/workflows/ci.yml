@@ -25,8 +25,37 @@ jobs:
         run: pip install pytest
       - name: Syntax check (compile all)
         run: python3 -m compileall -q scripts/ tests/
+      - name: Shell bootstrap syntax
+        run: sh -n scripts/install.sh
       - name: Run test suite
         run: python3 -m pytest tests/ -q
+
+  skill-package:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Validate SKILL.md (Agent Skills spec)
+        run: python3 scripts/build_package.py --check
+      - name: Build competition package (<=30 files)
+        run: python3 scripts/build_package.py --out dist
+      - name: Verify package manifest and checksums
+        run: |
+          python3 - <<'PY'
+          import json, hashlib, zipfile, pathlib
+          zp = next(pathlib.Path("dist").glob("mcp-fleet-v*.zip"))
+          with zipfile.ZipFile(zp) as z:
+              names = z.namelist()
+              assert any(n.endswith("SKILL.md") for n in names), "package missing SKILL.md"
+              manifest = json.loads(z.read("mcp-fleet/MANIFEST.json"))
+              assert manifest["file_count"] <= 30, manifest["file_count"]
+              for rel, meta in manifest["files"].items():
+                  data = z.read("mcp-fleet/" + rel)
+                  assert hashlib.sha256(data).hexdigest() == meta["sha256"], rel
+          print("package ok:", zp, len(names), "entries")
+          PY
 
   coverage:
     runs-on: ubuntu-latest

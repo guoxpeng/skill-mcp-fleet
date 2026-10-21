@@ -1,0 +1,36 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- MCP Fleet 节点 {{DISPLAY_NAME}}（launchd：RunAtLoad 开机自启 + KeepAlive 崩溃重拉） -->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>{{LAUNCHD_LABEL}}</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>{{PYTHON}}</string>
+        <string>-u</string>
+        <string>{{AGENT_PATH}}</string>
+        <string>--host</string>
+        <string>{{HOST}}</string>
+        <string>--port</string>
+        <string>{{PORT}}</string>{{EXTRA_PLIST_ARGS}}
+    </array>
+    <key>WorkingDirectory</key>
+    <string>{{INSTALL_DIR}}</string>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>ThrottleInterval</key>
+    <integer>10</integer>
+    <key>ProcessType</key>
+    <string>Background</string>
+    <key>Umask</key>
+    <integer>63</integer>
+    <key>StandardOutPath</key>
+    <string>{{LOG_DIR}}/agent.log</string>
+    <key>StandardErrorPath</key>
+    <string>{{LOG_DIR}}/agent.log</string>
+{{USERNAME_BLOCK}}
+</dict>
+</plist>

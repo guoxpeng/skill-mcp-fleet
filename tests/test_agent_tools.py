@@ -8,7 +8,7 @@ mp = pytest.importorskip("mcp_agent", reason="mcp_agent 导入失败")
 
 class TestToolRegistry:
     def test_tool_count(self):
-        assert len(mp.TOOLS) == 41
+        assert len(mp.TOOLS) == 53
 
     def test_tool_schema_structure(self):
         """每个工具必须有 name/description/inputSchema(dict)。"""
@@ -28,8 +28,8 @@ class TestToolRegistry:
                    if t["name"] not in mp.TOOL_FUNCS]
         assert missing == []
 
-    def test_version_is_v5(self):
-        assert mp.SERVER_VERSION.startswith("5.0")
+    def test_version_is_51(self):
+        assert mp.SERVER_VERSION.startswith("5.1")
 
     def test_core_tools_present(self):
         must = {"exec", "read", "write", "edit", "list_dir",
@@ -151,7 +151,7 @@ class TestPlatformGuard:
             "  TCP    192.168.1.5:3100       10.0.0.2:8080          ESTABLISHED     12345",
             "  TCP    0.0.0.0:3101           0.0.0.0:0              LISTENING       99999",
         ])
-        assert s.parse_netstat_pids(sample, 3100) == [12345]  # v4+v6 去重，排除 ESTABLISHED
+        assert s.parse_netstat_pids(sample, 3100) == [12345]  # v4+v5.1 去重，排除 ESTABLISHED
         assert s.parse_netstat_pids(sample, 3101) == [99999]
         assert s.parse_netstat_pids(sample, 3102) == []
 
@@ -363,59 +363,44 @@ class TestWinHardening:
 
 
 class TestTermuxInstall:
-    """v5.0.6 Termux 一键安装：CLI 部署 + 节点安装 + 守护 + _TERMUX_PREFIX 保留。"""
+    """v5.1 安装链路：POSIX 薄引导 + 统一安装器识别 Termux。"""
 
-    inst = pytest.importorskip("install", reason="install 导入失败")
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
-    def test_termux_prefix_preserved(self):
-        """_TERMUX_PREFIX 不应被空 PREFIX 覆盖（读 install.sh 源码验证修复模式）。"""
-        src = open("/workspace/mcp-fleet/scripts/install.sh", encoding="utf-8").read()
-        # 修复后：优先用已有 _TERMUX_PREFIX，否则取 Termux $PREFIX
-        assert '_TERMUX_PREFIX="${_TERMUX_PREFIX:-${PREFIX:-}}"' in src,             "_TERMUX_PREFIX 保留修复未生效"
-        # 同时验证旧 bug 模式已不存在
-        assert '_TERMUX_PREFIX="${PREFIX:-}"' not in src, "旧 bug 模式仍存在"
+    def test_install_sh_is_posix_bootstrap(self):
+        src = open(os.path.join(self.root, "scripts", "install.sh"),
+                   encoding="utf-8").read()
+        assert src.startswith("#!/bin/sh") or src.startswith("#!/usr/bin/env sh")
+        assert "fleet_install.py" in src
+        assert "SHA256SUMS" in src or "sha256" in src.lower()
+        assert "set -e" in src
 
-    def test_cli_only_initialized(self, monkeypatch):
-        """CLI_ONLY 默认值应为 0（set -u 不崩）。"""
-        s = self.inst
-        # 模拟 install.sh 在 set -u 下引用未初始化变量会崩
-        # 这里验证脚本源码里 CLI_ONLY="0" 存在
-        src = open("/workspace/mcp-fleet/scripts/install.sh", encoding="utf-8").read()
-        assert 'CLI_ONLY="0"' in src, "CLI_ONLY 未初始化，set -u 下会崩"
+    def test_install_sh_has_offline_mode(self):
+        src = open(os.path.join(self.root, "scripts", "install.sh"),
+                   encoding="utf-8").read()
+        assert "--offline" in src
+        assert "--dry-run" in src
 
-    def test_menu_subcommand_exists(self):
-        """fleet.py 应支持 menu 子命令（中文交互菜单入口）。"""
-        import subprocess, sys
-        r = subprocess.run(
-            [sys.executable, "/workspace/mcp-fleet/scripts/fleet.py", "menu", "--help"],
-            capture_output=True, text=True, timeout=30)
-        # 菜单帮助输出应含中文提示
+    def test_install_sh_syntax(self):
+        import subprocess
+        r = subprocess.run(["sh", "-n", os.path.join(self.root, "scripts", "install.sh")],
+                           capture_output=True, text=True)
         assert r.returncode == 0, r.stderr
-        assert "中文交互菜单" in r.stdout or "menu" in r.stdout.lower()
 
-    def test_menu_no_args_enters_menu(self, monkeypatch):
-        """fleet.py 无参数时应进入中文菜单（不打印英文 help）。"""
-        import subprocess, sys
-        # 给 stdin EOF 让 menu 立即退出
-        r = subprocess.run(
-            [sys.executable, "/workspace/mcp-fleet/scripts/fleet.py"],
-            input="0\n", capture_output=True, text=True, timeout=30)
-        # 输出应含中文 banner
-        assert "MCP Fleet" in r.stdout or "主控" in r.stdout, r.stdout[:200]
+    def test_fleet_install_termux_adapter(self):
+        import importlib.util
+        spec = importlib.util.spec_from_file_location(
+            "fleet_install", os.path.join(self.root, "scripts", "fleet_install.py"))
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        assert "termux" in mod.ADAPTERS
+        assert "systemd" in mod.ADAPTERS and "procd" in mod.ADAPTERS
 
-    def test_install_sh_has_cli_only_flag(self):
-        """install.sh 应识别 --cli-only 参数。"""
-        src = open("/workspace/mcp-fleet/scripts/install.sh", encoding="utf-8").read()
-        assert "--cli-only" in src
-        assert "install_cli()" in src
-        assert 'CLI_ONLY="1"' in src
-
-    def test_install_sh_termux_detection(self):
-        """install.sh Termux 检测逻辑完整（is_termux + 路径 + nohup 降级）。"""
-        src = open("/workspace/mcp-fleet/scripts/install.sh", encoding="utf-8").read()
-        assert "is_termux()" in src
-        assert "手机模式" in src or "Termux" in src
-        assert 'MODE="nohup"' in src  # Termux 强制 nohup
+    def test_installer_has_join_flag(self):
+        src = open(os.path.join(self.root, "scripts", "fleet_install.py"),
+                   encoding="utf-8").read()
+        assert '"--join"' in src or "'--join'" in src
+        assert "fleet://join/" in src
 
 
 class TestReadOnlyMode:
@@ -456,7 +441,7 @@ class TestReadOnlyMode:
     def test_query_tools_allowed(self):
         self._set(True)
         try:
-            assert not mp.call_tool("read", {"filePath": "/etc/hostname"})["isError"]
+            assert not mp.call_tool("read", {"filePath": os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "SKILL.md")})["isError"]
             assert not mp.call_tool("list_dir", {"filePath": "/"})["isError"]
             assert not mp.call_tool("sysinfo", {})["isError"]
             assert not mp.call_tool("mesh_caps", {})["isError"]
@@ -487,7 +472,7 @@ class TestReadOnlyMode:
         """tools/list 仍返回完整 41 工具（read-only 靠调用层拦截，工具数声明不变）。"""
         self._set(True)
         try:
-            assert len(mp.TOOLS) == 41
+            assert len(mp.TOOLS) == 53
         finally:
             self._set(False)
 

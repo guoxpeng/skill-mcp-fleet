@@ -119,8 +119,14 @@ class PeerHealth:
 # 威胁模型：防止 mailbox 落盘文件被直接读取（备份泄露 / 本机其他用户 / 云盘同步）。
 # 传输层另有可选 TLS（v4.5）。
 # ---------------------------------------------------------------------------
-CRYPTO_PREFIX = "enc1$"
+CRYPTO_PREFIX = "enc1$"          # 旧格式（v5.0，HMAC 认证）
+CRYPTO_V2_PREFIX = "enc2$"       # v5.1 格式（fleet_core seal：HKDF/CTR/HMAC + AAD）
 PBKDF2_ROUNDS = 100000
+
+try:                             # v5.1: 可选认证加密后端（缺失则继续用 enc1$）
+    import fleet_core as _CORE
+except Exception:                # pragma: no cover
+    _CORE = None
 
 
 def _derive_key(secret, salt):
@@ -162,15 +168,21 @@ def _keystream(key, nonce, length):
 
 
 def encrypt_text(secret, plaintext, salt=None):
-    """加密字符串 -> 'enc1$...' 形态。secret 为节点 auth_token。
+    """加密字符串。fleet_core 可用时输出 ``enc2$``（认证加密 + AAD），否则 ``enc1$``。
 
-    salt 缺省随机（兼容旧调用/测试）；MailEngine 写路径传固定 salt，
-    使同一邮箱的所有消息共享派生密钥（nonce 仍每条随机，keystream 不重复，
-    安全性等价），配合 _derive_key 缓存实现 O(1) 读写。
+    salt 缺省随机；MailEngine 写路径传固定 salt，使同一邮箱的消息共享派生密钥
+    （每条 nonce 随机，keystream 不重复），配合 _derive_key 缓存实现 O(1) 读写。
     """
     salt = bytes(salt) if salt is not None else os.urandom(16)
-    nonce = os.urandom(16)
     key = _derive_key(secret, salt)
+    if _CORE is not None:
+        try:
+            token = _CORE.seal(key, plaintext.encode("utf-8"), aad=b"fleet-mail")
+            return CRYPTO_V2_PREFIX + base64.b64encode(
+                salt + token.encode("ascii")).decode("ascii")
+        except Exception:
+            pass                      # 降级到 enc1$，不丢消息
+    nonce = os.urandom(16)
     pt = plaintext.encode("utf-8")
     ct = bytes(a ^ b for a, b in zip(pt, _keystream(key, nonce, len(pt))))
     tag = hmac.new(key, b"tag" + nonce + ct, hashlib.sha256).digest()[:16]
@@ -178,7 +190,14 @@ def encrypt_text(secret, plaintext, salt=None):
 
 
 def decrypt_text(secret, blob):
-    """解密 'enc1$...' -> 明文字符串。验签失败抛 ValueError。"""
+    """解密 ``enc1$`` / ``enc2$`` -> 明文字符串。验签失败抛 ValueError。"""
+    if isinstance(blob, str) and blob.startswith(CRYPTO_V2_PREFIX) and _CORE is not None:
+        raw = base64.b64decode(blob[len(CRYPTO_V2_PREFIX):].encode("ascii"))
+        if len(raw) < 17:
+            raise ValueError("blob too short")
+        salt, token = raw[:16], raw[16:].decode("ascii")
+        key = _derive_key(secret, salt)
+        return _CORE.open_sealed(key, token, aad=b"fleet-mail").decode("utf-8")
     if not isinstance(blob, str) or not blob.startswith(CRYPTO_PREFIX):
         raise ValueError("not an encrypted blob")
     raw = base64.b64decode(blob[len(CRYPTO_PREFIX):].encode("ascii"))
@@ -281,7 +300,8 @@ class MailEngine:
             return msg
         m = dict(msg)
         t = m.get("text")
-        if isinstance(t, str) and t and not t.startswith(CRYPTO_PREFIX):
+        if isinstance(t, str) and t and not t.startswith(
+                (CRYPTO_PREFIX, CRYPTO_V2_PREFIX)):
             try:
                 m["text"] = encrypt_text(self.secret, t, salt=self._salt)
             except Exception:
@@ -294,7 +314,7 @@ class MailEngine:
             return msg
         m = dict(msg)
         t = m.get("text")
-        if isinstance(t, str) and t.startswith(CRYPTO_PREFIX):
+        if isinstance(t, str) and t.startswith((CRYPTO_PREFIX, CRYPTO_V2_PREFIX)):
             try:
                 m["text"] = decrypt_text(self.secret, t)
             except Exception:

@@ -1,0 +1,23 @@
+#!/sbin/openrc-run
+# MCP Fleet 节点 {{DISPLAY_NAME}}（OpenRC：Alpine / Gentoo）
+# 安装：install -m755 fleet.openrc /etc/init.d/{{UNIT_LABEL}} && rc-update add {{UNIT_LABEL}} default
+name="{{UNIT_LABEL}}"
+description="MCP Fleet 节点 {{DISPLAY_NAME}}（HTTP {{PORT}}）"
+command={{CMD_PYTHON}}
+command_args="-u {{CMD_AGENT}} --host {{HOST}} --port {{PORT}}{{EXTRA_ARGS}}"
+directory="{{INSTALL_DIR}}"
+command_user="{{SERVICE_USER}}"
+command_background="yes"
+pidfile="/run/{{UNIT_LABEL}}.pid"
+output_log="{{LOG_DIR}}/agent.log"
+error_log="{{LOG_DIR}}/agent.err.log"
+
+# supervise-daemon = OpenRC 的 Restart=always 等价物（崩溃 3 秒后重拉，无限次）
+supervisor="supervise-daemon"
+respawn_delay=3
+respawn_max=0
+
+depend() {
+    need net
+    after firewall
+}

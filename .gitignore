@@ -9,3 +9,14 @@ data/
 peers.json
 .coverage
 coverage.json
+identity.json
+invites.json
+*.pid
+.venv/
+dist/
+.fleet/
+scripts/identity.json
+agent/
+tasks/
+scripts/agent/
+scripts/tasks/

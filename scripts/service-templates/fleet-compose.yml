@@ -1,0 +1,41 @@
+# MCP Fleet 节点 {{DISPLAY_NAME}} —— Docker / docker compose 部署
+# 用法（在本目录）：docker compose -f fleet-compose.yml up -d
+# 开机自启由 restart: unless-stopped 保证（宿主机 Docker 服务自启即可）
+services:
+  fleet:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: {{IMAGE_TAG}}
+    container_name: {{UNIT_LABEL}}
+    restart: unless-stopped
+    ports:
+      - "{{PORT}}:{{PORT}}"
+    volumes:
+      - "{{DATA_DIR}}:/data"
+      - "{{INSTALL_DIR}}:/app"
+    working_dir: /app
+    environment:
+      - MCP_FLEET_NAME={{DISPLAY_NAME}}
+      - MCP_FLEET_PORT={{PORT}}
+      - MCP_FLEET_DATA=/data
+    command: ["python3", "-u", "/app/mcp_agent.py", "--host", "{{HOST}}", "--port", "{{PORT}}"]
+    # ---- 容器加固 ----
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=64m
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import sys,urllib.request;sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:{{PORT}}/health',timeout=3).status==200 else 1)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
