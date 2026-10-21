@@ -507,3 +507,84 @@ class TestReadOnlyMode:
             assert r2["isError"] and "只读" in r2["content"][0]["text"]
         finally:
             self._set(False)
+
+
+# ---------------------------------------------------------------------------
+# v5.0.9: CLI 完整性回归守卫（与 test_agent_tools.py 合并以保持 zip 30 文件上限）
+# 守卫本轮排查发现的 CLI 级历史缺陷，防止复发。
+# ---------------------------------------------------------------------------
+import argparse as _argparse
+import sys as _sys
+
+_INTEGRITY_SCRIPTS = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "scripts")
+if _INTEGRITY_SCRIPTS not in _sys.path:
+    _sys.path.insert(0, _INTEGRITY_SCRIPTS)
+
+
+def _src(name):
+    with open(os.path.join(_INTEGRITY_SCRIPTS, name), encoding="utf-8") as f:
+        return f.read()
+
+
+class TestCliIntegrity:
+    def test_no_undefined_resolve_target(self):
+        """fleet.py 不得调用从未定义的 _resolve_target（v5.0.9 修复）。
+
+        该函数全仓库无 def，fleet msg 一执行即 NameError，功能自 v4.1 起
+        完全不可用；cmd_msg 已改用 resolve_target（注释中提及名称无妨，
+        但不得存在调用形式 `_resolve_target(target` 或定义）。"""
+        s = _src("fleet.py")
+        assert "_resolve_target(target" not in s
+        assert "def _resolve_target" not in s
+        assert "def resolve_target(" in s
+
+    def test_uuid_imported(self):
+        """fleet.py 必须导入 uuid（invite/verify 确权路径使用 uuid4）。"""
+        s = _src("fleet.py")
+        assert "\nimport uuid" in s
+        assert "uuid.uuid4()" in s
+
+    def test_discovery_layer_global_in_main(self):
+        """main() 必须把 _discovery_layer 声明为 global（v4.0 起的历史 bug）。
+
+        缺少声明时 `_discovery_layer = DiscoveryLayer(...)` 只创建局部变量，
+        模块级引用（_dashboard_data 读取）永远是 None。"""
+        s = _src("mcp_agent.py")
+        assert "global LISTEN_PORT, _discovery_layer" in s
+
+    def test_no_duplicate_collections_import(self):
+        """fleet_proto.py 不得重复 import collections（独立重复行已删除）。"""
+        s = _src("fleet_proto.py")
+        assert "\nimport collections\n" not in s
+        assert ", collections" in s   # 仍以组合 import 形式使用
+
+    def test_cmd_msg_runs_with_mocked_client(self, monkeypatch):
+        """cmd_msg 在 mock 客户端下完整走通 msg send 分支（回归：NameError）。"""
+        fleet = pytest.importorskip("fleet")
+        calls = []
+
+        class FakeClient:
+            def __init__(self, url, timeout, token=""):
+                calls.append(("init", url, token))
+
+            def handshake(self):
+                calls.append(("handshake",))
+
+            def call(self, name, args):
+                calls.append(("call", name, args))
+                return ("OK", False)
+
+        monkeypatch.setattr(fleet, "MCPClient", FakeClient, raising=False)
+        monkeypatch.setattr(
+            fleet, "resolve_target",
+            lambda t, agent=None, port=3100: ("http://127.0.0.1:3100/mcp", {"token": "tok"}),
+            raising=False)
+
+        a = _argparse.Namespace(target="node1", agent="auto", port=3100, timeout=30,
+                               msg_cmd="send", frm="me", to="you", text="hi", topic="")
+        rc = fleet.cmd_msg(a)
+        assert rc == 0
+        assert ("handshake",) in calls
+        assert any(c[0] == "call" and c[1] == "msg_send" for c in calls)
+        assert ("init", "http://127.0.0.1:3100/mcp", "tok") in calls

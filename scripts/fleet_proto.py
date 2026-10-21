@@ -15,7 +15,6 @@ import json, os, re, socket, sys, threading, time, uuid, io, collections
 import urllib.request, urllib.parse, urllib.error
 import ipaddress
 import base64, hashlib, hmac
-import collections
 
 PROTO_NAME = "fleet"
 PROTO_VERSION = 1

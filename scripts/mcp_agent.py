@@ -90,7 +90,7 @@ for _stream in (sys.stdout, sys.stderr):
 DEFAULT_CONFIG = {
     "name": "node",             # 副端标识（显示在状态页与 serverInfo）
     "tool_prefix": "",          # 工具名前缀，如 "nas_"；留空则用裸名（exec/read/...）
-    "version": "5.0.8",
+    "version": "5.0.9",
     "sudo_password": "",        # 留空且非 root 时会尝试免密 sudo
     "work_dir": "/",            # 默认工作目录
     "command_timeout": 120,     # 秒
@@ -985,7 +985,7 @@ def _note_peer_agents(peer_name, agents):
 
 def _init_proto():
     """初始化自研通讯协议层（在 main() 中配置加载后调用）。"""
-    global _mail_engine, _discovery_layer, _delivery_engine, _sync_engine
+    global _mail_engine, _delivery_engine, _sync_engine
     if not _HAS_PROTO:
         return
     # v5.0: 邮箱落盘加密密钥 = 节点 auth_token（PBKDF2 派生，零新增配置）
@@ -1700,8 +1700,6 @@ def _auto_discover_peers(port=3100):
         return []
     discovered = []
     my_name = CFG.get("name", "node")
-    my_token = CFG.get("auth_token", "")
-    my_url = CFG.get("self_url", "") or self_url()
     existing = load_peers()
     for host, ip in peers:
         # 探测对方 fleet 端口
@@ -1735,7 +1733,6 @@ def _broadcast_join():
     """新节点上线时广播 fleet_join 事件，让已有节点发现自己。"""
     my_name = CFG.get("name", "node")
     my_url = CFG.get("self_url", "") or self_url()
-    my_token = CFG.get("auth_token", "")
     ts_ip = _tailscale_ip()
     join_msg = json.dumps({"node": my_name, "url": my_url, "tailscale_ip": ts_ip or "",
                            "ts": time.strftime("%Y-%m-%d %H:%M:%S")})
@@ -1811,7 +1808,6 @@ def t_mesh_caps(a):
     """查询 mesh 内所有节点的能力清单（本机 + 所有 peers）。"""
     result = {"self": get_caps(), "peers": {}}
     peers = load_peers().get("nodes", {})
-    my_name = CFG.get("name", "node")
     for pname, pinfo in peers.items():
         try:
             text, is_err = peer_call(pinfo["url"], pinfo.get("token", ""),
@@ -3076,7 +3072,10 @@ def main():
               file=sys.stderr)
         sys.exit(2)
 
-    global LISTEN_PORT
+    # v5.0.9 修复：原来缺 _discovery_layer 的 global 声明，此处赋值只创建了
+    # 局部变量，模块级引用（_dashboard_data 读取）永远是 None，导致
+    # Dashboard 各节点的 last_seen 自 v4.0 起一直为空。
+    global LISTEN_PORT, _discovery_layer
     LISTEN_PORT = args.port
     # v5.0.7: --read-only 运行时开启只读模式（不写回配置文件）
     if args.read_only:

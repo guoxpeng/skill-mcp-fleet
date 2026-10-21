@@ -64,6 +64,7 @@ import sys
 import time
 import urllib.error
 import urllib.request
+import uuid
 
 # ---------------------------------------------------------------- 基础
 
@@ -1812,14 +1813,18 @@ def cmd_mesh(a):
     return 0
 
 def cmd_msg(a):
-    """fleet msg send/recv/history -- 通过 peer_call 调远程节点的 msg 工具。"""
-    reg = load_registry()
-    nodes = reg.get("nodes", {})
+    """fleet msg send/recv/history -- 通过 peer_call 调远程节点的 msg 工具。
+
+    v5.0.9 修复：原来调用的 _resolve_target() 从未定义（该函数全仓库
+    无 def，fleet msg 一执行即 NameError 崩溃，功能自 v4.1 起完全不可用）。
+    改用与 cmd_call/cmd_probe 相同的 resolve_target()（返回 (url, meta)，
+    token 在 meta 里）；target 是 argparse 必需位置参数，无需防御性取值。
+    """
     target = getattr(a, "target", None)
     if not target:
         return die("需要指定 target 节点")
-    url, token = _resolve_target(target, a)
-    c = MCPClient(url, a.timeout, token=token)
+    url, meta = resolve_target(target, a.agent, a.port)
+    c = MCPClient(url, a.timeout, token=meta.get("token", ""))
     c.handshake()
     if a.msg_cmd == "send":
         text, is_err = c.call("msg_send", {
@@ -2186,7 +2191,6 @@ def cmd_menu(a):
     except Exception:
         pass  # 某些环境缺失 readline 时忽略，不影响功能
     clear = (not a.no_clear)
-    nodes = load_registry().get("nodes", {})
 
     def _banner():
         if clear:

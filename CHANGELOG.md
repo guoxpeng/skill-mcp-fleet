@@ -6,6 +6,37 @@
 
 ---
 
+## [5.0.9] — 2026-10-21 · 深度自检：3 处 CLI/协议层历史缺陷修复
+
+**对全仓库做静态扫描（pyflakes）+ 未测试覆盖脚本审查 + 运行时端点冒烟，
+发现并修复 3 处历史缺陷；每处先复现再修复，并补回归守卫测试。**
+
+### 修复
+- **fleet msg 命令一执行即崩溃（严重，v4.1 起）**：`cmd_msg` 调用的
+  `_resolve_target()` 全仓库无定义，`fleet msg send/recv/history` 100%
+  抛 NameError、功能完全不可用。改用与 `cmd_call`/`cmd_probe` 一致的
+  `resolve_target()`（返回 `(url, meta)`，token 取自 meta）。
+  修复后实测：send 成功入 outbox、history 正常返回。
+- **配对确权路径 NameError（v4.1 起）**：fleet.py 使用 `uuid.uuid4()`
+  却从未 `import uuid`——invite/verify 在「本机无节点信息且未指定名字」
+  时崩溃。补上 import。
+- **Dashboard 节点 last_seen 永远为空（v4.0 起）**：`main()` 中
+  `_discovery_layer = DiscoveryLayer(...)` 缺少 `global` 声明，只创建了
+  局部变量，模块级引用（`_dashboard_data` 读取）永远是 None。
+  修复：`main()` 补 `global LISTEN_PORT, _discovery_layer`，并从
+  `_init_proto` 的 global 声明中移除该未赋值名字。
+
+### 清理（pyflakes 静态扫描）
+- `fleet_proto.py` 重复 `import collections`
+- `mcp_agent.py` 3 处未使用局部变量（_auto_discover_peers / _broadcast_join /
+  t_mesh_caps）与 `fleet.py` 菜单未使用变量
+
+### 测试
+- 新增 5 个 CLI 完整性回归守卫用例（静态断言 + mock 客户端功能验证），
+  全量 **130 passed + 1 skipped**（131 收集）。
+
+---
+
 ## [5.0.8] — 2026-10-18 · 回归自检：修复 v5.0.7 三项改动引入的 4 处回归
 
 **对 v5.0.7 新增的三项改动（去重/限流/只读模式）做专项回归排查，

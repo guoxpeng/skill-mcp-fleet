@@ -1,6 +1,6 @@
 # MCP Fleet · 参赛作品提交包（v5.0）
 
-![CI](https://github.com/guoxpeng/skill-mcp-fleet/actions/workflows/ci.yml/badge.svg) ![CodeQL](https://github.com/guoxpeng/skill-mcp-fleet/actions/workflows/codeql.yml/badge.svg) ![Coverage](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/guoxpeng/skill-mcp-fleet/main/.github/coverage-badge.json) ![Release](https://img.shields.io/github/v/release/guoxpeng/skill-mcp-fleet) ![Stars](https://img.shields.io/github/stars/guoxpeng/skill-mcp-fleet) ![License](https://img.shields.io/badge/license-MIT-blue) ![Python](https://img.shields.io/badge/python-3.6%2B-blue) ![Tests](https://img.shields.io/badge/tests-125%20passed-brightgreen)
+![CI](https://github.com/guoxpeng/skill-mcp-fleet/actions/workflows/ci.yml/badge.svg) ![CodeQL](https://github.com/guoxpeng/skill-mcp-fleet/actions/workflows/codeql.yml/badge.svg) ![Coverage](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/guoxpeng/skill-mcp-fleet/main/.github/coverage-badge.json) ![Release](https://img.shields.io/github/v/release/guoxpeng/skill-mcp-fleet) ![Stars](https://img.shields.io/github/stars/guoxpeng/skill-mcp-fleet) ![License](https://img.shields.io/badge/license-MIT-blue) ![Python](https://img.shields.io/badge/python-3.6%2B-blue) ![Tests](https://img.shields.io/badge/tests-130%20passed-brightgreen)
 
 > **2026 华为开发者大赛 · 小红书 Skill 创新赛**
 > 赛道：**通用赛道 · 开发工具**
@@ -32,7 +32,7 @@ MCP Fleet 是一张 **AI 对等协作网络**：每台设备装一个「节点�
 | 5 | **v5.0 hello 防伪** | 已配对节点 UDP 发现包强制 HMAC 验签，冒充已知节点直接拒收（兼容 v4.x 混部） |
 | 6 | **v5.0 Web Dashboard** | 浏览器实时看全网拓扑/在线状态/消息流，token 走 URL fragment 不外发，零 CDN 依赖 |
 | 7 | **v5.0.4 三平台守护** | 开机自启 + 进程保护全对齐：Linux systemd（Restart=always + watchdog）、Windows schtasks 双任务（pythonw 无窗口自启 + 每分钟探活拉起）、macOS launchd（KeepAlive 崩溃 10s 重启） |
-| 8 | **v5.0 测试套件** | 125 用例（含真实 UDP socket 验签 + 真实 HTTP 探活防误判 + 系统代理豁免回归 + 中文交互菜单），`pytest tests/ -q` 全量回归，还抓出一个历史死锁 |
+| 8 | **v5.0 测试套件** | 130 用例（含真实 UDP socket 验签 + 真实 HTTP 探活防误判 + 系统代理豁免回归 + 中文交互菜单），`pytest tests/ -q` 全量回归，还抓出一个历史死锁 |
 | 9 | **运行模式** | 连接模式（temporary/permanent）+ 控制模式（direct / assisted 辅助审查） |
 | 10 | **Agent 协作协议** | 能力声明（caps）、任务委派（delegate）、临时群组（group_*）、消息总线（msg_*） |
 | 11 | **TLS + 审计日志 + dryRun** | HTTPS 加密通讯、全工具调用审计留痕、edit 预览不落盘 |
@@ -63,7 +63,7 @@ MCP Fleet 是一张 **AI 对等协作网络**：每台设备装一个「节点�
 | **场景真实性** | 全设备管家 / 双 agent 协作 / 离线消息送达，三个真实场景；六类用户画像（NAS 用户/远程党/自托管/软路由/开发者/极客团队） | `references/vision-and-scenarios.md`、SKILL.md「谁需要它」 |
 | **作品可用性** | 一条命令安装 + 设备码/邀请码配对 + 一键演示 + Windows 安装器 + Web Dashboard，端到端实测 | `bash scripts/demo.sh` 30 秒复现全部核心能力；41 工具实测、双节点互联 + 在线直投 + 密文落盘 + 审计日志验证 |
 | **Skill 复用率** | 任意设备接入、任意 MCP 客户端可用（标准 MCP JSON-RPC，CodeArts / Claude Code / Cursor 均可）、节点间可协作 | 对等网络架构，天然可扩展；Linux/Windows/macOS 三平台安装路径；兼容性见 SKILL.md |
-| **技术完成度** | 自研协议层（含加密与防伪）+ 安全确权 + 运行模式 + 41 工具 + TLS/审计/dryRun + 125 用例测试护栏 | 协议级创新，绝非配置型工具；v5.0 测试套件**真实抓出并修复历史死锁**（自发现自修复闭环，见 `references/安全审计报告.md`） |
+| **技术完成度** | 自研协议层（含加密与防伪）+ 安全确权 + 运行模式 + 41 工具 + TLS/审计/dryRun + 130 用例测试护栏 | 协议级创新，绝非配置型工具；v5.0 测试套件**真实抓出并修复历史死锁**（自发现自修复闭环，见 `references/安全审计报告.md`） |
 | **内容传播力** | 华为云 × 小红书 × 开源社区三方通道，数据可查证 | `references/传播度证据.md`：GitHub 747 次克隆 / 281 独立访客，市场浏览量 23 次并列全场 114 作品第一；小红书笔记 + Skill 市场双通道 |
 
 ### 与华为云的结合
@@ -90,7 +90,7 @@ mcp-fleet/                               # 参赛提交包（AgentSkill 规范�
 │   ├── add_fleet_node.py / probe_fleet.py / call_node.py
 │   ├── make-offline.py                  # 离线安装包（systemd 单元由 install.sh 运行时生成）
 │   └── mcp_agent_config.example.json    # 配置模板
-├── tests/                               # ★ v5.0 测试套件（125 用例，pytest 一键回归）
+├── tests/                               # ★ v5.0 测试套件（130 用例，pytest 一键回归）
 │   ├── conftest.py + test_crypto.py（12）
 │   ├── test_mail_engine.py（24，含投递三分支）
 │   ├── test_hello.py（10，含真实 UDP socket 验签）
@@ -109,7 +109,7 @@ mcp-fleet/                               # 参赛提交包（AgentSkill 规范�
 # 0. 30 秒演示（可选）：本机自动拉起双节点，看懂它怎么工作
 bash scripts/demo.sh
 
-# 0.5 跑测试套件（可选）：125 个用例一键回归
+# 0.5 跑测试套件（可选）：130 个用例一键回归
 python3 -m pytest tests/ -q
 
 # 1. 在设备 A 安装（输出设备码 nas-a3f2 和 API）
