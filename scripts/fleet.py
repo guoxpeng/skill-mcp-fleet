@@ -1674,7 +1674,7 @@ def cmd_pair(a):
         print(warn("[!] ") + "两边名字都叫 %s，会互相覆盖。用 --name 给对方换个名字，或改一边的 name。" % rname)
         return 2
 
-    # v5.1 首选：调用对端 /fleet/pair 交换公钥（双方互存，后续请求可签名）
+    # v5.2 首选：调用对端 /fleet/pair 交换公钥（双方互存，后续请求可签名）
     base = url[:-4] if url.endswith("/mcp") else url.rstrip("/")
     peer_ident = {}
     registered = False
@@ -1716,7 +1716,7 @@ def cmd_pair(a):
             return 2
         print(ok("[+] ") + "%s → 本机：%s" % (rname, text.strip()))
 
-    # 取对方身份公钥（v5.1 端点或 MCP peer_info），并写入本机 registry
+    # 取对方身份公钥（v5.2 端点或 MCP peer_info），并写入本机 registry
     if not peer_ident.get("public_key"):
         try:
             info_text, info_err = c.call("peer_info", {}, timeout=a.timeout)
@@ -1750,7 +1750,7 @@ def cmd_pair(a):
                    peer_ident.get("public_key", "") or info.get("public_key", ""))
     print(ok("[+] ") + "配对成功！%s ↔ %s 双向通讯已建立" % (me["name"], rname))
     if sas:
-        print(ok("[+] ") + "v5.1 SAS 校验码：%s（两端显示必须一致）" % sas)
+        print(ok("[+] ") + "v5.2 SAS 校验码：%s（两端显示必须一致）" % sas)
         print("    对方指纹：%s" % (peer_ident.get("fingerprint")
                                      or info.get("fingerprint") or "未提供（v5 节点）"))
     print("")
@@ -1766,7 +1766,30 @@ def cmd_invite(a):
     me = local_node(a.self_url)
     if not me:
         return die("本机没有装节点 agent。先安装：bash install.sh --port 3100")
-    # 调本机 /fleet/invite 端点生成邀请码
+    # v5.2 优先：节点工具 fleet_invite 生成签名 URI（带公钥/过期/nonce）
+    got = _local_mcp(a)
+    if got:
+        _me, client = got
+        try:
+            text, is_err = client.call("fleet_invite", {"ttl": a.ttl})
+            data = json.loads(text) if not is_err else {}
+        except Exception:
+            data = {}
+        uri = (data or {}).get("uri", "")
+        if uri:
+            print(ok("[+] ") + "邀请已生成（%s 过期）" % data.get("expires", "?"))
+            print("  设备指纹: %s" % data.get("fingerprint", ""))
+            print("  邀请 URI: %s" % uri)
+            print("")
+            print("  对方执行：sh scripts/install.sh --join '%s'" % uri)
+            print("           或：fleet join '%s'" % uri)
+            if getattr(a, "qr", False):
+                print("")
+                _show_qr(uri)
+            print("")
+            print("  ⚠ 只分享给信任的人；首次配对请核对两端 SAS。")
+            return 0
+    # 兼容 v5.0 节点：走旧邀请码端点
     url = me["url"].rstrip("/").replace("/mcp", "/fleet/invite")
     token = me["token"]
     try:
@@ -1894,7 +1917,7 @@ def cmd_accept(a):
     _sas = pair_sas(node_identity().get("public_key", ""),
                     result.get("my_public_key", ""))
     if _sas:
-        print(ok("[+] ") + "v5.1 SAS 校验码：%s（与对方屏幕核对）" % _sas)
+        print(ok("[+] ") + "v5.2 SAS 校验码：%s（与对方屏幕核对）" % _sas)
     print("  对方设备码 : %s" % device_code)
     print("  对方地址   : %s" % url)
     print("  本机设备码 : %s" % my_name)
@@ -2043,7 +2066,7 @@ def cmd_discover_proto(a):
 
 
 
-# ---------------------------------------------------------------- v5.1 命令
+# ---------------------------------------------------------------- v5.2 命令
 
 def _local_mcp(a):
     """返回本机节点的 (name, MCPClient) 或 None。"""
@@ -2063,7 +2086,7 @@ def _http_json(url, token="", timeout=10):
 
 
 def cmd_join(a):
-    """v5.1: 解析 fleet://join/<...> 邀请并配对（节点未装则给安装命令）。"""
+    """v5.2: 解析 fleet://join/<...> 邀请并配对（节点未装则给安装命令）。"""
     uri = (getattr(a, "uri", "") or "").strip()
     if not uri.startswith("fleet://join/"):
         return die("邀请格式不对，应为 fleet://join/...（可用 fleet invite 生成）")
@@ -2078,12 +2101,23 @@ def cmd_join(a):
     print(ok("[+] ") + "邀请来自 %s（指纹 %s）" % (
         getattr(inv, "name", "?"), getattr(inv, "fingerprint", "?")))
     me = local_node(getattr(a, "self_url", None))
+    if not me and getattr(a, "auto_install", False):
+        installer = _installer_path()
+        if not installer:
+            return die("找不到 fleet_install.py；请先安装节点再 join")
+        print(dim("    本机没有节点，自动安装并加入 ..."))
+        rc = subprocess.call([sys.executable, installer, "--join", uri])
+        if rc != 0:
+            return die("自动安装失败（退出码 %s）" % rc)
+        me = local_node(getattr(a, "self_url", None))
     if not me:
         print(warn("[i] ") + "本机还没有节点。先安装再加入：")
         print("    sh scripts/install.sh --join '%s'" % uri)
+        print("    或：fleet join '%s' --auto-install" % uri)
         return 1
     target = "%s@http://%s:%s/mcp" % (inv.name, inv.host, inv.port)
-    ns = argparse.Namespace(target=target, name=inv.name, token=inv.token,
+    ns = argparse.Namespace(target=target, name=inv.name,
+                            token=getattr(inv, "token", ""),
                             port=inv.port, timeout=getattr(a, "timeout", 30),
                             self_url=getattr(a, "self_url", None), one_way=False)
     print(dim("    正在配对 %s ..." % target))
@@ -2187,7 +2221,7 @@ def cmd_token(a):
 
 
 def cmd_send(a):
-    """v5.1: 通过本机节点给另一个节点/agent 发消息（在线直投或离线信箱）。"""
+    """v5.2: 通过本机节点给另一个节点/agent 发消息（在线直投或离线信箱）。"""
     got = _local_mcp(a)
     if not got:
         return die("本机没有运行中的节点")
@@ -2204,7 +2238,7 @@ def cmd_send(a):
 
 
 def cmd_logs(a):
-    """v5.1: 查看本机节点日志尾部（安装器日志或 systemd journal）。"""
+    """v5.2: 查看本机节点日志尾部（安装器日志或 systemd journal）。"""
     me = local_node(getattr(a, "self_url", None))
     if not me:
         return die("本机没有安装节点")
@@ -2229,6 +2263,255 @@ def cmd_logs(a):
                                 "-n", str(n), "--no-pager"])
     except Exception:
         return die("未找到日志文件（%s）" % ", ".join(candidates))
+
+
+
+# ---------------------------------------------------------------- v5.2 体验命令
+
+def _show_qr(uri):
+    """终端二维码：优先 qrencode，缺失时给出安装提示。"""
+    exe = shutil.which("qrencode")
+    if not exe:
+        print(warn("[i] ") + "未安装 qrencode，无法显示二维码；可复制上面的 URI，"
+              "或安装：brew install qrencode / apt install qrencode / pkg install qrencode")
+        return False
+    try:
+        subprocess.call([exe, "-t", "ANSIUTF8", uri])
+        return True
+    except Exception as e:
+        print(warn("[i] ") + "二维码渲染失败：%s" % e)
+        return False
+
+
+def _installer_path():
+    """定位 fleet_install.py：优先同目录（仓库/安装目录），其次节点目录。"""
+    local = os.path.join(HERE, "fleet_install.py")
+    if os.path.isfile(local):
+        return local
+    me = local_node()
+    if me:
+        cand = os.path.join(me["dir"], "fleet_install.py")
+        if os.path.isfile(cand):
+            return cand
+    return ""
+
+
+def cmd_update(a):
+    """v5.2: 升级 / 回滚本机节点（调用统一安装器）。"""
+    installer = _installer_path()
+    if not installer:
+        return die("找不到 fleet_install.py；请重新下载安装包，或手工执行 "
+                   "python3 scripts/fleet_install.py --upgrade")
+    argv = [sys.executable, installer,
+            "--rollback" if getattr(a, "rollback", False) else "--upgrade"]
+    if getattr(a, "json", False):
+        argv.append("--json")
+    print(dim("    执行: %s" % " ".join(argv)))
+    return subprocess.call(argv)
+
+
+def cmd_identity(a):
+    """v5.2: 身份备份/恢复（加密导出，避免重新配对全网）。"""
+    action = getattr(a, "action", "show") or "show"
+    me = local_node(getattr(a, "self_url", None))
+    if not me:
+        return die("本机没有安装节点")
+    ident_dir = me["dir"]
+    ident = node_identity(ident_dir)
+    if action == "show":
+        print("节点    : %s" % me.get("name"))
+        print("node_id : %s" % ident.get("node_id"))
+        print("指纹    : %s" % ident.get("fingerprint"))
+        print("公钥    : %s" % (ident.get("public_key") or "")[:24] + "...")
+        return 0
+    id_path = os.path.join(ident_dir, "identity.json")
+    try:
+        cfg = load_json_config(os.path.join(ident_dir, "mcp_agent_config.json"))
+        if cfg.get("data_dir"):
+            id_path = os.path.join(cfg["data_dir"], "identity.json")
+    except Exception:
+        pass
+    if action == "export":
+        return _identity_export(a, id_path, ident)
+    if action == "import":
+        return _identity_import(a, id_path)
+    return die("未知 identity 动作：%s（可用 show/export/import）" % action)
+
+
+def _identity_passphrase(a, confirm=False):
+    p = getattr(a, "passphrase", "") or ""
+    if p:
+        return p
+    try:
+        import getpass
+        p = getpass.getpass("请输入备份口令: ")
+        if confirm and p != getpass.getpass("再次输入口令: "):
+            raise ValueError("两次口令不一致")
+        return p
+    except Exception as e:
+        raise SystemExit("读取口令失败：%s" % e)
+
+
+def _identity_export(a, id_path, ident):
+    try:
+        import fleet_core as _core
+    except Exception as e:
+        return die("缺少 fleet_core，无法加密导出：%s" % e)
+    if not os.path.isfile(id_path):
+        return die("找不到身份文件：%s" % id_path)
+    passphrase = _identity_passphrase(a)
+    if len(passphrase) < 6:
+        return die("口令至少 6 位")
+    with open(id_path, encoding="utf-8") as f:
+        payload = f.read()
+    salt = os.urandom(16)
+    key = hashlib.pbkdf2_hmac("sha256", passphrase.encode("utf-8"), salt, 200000)
+    blob = _core.seal(key, payload.encode("utf-8"), aad=b"fleet-identity")
+    out = {
+        "v": 1, "kdf": "pbkdf2-sha256-200000",
+        "salt": base64.b64encode(salt).decode("ascii"),
+        "blob": blob,
+        "node_id": ident.get("node_id"), "fingerprint": ident.get("fingerprint"),
+        "exported_at": int(time.time()),
+    }
+    dest = getattr(a, "out", "") or os.path.join(
+        os.path.expanduser("~"), "fleet-identity-%s.json" % ident.get("node_id", "node"))
+    with open(dest, "w", encoding="utf-8") as f:
+        json.dump(out, f, ensure_ascii=False, indent=2)
+    try:
+        os.chmod(dest, 0o600)
+    except OSError:
+        pass
+    print(ok("[+] ") + "身份已加密导出：%s（0600）" % dest)
+    print("    口令丢失将无法恢复；请与备份文件分开保存。")
+    return 0
+
+
+def _identity_import(a, id_path):
+    try:
+        import fleet_core as _core
+    except Exception as e:
+        return die("缺少 fleet_core，无法解密：%s" % e)
+    src = getattr(a, "from_file", "") or ""
+    if not src or not os.path.isfile(src):
+        return die("请用 --from <导出的 json> 指定备份文件")
+    try:
+        with open(src, encoding="utf-8") as f:
+            data = json.load(f)
+        salt = base64.b64decode(data["salt"])
+        key = hashlib.pbkdf2_hmac("sha256", _identity_passphrase(a).encode("utf-8"),
+                                  salt, 200000)
+        payload = _core.open_sealed(key, data["blob"], aad=b"fleet-identity")
+        ident_obj = json.loads(payload.decode("utf-8"))
+        assert ident_obj.get("private_key_b64") and ident_obj.get("public_key_b64")
+    except SystemExit:
+        raise
+    except Exception:
+        return die("导入失败：口令错误或文件损坏")
+    if os.path.isfile(id_path):
+        bak = id_path + ".bak-" + time.strftime("%Y%m%d-%H%M%S")
+        try:
+            shutil.copy2(id_path, bak)
+            print(dim("    旧身份已备份：%s" % bak))
+        except OSError:
+            pass
+    tmp = id_path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(ident_obj, f, ensure_ascii=False, indent=2)
+    try:
+        os.chmod(tmp, 0o600)
+    except OSError:
+        pass
+    os.replace(tmp, id_path)
+    print(ok("[+] ") + "身份已恢复：%s（%s）"
+          % (ident_obj.get("node_id"), ident_obj.get("fingerprint")))
+    print("    ⚠ 请重启节点；旧配对关系可能需重新建立（公钥已变/未变均建议核对指纹）。")
+    return 0
+
+
+INTENTS = [
+    ("disk", ("磁盘", "空间", "硬盘", "存储", "满了", "占用", "df"),
+     "检查磁盘占用并找出大目录",
+     [("sysinfo", {}), ("exec", {"command": "df -h"})]),
+    ("network", ("网络", "慢", "不通", "断", "延迟", "dns", "丢包", "网速"),
+     "定位网络瓶颈：接口/路由/延迟/DNS",
+     [("net_check", {"action": "listen"}),
+      ("exec", {"command": "ip route" if sys.platform != "darwin" else "netstat -rn | head"}),
+      ("net_check", {"action": "dns", "host": "www.baidu.com"})]),
+    ("docker", ("docker", "容器", "镜像", "compose"),
+     "查看容器状态与异常日志",
+     [("docker_ps", {"all": True})]),
+    ("service", ("服务", "挂了", "重启", "systemd", "进程"),
+     "检查服务/进程状态",
+     [("ps", {"all": True})]),
+    ("backup", ("备份", "归档", "同步"),
+     "制定备份计划（写操作，需人工确认）",
+     [("sysinfo", {}), ("exec", {"command": "df -h"})]),
+    ("health", ("健康", "体检", "概览", "状态", "怎么样"),
+     "系统整体健康检查",
+     [("sysinfo", {}), ("fleet_doctor", {})]),
+]
+
+
+def _classify_ask(text):
+    low = (text or "").lower()
+    for name, keys, goal, steps in INTENTS:
+        if any(k.lower() in low for k in keys):
+            return name, goal, steps
+    return "general", "先收集系统事实，再决定下一步", [("sysinfo", {}), ("fleet_doctor", {})]
+
+
+def cmd_ask(a):
+    """v5.2: 自然语言入口：给普通用户生成计划/证据/可直接粘贴的提示词。"""
+    text = (getattr(a, "text", "") or "").strip()
+    if not text:
+        return die("用法：fleet ask \"帮我看下 NAS 磁盘为什么满了\" [--run]")
+    me = local_node(getattr(a, "self_url", None))
+    if not me:
+        return die("本机没有运行中的节点；先安装：sh scripts/install.sh --name <名字>")
+    intent, goal, steps = _classify_ask(text)
+    print("任务    : %s" % text)
+    print("意图    : %s" % intent)
+    print("目标    : %s" % goal)
+    print("计划    :")
+    for index, (tool, args) in enumerate(steps, 1):
+        detail = args.get("command") or args.get("host") or ""
+        print("  %d. %s %s" % (index, tool, ("（%s）" % detail) if detail else ""))
+    print("验收    : 输出包含可核对的事实（容量/延迟/容器状态/错误行），结论引用证据")
+    print("")
+    prompt = (
+        "你在节点 %s 上执行任务：%s。\n"
+        "先只读观察（sysinfo/ps/docker_ps/net_check/df），列出证据再给结论；\n"
+        "任何删除/重启/改配置前先向我确认；最后按“结论/证据/建议”三段式回复。"
+        % (me.get("name"), text))
+    print("可直接粘给 AI 客户端：")
+    print("  " + prompt)
+    if not getattr(a, "run", False):
+        print("")
+        print(dim("    加 --run 会立即执行上面的只读步骤并汇总证据。"))
+        return 0
+    print("")
+    print("执行结果：")
+    client = MCPClient(me["url"], getattr(a, "timeout", 30), token=me.get("token") or "")
+    failed = 0
+    safe_exec = ("df ", "df", "uptime", "free", "ip route", "ip addr", "netstat",
+                 "cat /proc/loadavg", "nproc", "uname")
+    for tool, args in steps:
+        if tool == "exec" and not str(args.get("command", "")).startswith(safe_exec):
+            print("  - 跳过非白名单命令：%r" % args.get("command"))
+            continue
+        try:
+            result, is_err = client.call(tool, args)
+        except Exception as e:
+            print("  - %s 失败：%s" % (tool, e))
+            failed += 1
+            continue
+        text_out = (result or "").strip()
+        print("\n[%s] %s" % (tool, "错误" if is_err else "ok"))
+        print("\n".join(text_out.splitlines()[:12]))
+        if is_err:
+            failed += 1
+    return 1 if failed and failed == len(steps) else 0
 
 
 def build_parser():
@@ -2409,6 +2692,7 @@ def build_parser():
     sp.add_argument("--ttl", type=int, default=3600, help="邀请码有效期（秒，默认 3600）")
     sp.add_argument("--self-url", help="本机对外地址（默认自动检测）")
     sp.add_argument("--timeout", type=int, default=10)
+    sp.add_argument("--qr", action="store_true", help="在终端显示二维码（需 qrencode）")
     sp.set_defaults(func=cmd_invite)
 
     def local(sp):
@@ -2417,27 +2701,45 @@ def build_parser():
                         help="本机节点回连地址（NAT/容器场景显式指定）")
         return sp
 
-    sp = local(sub.add_parser("join", help="v5.1: 用 fleet://join/... 邀请加入并配对"))
+    sp = local(sub.add_parser("join", help="v5.2: 用 fleet://join/... 邀请加入并配对"))
     sp.add_argument("uri", help="fleet://join/...")
+    sp.add_argument("--auto-install", action="store_true", dest="auto_install",
+                    help="本机未安装节点时自动安装后再加入")
     sp.set_defaults(func=cmd_join)
-    sp = local(sub.add_parser("nodes", help="v5.1: 列出本机节点认识的对等节点"))
+    sp = local(sub.add_parser("ask", help="v5.2: 自然语言入口（生成计划/证据/提示词）"))
+    sp.add_argument("text", help="你想做什么，例如：帮我看下磁盘为什么满了")
+    sp.add_argument("--run", action="store_true", help="立即执行只读诊断步骤")
+    sp.set_defaults(func=cmd_ask)
+    sp = local(sub.add_parser("update", help="v5.2: 升级/回滚本机节点"))
+    sp.add_argument("--rollback", action="store_true", help="回滚到最近一次升级备份")
+    sp.set_defaults(func=cmd_update)
+    sp = sub.add_parser("identity", help="v5.2: 身份查看/加密导出/恢复")
+    sp.add_argument("action", nargs="?", default="show",
+                    choices=["show", "export", "import"])
+    sp.add_argument("--out", default="", help="导出路径（默认 ~/fleet-identity-<id>.json）")
+    sp.add_argument("--from", dest="from_file", default="", help="导入的备份文件")
+    sp.add_argument("--passphrase", default="", help="备份口令（不传则交互输入）")
+    sp.add_argument("--self-url", dest="self_url", default=None)
+    sp.add_argument("--timeout", type=int, default=30)
+    sp.set_defaults(func=cmd_identity)
+    sp = local(sub.add_parser("nodes", help="v5.2: 列出本机节点认识的对等节点"))
     sp.add_argument("--check", action="store_true", help="顺带探活")
     sp.set_defaults(func=cmd_nodes)
-    local(sub.add_parser("status", help="v5.1: 本机节点健康与身份摘要")).set_defaults(func=cmd_status)
-    local(sub.add_parser("metrics", help="v5.1: 打印节点 Prometheus 指标")).set_defaults(func=cmd_metrics)
-    sp = local(sub.add_parser("send", help="v5.1: 通过本机节点给其他节点/agent 发消息"))
+    local(sub.add_parser("status", help="v5.2: 本机节点健康与身份摘要")).set_defaults(func=cmd_status)
+    local(sub.add_parser("metrics", help="v5.2: 打印节点 Prometheus 指标")).set_defaults(func=cmd_metrics)
+    sp = local(sub.add_parser("send", help="v5.2: 通过本机节点给其他节点/agent 发消息"))
     sp.add_argument("to", help="接收方节点/agent 名，* 为广播")
     sp.add_argument("text", help="消息正文")
     sp.add_argument("--from", dest="sender", default="", help="发送方名字（默认 cli-<本机名>）")
     sp.add_argument("--topic", default="", help="消息主题")
     sp.set_defaults(func=cmd_send)
-    sp = local(sub.add_parser("logs", help="v5.1: 查看本机节点日志尾部"))
+    sp = local(sub.add_parser("logs", help="v5.2: 查看本机节点日志尾部"))
     sp.add_argument("--tail", type=int, default=100)
     sp.set_defaults(func=cmd_logs)
-    sp = local(sub.add_parser("audit", help="v5.1: 校验本机节点审计哈希链"))
+    sp = local(sub.add_parser("audit", help="v5.2: 校验本机节点审计哈希链"))
     sp.add_argument("--tail", type=int, default=20)
     sp.set_defaults(func=cmd_audit)
-    sp = local(sub.add_parser("token", help="v5.1: 轮换本机节点访问 token"))
+    sp = local(sub.add_parser("token", help="v5.2: 轮换本机节点访问 token"))
     sp.add_argument("--yes", action="store_true")
     sp.set_defaults(func=cmd_token)
     sp = sub.add_parser("accept", help="v4.4: 接受邀请码 → 确权 → 自动配对")

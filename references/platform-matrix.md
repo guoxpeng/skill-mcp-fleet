@@ -1,7 +1,7 @@
-# MCP Fleet v5.1 平台安装矩阵
+# MCP Fleet v5.2 平台安装矩阵
 
 > **事实来源**：本文所有命令、默认路径、探测规则与限制，均以仓库内
-> `scripts/fleet_install.py`（v5.1.0）的实际实现为准。安装器只依赖 **Python 标准库
+> `scripts/fleet_install.py`（v5.2.0）的实际实现为准。安装器只依赖 **Python 标准库
 > （3.6+）**，不 `pip install` 任何东西，也不会擅自安装系统依赖——缺依赖时只打印
 > 对应平台的安装命令。凡本安装器**尚未实现**的能力，本文在「已知限制 / 仍缺平台」
 > 中如实列出，不做承诺。
@@ -18,7 +18,7 @@ python3 scripts/fleet_install.py --name <节点名> --port 3100
   `--source-dir`、当前目录、脚本所在 `scripts/` 中寻找 `mcp_agent.py` 等节点文件）。
 - 如果只有 `fleet_install.py` 一个文件，请补 `--source-dir /path/to/scripts`。
 - 仓库根 README/SKILL 里的 `sh fleet-install.sh ...` 引导脚本与安装器参数同名
-  （`--name/--port/--dir/--mode/--uninstall`）；**v5.1 全部高级参数以本表为准**，
+  （`--name/--port/--dir/--mode/--uninstall`）；**v5.2 全部高级参数以本表为准**，
   例如 `--service`、`--print-unit`、`--status`、`--json`、`--dry-run`。
 
 ### 0.2 常用参数速查（均来自 `--help` 实现）
@@ -48,7 +48,7 @@ python3 scripts/fleet_install.py --name <节点名> --port 3100
 
 **旧参数兼容**：`--invite <邀请码>`（`fleet://` 开头会映射成 `--join`）、
 `--auto-start`、`--tunnel*`、`--frp-*`、`--ssh-*`、`--directory*`、`--tailnet*`
-会被接受；v5.1 不再内建隧道/frp/tailnet，仅在结果 `warnings` 中提示改用中继工具或系统级隧道。
+会被接受；v5.2 不再内建隧道/frp/tailnet，仅在结果 `warnings` 中提示改用中继工具或系统级隧道。
 
 ### 0.3 退出码与 JSON
 
@@ -534,3 +534,17 @@ sudo python3 scripts/fleet_install.py --name tencent-ecs --port 3100
   并提示；公网场景请先 `pkg install openssl` 或叠加 Tailscale/中继。
 - **存储权限**：Termux 访问 `/sdcard` 需 `termux-setup-storage`；节点自身数据
   放在应用私有目录，不需要外部存储权限。
+
+---
+
+## 17. v5.2 安装体验变化（所有平台通用）
+
+- **默认鉴权**：安装时自动生成 `auth_token` 并写入配置（0600），人读输出只显示一次；
+  `--no-auth` 才关闭。首次启动时若对外监听且无 token，节点也会自动生成（`auto_secure`）。
+- **全局命令**：安装器创建 `fleet`（Linux/macOS：`/usr/local/bin` 或 `~/.local/bin`；
+  Termux：`$PREFIX/bin`；Windows：安装目录 `fleet.cmd`），之后直接 `fleet status`。
+- **升级/回滚**：`fleet update` / `fleet update --rollback`，安装器 `--upgrade/--rollback`，
+  自动备份安装目录（含 mailbox/config）并在失败时保留现场。
+- **Android 14**：安装时尝试拉起「忽略电池优化」授权页；请点允许，并安装 Termux:Boot。
+- **发布校验**：`scripts/release.py` 创建 Release 并上传 zip + SHA256SUMS；
+  `install.sh` 远程安装会校验 SHA256。

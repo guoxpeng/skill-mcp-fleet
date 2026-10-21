@@ -1,4 +1,4 @@
-# MCP Fleet v5.1 · 让所有设备成为一支 AI 团队
+# MCP Fleet v5.2 · 让所有设备成为一支 AI 团队
 
 > **2026 华为开发者大赛 · 小红书 Skill 创新赛** ｜ 通用赛道 · 开发工具
 > 作者：guoxpeng ｜ 开源仓库：https://github.com/guoxpeng/skill-mcp-fleet ｜ 许可：MIT
@@ -24,9 +24,9 @@
 - 设备上的 Agent 之间可以发消息、谈验收标准、互相复核结果；
 - 整套系统**零第三方依赖、不依赖任何中心服务、一条命令安装**。
 
-v5.1 把这件事从"能连"推进到**"敢连、好连、会自己想"**。
+v5.2 把这件事从"能连"推进到**"敢连、好连、会自己想"**。
 
-## 二、v5.1 五大升级
+## 二、v5.2 五大升级
 
 | # | 升级 | 一句话 | 证据 |
 |---|------|--------|------|
@@ -80,13 +80,13 @@ fleet nodes
 
 ## 六、核心能力
 
-### 6.1 设备能力（41 个设备工具 + 12 个 v5.1 工具）
+### 6.1 设备能力（41 个设备工具 + 12 个 v5.2 工具）
 
 执行/后台任务、文件读写编辑搜索/二进制传输、进程、Docker、systemd、网络诊断、
 系统信息、节点互控（多跳）、消息总线、能力声明与任务委派、群组、临时/长期连接、
 直接/辅助控制、只读审计模式。
 
-### 6.2 安全（v5.1 六层）
+### 6.2 安全（v5.2 六层）
 
 - **身份**：Ed25519 节点身份 + 指纹；邀请签名 + 公钥交换 + 6 位 SAS 防中间人（X25519 原语已提供，CLI 尚未接入）。
 - **请求**：签名 + 时间窗 + nonce 防重放；可选 TLS 自签。
@@ -103,10 +103,18 @@ fleet nodes
 - 结构化信封：propose/accept/counter/progress/result/fail/review/handoff，带 thread、
   验收标准、超时；编排器确定性执行，可接 LLM。
 
-### 6.4 可复现的验证证据
+### 6.4 v5.2 体验增强
+
+- 默认生成访问 token（`--no-auth` 才关闭）、全局 `fleet` 命令；
+- `fleet update / --rollback` 原子升级回滚、`fleet identity export/import`；
+- `fleet ask "..." [--run]` 自然语言入口、`fleet invite --qr` 扫码配对；
+- Dashboard 2.0：设备指纹/移除、投递队列、Agent 任务时间线、安全状态；
+- 普通用户文档：[5 分钟上手](references/quickstart.md)、[一页排障](references/troubleshooting.md)。
+
+### 6.5 可复现的验证证据
 
 ```bash
-.venv/bin/python -m pytest tests/ -q        # 578 passed, 1 skipped
+.venv/bin/python -m pytest tests/ -q        # 603 passed, 1 skipped
 sh scripts/install.sh --dry-run --json --name demo   # 安装器零副作用预演
 bash scripts/demo.sh                        # 本机双节点 30 秒演示
 ```
@@ -126,12 +134,12 @@ bash scripts/demo.sh                        # 本机双节点 30 秒演示
 
 ```bash
 python3 scripts/build_package.py
-# → dist/mcp-fleet-v5.1.0.zip + SHA256SUMS + MANIFEST.json
+# → dist/mcp-fleet-v5.2.0.zip + SHA256SUMS + MANIFEST.json
 ```
 
 - 提交包文件数 **≤ 30**、大小 **≤ 40 MB**，由脚本自动裁剪并以清单/SHA256 固化。
 - 纯标准库、零第三方运行时依赖、MIT 许可、可离线部署。
-- 版本：代码 `SERVER_VERSION=5.1.0` ＝ git tag `v5.1.0` ＝ GitHub Release。
+- 版本：代码 `SERVER_VERSION=5.2.0` ＝ git tag `v5.2.0` ＝ GitHub Release。
   完整演进见 `CHANGELOG.md`。
 
 ## 八、仓库结构
@@ -142,22 +150,22 @@ mcp-fleet/
 ├── README.md                    # 本文件（参赛说明）
 ├── AGENTS.md                    # 仓库内 AI 协作约定
 ├── SECURITY.md                  # 六层安全模型与披露流程
-├── CHANGELOG.md                 # v3.0 → v5.1 演进
+├── CHANGELOG.md                 # v3.0 → v5.2 演进
 ├── LICENSE                      # MIT
-├── docs/V5.1-CONTRACT.md          # 模块契约（并行开发/二次开发）
+├── docs/V5.2-CONTRACT.md          # 模块契约（并行开发/二次开发）
 ├── scripts/
 │   ├── mcp_agent.py             # 节点 MCP 服务器（41 工具）
 │   ├── fleet_proto.py           # 协议层（发现/信箱/投递/gossip）
-│   ├── fleet_core.py            # v5.1 安全核心（身份/签名/加密/策略/审计/指标）
-│   ├── fleet_agent.py           # v5.1 Agent 智能层（提示词/自对话/编排）
-│   ├── fleet_install.py         # v5.1 统一安装器（全平台）
+│   ├── fleet_core.py            # v5.2 安全核心（身份/签名/加密/策略/审计/指标）
+│   ├── fleet_agent.py           # v5.2 Agent 智能层（提示词/自对话/编排）
+│   ├── fleet_install.py         # v5.2 统一安装器（全平台）
 │   ├── fleet.py                 # 统一 CLI
 │   ├── install.sh               # POSIX 薄引导（SHA256 校验）
 │   ├── dashboard_html.py        # Web Dashboard
 │   ├── service-templates/       # systemd/openrc/procd/launchd/compose/Dockerfile
 │   ├── demo.sh                  # 30 秒双节点演示
 │   └── build_package.py         # 参赛包生成
-├── tests/                       # v5.1 测试套件
+├── tests/                       # v5.2 测试套件
 └── references/                  # 安全模型/平台矩阵/Agent 手册/协议/FAQ/架构
 ```
 

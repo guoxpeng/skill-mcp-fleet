@@ -5,12 +5,12 @@ license: MIT
 compatibility: Python 3.6+，纯标准库；Linux / macOS / Windows / Android(Termux) / OpenWrt。可选 openssl（自动生成 TLS 证书）与 tailscale（跨网段加速）。
 ---
 
-# MCP Fleet v5.1 · 让所有设备成为一支 AI 团队
+# MCP Fleet v5.2 · 让所有设备成为一支 AI 团队
 
 MCP Fleet 把每台设备变成一个**节点**，节点之间对等互联：自动发现、在线直投、离线信箱、
 按能力委派。设备上的 AI Agent 可以直接对话与协作，而不是"人拿遥控器"。
 
-**v5.1 的三件事**：
+**v5.2 的三件事**：
 
 1. **一条命令接入**——安装器自动识别 Android/NAS/软路由/云主机/PC，生成服务、开机自启、健康检查，并打印邀请链接。
 2. **默认安全**——每节点 Ed25519 身份、请求签名与防重放、认证加密信箱、执行策略、哈希链审计、供应链校验。
@@ -56,6 +56,7 @@ fleet status                 # 本机身份、服务状态、端口、证书指�
 fleet nodes                  # 全网节点、在线状态、RTT、能力
 fleet doctor                 # 12 项自检：时钟偏差/端口/防火墙/磁盘/权限/对端可达/TLS
 fleet send nas-a3f2 "hello"  # 给节点上的 agent 发消息
+fleet ask "帮我看下磁盘为什么满了" --run   # 自然语言入口（只读诊断）
 ```
 
 ### 平台一键命令
@@ -82,7 +83,7 @@ fleet send nas-a3f2 "hello"  # 给节点上的 agent 发消息
 - `initialize.instructions`：本机操作手册（何时用哪些工具、安全边界、四步法）。
 - `prompts/list`：`fleet-playbook`、`fleet-diagnose`、`fleet-plan`、`fleet-self-review`、
   `fleet-delegate`、`fleet-incident`、`fleet-onboard`。
-- 工具层：41 个设备工具 + 12 个 v5.1 工具（6 个自对话 + 6 个运维）。
+- 工具层：41 个设备工具 + 12 个 v5.2 工具（6 个自对话 + 6 个运维）。
 
 ### 自对话四步法（默认工作方式）
 
@@ -185,7 +186,8 @@ A(规划) → propose 任务给 B(执行) → B 回 progress → B 回 result+�
 | 消息延迟 | `fleet status` | 对端离线走 outbox，每 15s 退避重试；上线自动补投 |
 | 时钟偏差 | `fleet doctor` | 签名请求允许 ±300s；开启 NTP |
 | 服务反复重启 | `fleet logs --tail 100` | 端口占用/配置错误/权限；`fleet doctor` 有结论 |
-| 想回滚 | `fleet logs --tail 100` | 保留数据目录；重装上一版本即可（update 命令规划中） |
+| 想回滚 | `fleet update --rollback` | 自动恢复最近一次升级备份 |
+| 想升级 | `fleet update` | 自动备份 → 覆盖 → 重启 → 健康检查 |
 
 ---
 
@@ -193,6 +195,8 @@ A(规划) → propose 任务给 B(执行) → B 回 progress → B 回 result+�
 
 | 文件 | 什么时候读 |
 |------|-----------|
+| `references/quickstart.md` | 第一次使用 / 给普通用户看：5 分钟上手 |
+| `references/troubleshooting.md` | 出问题先看这一页：症状 → 原因 → 命令 |
 | `references/agent-playbook.md` | **执行多步任务前必读**：决策树、工具矩阵、失败恢复、示例 |
 | `references/self-dialogue-protocol.md` | 多 Agent 协作、消息信封、状态机、验收 |
 | `references/prompt-pack.md` | 配置 MCP 客户端 / 给其他 Agent 的提示词 |
@@ -213,4 +217,4 @@ A(规划) → propose 任务给 B(执行) → B 回 progress → B 回 result+�
 - 节点被完全攻陷时，攻击者拥有该节点进程权限——这是所有远程执行工具的边界；
   用独立低权限用户 + 只读模式 + 网络隔离降低影响。
 
-> 版本：v5.1.0 ｜ 作者：guoxpeng ｜ 许可：MIT ｜ 仓库：https://github.com/guoxpeng/skill-mcp-fleet
+> 版本：v5.2.0 ｜ 作者：guoxpeng ｜ 许可：MIT ｜ 仓库：https://github.com/guoxpeng/skill-mcp-fleet

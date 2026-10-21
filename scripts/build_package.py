@@ -8,7 +8,7 @@ SHA256SUMS 与 MANIFEST.json，保证评审可复现、可校验。
 用法：
     python3 scripts/build_package.py
     python3 scripts/build_package.py --check          # 只校验，不构建
-    python3 scripts/build_package.py --out dist --version 5.1.0
+    python3 scripts/build_package.py --out dist --version 5.2.0
     python3 scripts/build_package.py --with-tests      # 默认也包含 tests
 """
 
@@ -23,7 +23,7 @@ import zipfile
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
-DEFAULT_VERSION = "5.1.0"
+DEFAULT_VERSION = "5.2.0"
 MAX_FILES = 30
 MAX_BYTES = 40 * 1024 * 1024
 SKILL_NAME = "mcp-fleet"
@@ -70,8 +70,8 @@ REFERENCE_FILES = [
     "references/prompt-pack.md",
     "references/security-model.md",
     "references/platform-matrix.md",
-    "references/architecture.md",
-    "references/faq.md",
+    "references/quickstart.md",
+    "references/troubleshooting.md",
 ]
 
 

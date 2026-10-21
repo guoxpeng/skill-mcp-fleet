@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""v5.1 安全核心单元测试（``scripts/fleet_core.py``）。
+"""v5.2 安全核心单元测试（``scripts/fleet_core.py``）。
 
 覆盖：
   * RFC 8032 Ed25519 官方向量（含 1023 字节长消息）、签名篡改/可延展签名
@@ -335,7 +335,7 @@ class TestHkdfAndSeal:
 
     def test_format_errors_raise(self):
         key = b"k" * 32
-        for bad in ("plain", "v5.1$2$AAAA", "enc2$@@@", "enc2$" + core._b64e(b"short")):
+        for bad in ("plain", "v5.2$2$AAAA", "enc2$@@@", "enc2$" + core._b64e(b"short")):
             with pytest.raises(ValueError):
                 core.open_sealed(key, bad)
 
@@ -1202,7 +1202,7 @@ class TestCompatibility:
     """版本常量与 Python 3.6 语法兼容。"""
 
     def test_version(self):
-        assert core.VERSION == "5.1.0"
+        assert core.VERSION == "5.2.0"
 
     def test_python36_syntax(self):
         source_path = core.__file__

@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""MCP Fleet v5.1 Agent 智能层（内置提示词 + 自对话协议 + 确定性编排器）。
+"""MCP Fleet v5.2 Agent 智能层（内置提示词 + 自对话协议 + 确定性编排器）。
 
 设计目标
 --------
@@ -62,7 +62,7 @@ try:  # Python 3.6+ 均有 urllib.request；显式兜底便于极简环境
 except ImportError:  # pragma: no cover - 正常 CPython 不会走到
     urllib = None
 
-VERSION = "5.1.0"
+VERSION = "5.2.0"
 
 # MCP initialize instructions 硬上限（契约要求 ≤ 6000 字符）
 MAX_INSTRUCTIONS = 6000

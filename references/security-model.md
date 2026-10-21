@@ -1,4 +1,4 @@
-# 安全模型 · MCP Fleet v5.1
+# 安全模型 · MCP Fleet v5.2
 
 > 读者：安全评审、想公网部署的人、想理解「为什么这样设计」的开发者。
 > 产品用法见 `SKILL.md`；协议细节见 `references/architecture.md`；披露流程见 `SECURITY.md`。
@@ -88,7 +88,7 @@ X-Fleet-Sig:   base64(Ed25519("fleet1|METHOD|PATH|ts|nonce|sha256(body) hex"))
 
 | 数据 | 格式 | 算法 | 说明 |
 |------|------|------|------|
-| 邮箱内容（v5.1） | `enc2$<b64(salt+seal)>` | PBKDF2-SHA256 派生 + SHA-256 CTR + HMAC-SHA256（encrypt-then-MAC，AAD=`fleet-mail`） | 默认；`fleet_core` 可用时启用 |
+| 邮箱内容（v5.2） | `enc2$<b64(salt+seal)>` | PBKDF2-SHA256 派生 + SHA-256 CTR + HMAC-SHA256（encrypt-then-MAC，AAD=`fleet-mail`） | 默认；`fleet_core` 可用时启用 |
 | 邮箱内容（v5.0 兼容） | `enc1$<b64(salt+nonce+ct+tag)>` | 同上结构 | 旧数据可读，新数据优先 enc2$ |
 | 敏感配置 | JSON 0600 | 文件权限 | token/私钥/sudo 密码 |
 | 日志/审计 | 文本 0600 | `redact()` | token/私钥/邀请码/enc2$/enc1$ 自动打码 |

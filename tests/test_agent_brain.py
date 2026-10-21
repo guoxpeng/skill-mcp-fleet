@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""fleet_agent（v5.1 Agent 智能层）测试。
+"""fleet_agent（v5.2 Agent 智能层）测试。
 
 覆盖：instructions 长度/关键内容、prompts 完整性与 MCP 结构、fleet_plan 校验、
 think/reflect 持久化、任务存储原子写/并发、信封校验与向后兼容、FleetClient 路由、
@@ -312,23 +312,23 @@ class TestEnvelope:
         assert not ok and "v" in error
 
     def test_validate_missing_kind(self):
-        ok, error = fa.validate_envelope({"v": "5.1.0", "thread_id": "th",
+        ok, error = fa.validate_envelope({"v": "5.2.0", "thread_id": "th",
                                           "from": "a", "to": "b", "payload": {}})
         assert not ok and "kind" in error
 
     def test_validate_invalid_kind(self):
-        ok, error = fa.validate_envelope({"v": "5.1.0", "kind": "bogus",
+        ok, error = fa.validate_envelope({"v": "5.2.0", "kind": "bogus",
                                           "thread_id": "th", "from": "a",
                                           "to": "b", "payload": {}})
         assert not ok and "kind" in error
 
     def test_validate_missing_thread(self):
-        ok, error = fa.validate_envelope({"v": "5.1.0", "kind": "propose",
+        ok, error = fa.validate_envelope({"v": "5.2.0", "kind": "propose",
                                           "from": "a", "to": "b", "payload": {}})
         assert not ok and "thread_id" in error
 
     def test_validate_bad_names(self):
-        base = {"v": "5.1.0", "kind": "propose", "thread_id": "th-1",
+        base = {"v": "5.2.0", "kind": "propose", "thread_id": "th-1",
                 "from": "a b", "to": "b", "payload": {}}
         ok, error = fa.validate_envelope(base)
         assert not ok and "from" in error
@@ -342,13 +342,13 @@ class TestEnvelope:
         assert fa.validate_envelope(env)[0]
 
     def test_validate_payload_must_be_dict(self):
-        ok, error = fa.validate_envelope({"v": "5.1.0", "kind": "propose",
+        ok, error = fa.validate_envelope({"v": "5.2.0", "kind": "propose",
                                           "thread_id": "th", "from": "a",
                                           "to": "b", "payload": []})
         assert not ok and "payload" in error
 
     def test_validate_invalid_task_id(self):
-        ok, error = fa.validate_envelope({"v": "5.1.0", "kind": "propose",
+        ok, error = fa.validate_envelope({"v": "5.2.0", "kind": "propose",
                                           "thread_id": "th", "from": "a",
                                           "to": "b", "payload": {},
                                           "task_id": "../x"})

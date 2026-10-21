@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
-"""tests/test_installer_51.py — fleet_install.py（v5.1 跨平台安装器）单元测试。
+"""tests/test_installer_51.py — fleet_install.py（v5.2 跨平台安装器）单元测试。
 
-覆盖契约 docs/V5.1-CONTRACT.md 第 2 节要求：
+覆盖契约 docs/V5.2-CONTRACT.md 第 2 节要求：
 * 平台检测（systemd/openrc/procd/launchd/schtasks/termux/容器/NAS）——monkeypatch；
 * dry-run JSON 单行可解析、CLI 行为（--json/--dry-run/--print-unit/--status/--uninstall）；
 * plan 的动作序列与 requires_root；
@@ -23,6 +23,8 @@ import types
 
 import pytest
 
+os.environ.setdefault("FLEET_NO_LAUNCHER", "1")
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 SCRIPTS = os.path.join(ROOT, "scripts")
@@ -39,7 +41,7 @@ _REAL_PORT_IN_USE = fi._port_in_use
 # 公共辅助
 # ---------------------------------------------------------------------------
 STUB_NODE_FILES = ["mcp_agent.py", "fleet_proto.py", "dashboard_html.py",
-                   "fleet_core.py", "fleet_agent.py"]
+                   "fleet_core.py", "fleet_agent.py", "fleet.py"]
 
 
 def make_platform(**over):
@@ -630,7 +632,9 @@ def test_install_writes_config_and_node_files(tmp_path):
     assert config["audit_log"] is True
     assert config["discover_port"] == fi.DEFAULT_DISCOVER_PORT
     assert config["allowed_roots"] == ["/"]
-    assert config["auth_token"] == ""
+    assert len(config["auth_token"]) >= 32      # v5.2 默认自动生成
+    assert result["auth"]["enabled"] is True
+    assert result["auth"]["created"] is True
     manifest = read_json(os.path.join(data_dir, "manifest.json"))
     assert manifest["name"] == "testnode"
     assert manifest["service"] == "nohup"
@@ -1060,7 +1064,7 @@ def test_check_dependencies_missing_required_file(tmp_path):
 def test_check_dependencies_warns_without_fleet_core(tmp_path):
     src = tmp_path / "src"
     src.mkdir()
-    for name in ("mcp_agent.py", "fleet_proto.py", "dashboard_html.py"):
+    for name in ("mcp_agent.py", "fleet_proto.py", "dashboard_html.py", "fleet.py"):
         (src / name).write_text("# stub", encoding="utf-8")
     deps = fi.check_dependencies({"source_dir": str(src)}, make_platform())
     assert deps["ok"] is True, deps["errors"]
@@ -1540,7 +1544,7 @@ def test_install_sh_no_crlf():
 # 13. 常量与适配器表
 # ===========================================================================
 def test_version_and_adapter_registry():
-    assert fi.VERSION == "5.1.0"
+    assert fi.VERSION == "5.2.0"
     assert set(fi.ADAPTERS) == set(fi.SERVICE_KEYS) - {"auto"}
     for key, cls in fi.ADAPTERS.items():
         assert cls.key == key
@@ -1568,3 +1572,86 @@ def test_select_service_auto_and_explicit():
 
 if __name__ == "__main__":  # pragma: no cover
     sys.exit(pytest.main([__file__, "-q"]))
+
+
+# ---------------------------------------------------------------------------
+# v5.2: 默认鉴权 / 全局命令 / 升级回滚
+# ---------------------------------------------------------------------------
+def test_default_auth_generated(tmp_path):
+    opts = make_opts(tmp_path)
+    result = fi.install(opts)
+    assert result["ok"] is True, result["errors"]
+    cfg = read_json(os.path.join(opts["dir"], "mcp_agent_config.json"))
+    assert len(cfg["auth_token"]) >= 32
+    assert result["auth"]["enabled"] is True
+    assert result["auth"]["created"] is True
+    # JSON 结果不泄露 token
+    assert cfg["auth_token"] not in json.dumps(result)
+
+
+def test_no_auth_flag(tmp_path):
+    opts = make_opts(tmp_path, no_auth=True)
+    result = fi.install(opts)
+    assert result["ok"] is True, result["errors"]
+    cfg = read_json(os.path.join(opts["dir"], "mcp_agent_config.json"))
+    assert cfg["auth_token"] == ""
+    assert result["auth"]["disabled"] is True
+    assert any("--no-auth" in w for w in result["warnings"])
+
+
+def test_launcher_created_and_removable(tmp_path, monkeypatch):
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("FLEET_NO_LAUNCHER", "")
+    opts = make_opts(tmp_path, no_launcher=False)
+    # 平台按非 root、非 Termux 处理
+    opts["platform"]["is_termux"] = False
+    opts["platform"]["os"] = "linux"
+    result = fi.install(opts)
+    assert result["ok"] is True, result["errors"]
+    launcher = result["launcher"]
+    assert launcher["ok"] is True
+    assert os.path.isfile(launcher["path"])
+    content = open(launcher["path"], encoding="utf-8").read()
+    assert "fleet.py" in content
+    assert os.access(launcher["path"], os.X_OK)
+
+
+def test_upgrade_creates_backup(tmp_path):
+    opts = make_opts(tmp_path)
+    first = fi.install(opts)
+    assert first["ok"] is True, first["errors"]
+    marker = os.path.join(opts["dir"], "old-marker.txt")
+    open(marker, "w").write("v1")
+    upgraded = fi.install(dict(opts, upgrade=True))
+    assert upgraded["ok"] is True, upgraded["errors"]
+    backup = (upgraded.get("upgrade") or {}).get("backup")
+    assert backup and os.path.isdir(backup)
+    assert os.path.isfile(os.path.join(backup, "old-marker.txt"))
+
+
+def test_rollback_restores_backup(tmp_path, monkeypatch):
+    opts = make_opts(tmp_path)
+    assert fi.install(opts)["ok"] is True
+    marker = os.path.join(opts["dir"], "old-marker.txt")
+    open(marker, "w").write("v1")
+    up = fi.install(dict(opts, upgrade=True))
+    assert up["ok"] is True, up["errors"]
+    # 升级后删掉 marker，回滚应恢复
+    os.remove(marker)
+    monkeypatch.setattr(fi.NohupAdapter, "start", lambda self: {"ok": True})
+    monkeypatch.setattr(fi.NohupAdapter, "stop", lambda self: {"ok": True})
+    monkeypatch.setattr(fi, "health_check",
+                        lambda *a, **k: {"ok": True, "attempts": 1})
+    result = fi.rollback(opts)
+    assert result["ok"] is True, result["errors"]
+    assert os.path.isfile(marker)
+    assert open(marker).read() == "v1"
+
+
+def test_rollback_without_backup(tmp_path):
+    opts = make_opts(tmp_path)
+    result = fi.rollback(opts)
+    assert result["ok"] is False
+    assert any("没有可用备份" in e for e in result["errors"])

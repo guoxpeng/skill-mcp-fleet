@@ -1,8 +1,8 @@
 # -*- coding: utf-8 -*-
-"""v5.1 端到端集成测试：真实起节点进程，验证协议/提示词/策略/签名/审计/只读。
+"""v5.2 端到端集成测试：真实起节点进程，验证协议/提示词/策略/签名/审计/只读。
 
 与 tests/test_agent_integration.py（v4 老协议）互补：
-本文件覆盖 v5.1 新增的 Ed25519 签名请求、防重放、执行策略、哈希链审计、
+本文件覆盖 v5.2 新增的 Ed25519 签名请求、防重放、执行策略、哈希链审计、
 MCP instructions/prompts 与运维工具。全部用临时目录，不碰用户数据。
 """
 import json
@@ -35,20 +35,29 @@ def free_port():
 
 
 def wait_health(base, timeout=20):
+    """等到 HTTP 服务起来；401/403 也算起来了（可能已开鉴权）。"""
     deadline = time.time() + timeout
     while time.time() < deadline:
         try:
             with urllib.request.urlopen(base + "/health", timeout=1) as resp:
                 if resp.status == 200:
                     return True
+        except urllib.error.HTTPError as exc:
+            if exc.code in (401, 403):
+                return True
         except Exception:
-            time.sleep(0.2)
+            pass
+        time.sleep(0.2)
     return False
 
 
 class Node(object):
-    def __init__(self, tmpdir, name="it51", read_only=False, token=""):
+    def __init__(self, tmpdir, name="it51", read_only=False, token="",
+                 host="127.0.0.1", auto_token=False):
         self.dir = tmpdir
+        self.host = host
+        self.token = token
+        self.auto_token = auto_token
         self.port = free_port()
         self.base = "http://127.0.0.1:%d" % self.port
         for fn in NODE_FILES:
@@ -65,10 +74,14 @@ class Node(object):
         env["PYTHONPATH"] = SCRIPTS
         self.proc = subprocess.Popen(
             [sys.executable, os.path.join(tmpdir, "mcp_agent.py"),
-             "--host", "127.0.0.1", "--port", str(self.port)],
+             "--host", self.host, "--port", str(self.port)],
             cwd=tmpdir, env=env, stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL)
         assert wait_health(self.base), "节点未在 20s 内启动"
+        if auto_token:
+            cfg = json.load(open(os.path.join(tmpdir, "mcp_agent_config.json")))
+            self.token = str(cfg.get("auth_token") or "")
+            assert self.token, "自动鉴权未生成 token"
         self.sid = None
 
     def rpc(self, method, params=None, headers=None):
@@ -76,6 +89,8 @@ class Node(object):
                            "params": params or {}}).encode("utf-8")
         hdrs = {"Content-Type": "application/json",
                 "Accept": "application/json, text/event-stream"}
+        if self.token:
+            hdrs["Authorization"] = "Bearer " + self.token
         hdrs.update(headers or {})
         req = urllib.request.Request(self.base + "/mcp", data=body, method="POST",
                                      headers=hdrs)
@@ -101,8 +116,12 @@ class Node(object):
         text = (result.get("content") or [{}])[0].get("text", "")
         return result.get("isError"), text
 
-    def get(self, path):
-        with urllib.request.urlopen(self.base + path, timeout=10) as resp:
+    def get(self, path, token=None):
+        req = urllib.request.Request(self.base + path)
+        tok = self.token if token is None else token
+        if tok:
+            req.add_header("Authorization", "Bearer " + tok)
+        with urllib.request.urlopen(req, timeout=10) as resp:
             return resp.status, resp.read().decode("utf-8")
 
     def stop(self):
@@ -136,7 +155,7 @@ def ro_node(tmp_path):
 class TestMcpV51:
     def test_initialize_instructions(self, node):
         res = node.init()
-        assert res["serverInfo"]["version"].startswith("5.1")
+        assert res["serverInfo"]["version"].startswith("5.2")
         instructions = res.get("instructions", "")
         assert len(instructions) > 500
         for key in ("观察", "计划", "执行", "fleet_plan", "安全"):
@@ -299,3 +318,66 @@ class TestAuditAndReadOnly:
         assert not err and "node_id" in text
         err, text = ro_node.tool("fleet_doctor")
         assert not err
+
+
+# --------------------------------------------------------------------------
+# v5.2：Dashboard 数据/设备管理/任务时间线/默认鉴权
+# --------------------------------------------------------------------------
+class TestDashboardV52:
+    def test_dashboard_payload_fields(self, node):
+        node.init()
+        status, body = node.get("/fleet/ui/data")
+        assert status == 200
+        data = json.loads(body)
+        assert data["identity"]["fingerprint"]
+        assert data["security"]["audit_ok"] is True
+        assert "pending" in data["delivery"] and "dead" in data["delivery"]
+        assert isinstance(data["tasks"], list)
+        assert data["peers"] == []
+
+    def test_tasks_endpoint_after_plan(self, node):
+        node.init()
+        err, _ = node.tool("fleet_plan", {
+            "goal": "检查磁盘",
+            "steps": [{"goal": "df", "tool": "exec", "assignee": "self",
+                       "acceptance": "输出含 /"}]})
+        assert not err
+        status, body = node.get("/fleet/tasks")
+        assert status == 200
+        tasks = json.loads(body)["tasks"]
+        assert tasks and tasks[-1]["goal"] == "检查磁盘"
+
+    def test_peer_remove_loopback(self, node):
+        node.init()
+        peers = {"nodes": {"ghost": {"url": "http://127.0.0.1:1/mcp",
+                                     "token": "", "public_key": "x"}}}
+        with open(os.path.join(node.dir, "peers.json"), "w", encoding="utf-8") as f:
+            json.dump(peers, f)
+        body = json.dumps({"name": "ghost"}).encode()
+        req = urllib.request.Request(node.base + "/fleet/peer_remove", data=body,
+                                     method="POST",
+                                     headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            assert resp.status == 200
+            assert json.loads(resp.read().decode())["ok"] is True
+        data = json.loads(node.get("/fleet/ui/data")[1])
+        assert data["peers"] == []
+
+    def test_auto_secure_generates_token(self, tmp_path):
+        n = Node(str(tmp_path), name="public", host="0.0.0.0", auto_token=True)
+        try:
+            # 无 token 401，带 token 200
+            try:
+                n.get("/fleet/health", token="")
+                raise AssertionError("未鉴权请求应被拒绝")
+            except urllib.error.HTTPError as exc:
+                assert exc.code == 401
+            status, body = n.get("/fleet/health")
+            assert status == 200 and json.loads(body)["status"] == "ok"
+        finally:
+            n.stop()
+
+    def test_unknown_tool_guidance(self, node):
+        node.init()
+        err, text = node.tool("no_such_tool", {})
+        assert err and "下一步" in text and "tools/list" in text

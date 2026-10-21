@@ -29,7 +29,7 @@ class TestToolRegistry:
         assert missing == []
 
     def test_version_is_51(self):
-        assert mp.SERVER_VERSION.startswith("5.1")
+        assert mp.SERVER_VERSION.startswith("5.2")
 
     def test_core_tools_present(self):
         must = {"exec", "read", "write", "edit", "list_dir",
@@ -151,7 +151,7 @@ class TestPlatformGuard:
             "  TCP    192.168.1.5:3100       10.0.0.2:8080          ESTABLISHED     12345",
             "  TCP    0.0.0.0:3101           0.0.0.0:0              LISTENING       99999",
         ])
-        assert s.parse_netstat_pids(sample, 3100) == [12345]  # v4+v5.1 去重，排除 ESTABLISHED
+        assert s.parse_netstat_pids(sample, 3100) == [12345]  # v4+v5.2 去重，排除 ESTABLISHED
         assert s.parse_netstat_pids(sample, 3101) == [99999]
         assert s.parse_netstat_pids(sample, 3102) == []
 
@@ -363,7 +363,7 @@ class TestWinHardening:
 
 
 class TestTermuxInstall:
-    """v5.1 安装链路：POSIX 薄引导 + 统一安装器识别 Termux。"""
+    """v5.2 安装链路：POSIX 薄引导 + 统一安装器识别 Termux。"""
 
     root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 

@@ -115,7 +115,7 @@ class TestDashboard:
         code, body = get("/fleet/ui/data")
         d = json.loads(body)
         assert d["node"] == "it-node" and d["encryption"] is True
-        assert d["version"].startswith("5.1") and d["tools"] == 53
+        assert d["version"].startswith("5.2") and d["tools"] == 53
         assert isinstance(d["peers"], list) and "sys" in d
 
 

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""MCP Fleet v5.1 统一跨平台安装器（纯标准库，Python 3.6+）。
+"""MCP Fleet v5.2 统一跨平台安装器（纯标准库，Python 3.6+）。
 
 一条命令把 MCP Fleet 节点装到任意设备并注册开机自启：
 
@@ -18,7 +18,7 @@
 群晖 DSM、飞牛 fnOS、威联通 QNAP、绿联 UGREEN 等无 systemd 的 NAS 自动走
 nohup + 任务计划提示。
 
-设计约束（见 docs/V5.1-CONTRACT.md 第 0/2 节）：
+设计约束（见 docs/V5.2-CONTRACT.md 第 0/2 节）：
 * 只 import 标准库；不 import mcp_agent / fleet_proto / fleet。
 * 依赖缺失只给安装命令，绝不擅自安装；fleet_core 缺失时降级而不是崩溃。
 * 敏感文件 0600、数据目录 0700、原子写（tmp + os.replace + fsync）。
@@ -55,11 +55,11 @@ import sys
 import time
 import urllib.request
 
-VERSION = "5.1.0"
+VERSION = "5.2.0"
 
 # 节点程序（安装时必须拷到安装目录，mcp_agent.py 从自己所在目录读配置）
-NODE_FILES = ["mcp_agent.py", "fleet_proto.py", "dashboard_html.py"]
-OPTIONAL_NODE_FILES = ["fleet_core.py", "fleet_agent.py"]
+NODE_FILES = ["mcp_agent.py", "fleet_proto.py", "dashboard_html.py", "fleet.py"]
+OPTIONAL_NODE_FILES = ["fleet_core.py", "fleet_agent.py", "fleet_install.py"]
 CONFIG_NAME = "mcp_agent_config.json"
 MANIFEST_NAME = "manifest.json"
 MANIFEST_POINTER = ".fleet-manifest.json"
@@ -912,6 +912,10 @@ def _normalize_opts(opts):
     normalized["relay"] = bool(raw.get("relay"))
     normalized["require_auth"] = bool(raw.get("require_auth"))
     normalized["generate_token"] = bool(raw.get("generate_token"))
+    normalized["no_auth"] = bool(raw.get("no_auth"))
+    normalized["upgrade"] = bool(raw.get("upgrade"))
+    normalized["rollback"] = bool(raw.get("rollback"))
+    normalized["no_launcher"] = bool(raw.get("no_launcher"))
     normalized["print_unit"] = bool(raw.get("print_unit"))
     if "user" not in normalized:
         normalized["user"] = ""
@@ -1341,6 +1345,14 @@ class TermuxAdapter(ServiceAdapter):
         rc, out = _run(["termux-wake-lock"], timeout=20)
         commands.append({"cmd": "termux-wake-lock", "rc": rc,
                          "output": out.strip()[:120]})
+        # Android 14 后台冻结：尝试拉起「忽略电池优化」授权页（需用户点允许）
+        rc2, out2 = _run(["am", "start", "-a",
+                          "android.settings.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS",
+                          "-d", "package:com.termux"], timeout=15)
+        commands.append({"cmd": "request ignore battery optimizations",
+                         "rc": rc2, "output": out2.strip()[:120]})
+        warnings.append("如系统弹出「允许后台运行」，请点允许；否则 Android 14 "
+                        "可能在息屏后冻结 Termux")
         label = self.paths["unit_label"]
         warnings = []
         if _which("sv"):
@@ -1826,9 +1838,15 @@ def _write_config(opts, paths, source_dir):
     token = str(opts.get("auth_token") or "").strip()
     if token:
         cfg["auth_token"] = token
-    need_token = opts.get("require_auth") or opts.get("generate_token")
+    # v5.2 安全默认：没有显式关闭鉴权时，首次安装自动生成 token。
+    need_token = (not opts.get("no_auth")) or opts.get("require_auth") or opts.get("generate_token")
     if need_token and not (cfg.get("auth_token") or ""):
         cfg["auth_token"] = _gen_token()
+        opts["_auth_created"] = True
+        opts["_auth_token"] = cfg["auth_token"]
+    elif opts.get("no_auth") and not (cfg.get("auth_token") or ""):
+        opts["_auth_created"] = False
+        opts["_auth_disabled"] = True
     cfg.setdefault("auth_token", "")
 
     _atomic_write(paths["config_path"],
@@ -2154,6 +2172,126 @@ def _install_next_steps(opts, platform, paths, service, adapter, result):
     return steps
 
 
+
+# ---------------------------------------------------------------------------
+# v5.2: 全局启动器 / 升级备份 / 回滚
+# ---------------------------------------------------------------------------
+def _launcher_path(paths, platform):
+    """返回（路径, 是否 Windows）启动器位置。"""
+    if platform.get("is_termux"):
+        prefix = os.environ.get("PREFIX") or "/data/data/com.termux/files/usr"
+        return os.path.join(prefix, "bin", "fleet"), False
+    if platform.get("os") == "windows" or os.name == "nt":
+        return os.path.join(paths["install_dir"], "fleet.cmd"), True
+    if hasattr(os, "geteuid") and os.geteuid() == 0:
+        return "/usr/local/bin/fleet", False
+    return os.path.join(os.path.expanduser("~"), ".local", "bin", "fleet"), False
+
+
+def _install_launcher(opts, paths, platform):
+    """创建全局 `fleet` 启动器；失败只告警，不影响安装。"""
+    path, is_win = _launcher_path(paths, platform)
+    python = opts.get("python") or sys.executable or "python3"
+    cli = os.path.join(paths["install_dir"], "fleet.py")
+    try:
+        parent = os.path.dirname(path)
+        if parent:
+            _ensure_dir(parent, 0o755)
+        if is_win:
+            content = '@echo off\r\n"%s" "%s" %%*\r\n' % (python, cli)
+        else:
+            content = '#!/bin/sh\nexec "%s" "%s" "$@"\n' % (python, cli)
+        _atomic_write(path, content, 0o755)
+        _chmod(path, 0o755)
+        return {"path": path, "ok": True,
+                "on_path": bool(_which(os.path.basename(path)))}
+    except Exception as exc:
+        return {"path": path, "ok": False,
+                "warning": "创建全局命令失败（可手工执行 python3 %s）: %s" % (cli, exc)}
+
+
+def _backup_install_dir(paths):
+    """升级前完整备份安装目录（含 mailbox/config），返回备份路径或 None。"""
+    src = paths["install_dir"]
+    if not _exists(src):
+        return None
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    dst = src.rstrip("/\\") + ".bak-" + stamp
+    if _exists(dst):
+        return dst
+    shutil.copytree(src, dst, symlinks=True)
+    return dst
+
+
+def _list_backups(paths):
+    base = paths["install_dir"].rstrip("/\\") + ".bak-"
+    parent = os.path.dirname(paths["install_dir"]) or "."
+    try:
+        names = [n for n in os.listdir(parent) if n.startswith(os.path.basename(base))]
+    except OSError:
+        return []
+    found = [os.path.join(parent, n) for n in names]
+    return sorted(found, key=lambda p: os.path.getmtime(p), reverse=True)
+
+
+def rollback(opts=None):
+    """回滚到最近一次 --upgrade 备份，并重启服务/健康检查。"""
+    raw = dict(opts or {})
+    opts = _normalize_opts(raw)
+    platform = opts.get("platform") or detect_platform()
+    paths = resolve_paths(opts, platform)
+    manifest = _load_manifest(opts, paths)
+    opts, paths = _manifest_paths(manifest, raw, platform)
+    backups = _list_backups(paths)
+    result = {"ok": False, "version": VERSION, "platform": platform,
+              "paths": _public_paths(paths), "errors": [], "warnings": []}
+    if not backups:
+        result["errors"].append("没有可用备份（需先执行 --upgrade 才会生成）")
+        return result
+    backup = backups[0]
+    service = (manifest or {}).get("service") or _select_service(opts, platform)
+    try:
+        adapter = _make_adapter(service, opts, platform, paths)
+    except InstallerError:
+        adapter = _make_adapter(_select_service(opts, platform), opts, platform, paths)
+    try:
+        adapter.stop()
+    except Exception as exc:
+        result["warnings"].append("停止旧服务失败（继续回滚）: %s" % exc)
+    failed = paths["install_dir"].rstrip("/\\") + ".failed-" + time.strftime("%Y%m%d-%H%M%S")
+    try:
+        if _exists(paths["install_dir"]):
+            os.replace(paths["install_dir"], failed)
+        os.replace(backup, paths["install_dir"])
+    except OSError as exc:
+        result["errors"].append("回滚目录失败: %s" % exc)
+        return result
+    try:
+        start = adapter.start()
+        result["start"] = start
+        port = int((manifest or {}).get("port") or opts.get("port") or DEFAULT_PORT)
+        health = health_check(port, token=_read_token(paths["config_path"]),
+                              attempts=3)
+        result["health"] = health
+        result["ok"] = bool(start.get("ok")) and bool(health.get("ok"))
+        result["backup_used"] = backup
+        result["previous_install"] = failed
+        if not result["ok"]:
+            result["errors"].append("回滚后服务/健康检查未通过，旧目录保留在 %s" % failed)
+    except Exception as exc:
+        result["errors"].append("回滚后启动失败: %s" % exc)
+    return result
+
+
+def _redact_config(cfg):
+    """返回可进入 JSON 输出的配置副本（不泄露 token/sudo 密码）。"""
+    out = dict(cfg or {})
+    for key in ("auth_token", "sudo_password"):
+        if out.get(key):
+            out[key] = "***"
+    return out
+
+
 def install(opts=None):
     """执行安装：预检 → 目录/配置 → 身份 → 服务单元 → 启动 → 健康检查。
 
@@ -2187,6 +2325,15 @@ def install(opts=None):
         "next_steps": [],
         "manifest": paths["manifest_path"],
     }
+
+    upgrade_backup = None
+    if opts.get("upgrade") and not dry and _exists(paths["config_path"]):
+        try:
+            upgrade_backup = _backup_install_dir(paths)
+            result["upgrade"] = {"backup": upgrade_backup}
+            result["warnings"].append("升级前已备份: %s" % upgrade_backup)
+        except Exception as exc:
+            result["warnings"].append("升级备份失败（继续但请手工备份）: %s" % exc)
 
     # 1) 依赖预检（缺失只给安装命令）
     deps = check_dependencies(opts, platform)
@@ -2232,7 +2379,27 @@ def install(opts=None):
     except OSError as exc:
         result["errors"].append("写配置失败: %s" % exc)
         return result
-    result["config"] = cfg
+    result["config"] = _redact_config(cfg)
+    result["auth"] = {
+        "enabled": bool(str(cfg.get("auth_token") or "")),
+        "created": bool(opts.get("_auth_created")),
+        "disabled": bool(opts.get("_auth_disabled")),
+        "path": paths["config_path"],
+    }
+    if opts.get("_auth_disabled"):
+        result["warnings"].append("已按 --no-auth 关闭鉴权：公网/多用户环境请勿使用")
+
+    # 4.5) 全局 fleet 启动器
+    if opts.get("no_launcher") or os.environ.get("FLEET_NO_LAUNCHER"):
+        launcher = {"ok": False, "skipped": True, "path": ""}
+    else:
+        launcher = _install_launcher(opts, paths, platform)
+    result["launcher"] = launcher
+    if launcher.get("ok"):
+        result["warnings"].append("全局命令: %s（若不在 PATH，请加入 PATH）"
+                                  % launcher["path"])
+    elif launcher.get("warning"):
+        result["warnings"].append(launcher["warning"])
 
     # 5) 身份 / 邀请（fleet_core 缺失则降级）
     identity = _setup_identity(opts, platform, paths, cfg)
@@ -2277,7 +2444,9 @@ def install(opts=None):
     # 9) manifest（先写，保证失败也能安全卸载）
     manifest, manifest_errors = _write_manifest(
         opts, platform, paths, service, adapter, unit_written, copied,
-        adapter.extra_files(), result)
+        adapter.extra_files()
+        + ([result["launcher"]["path"]] if result.get("launcher", {}).get("ok") else []),
+        result)
     result["errors"].extend(manifest_errors)
     result["manifest"] = paths["manifest_path"]
 
@@ -2305,6 +2474,13 @@ def install(opts=None):
     result["ok"] = not result["errors"]
     result["next_steps"] = _install_next_steps(opts, platform, paths, service,
                                                adapter, result)
+    if result.get("launcher", {}).get("ok"):
+        result["next_steps"].insert(
+            0, "全局命令已就绪：fleet status / fleet nodes / fleet doctor")
+    if result["auth"].get("created"):
+        result["next_steps"].append(
+            "已自动生成访问 token（见 %s，0600）；MCP 客户端需要用同一 token"
+            % paths["config_path"])
     return result
 
 
@@ -2606,6 +2782,14 @@ def _build_parser():
     parser.add_argument("--no-service", action="store_true", dest="no_service",
                         help="只落地文件与配置，不注册服务、不启动")
     parser.add_argument("--uninstall", action="store_true", help="卸载节点")
+    parser.add_argument("--upgrade", action="store_true",
+                        help="升级：先备份当前安装目录，再覆盖程序并重启")
+    parser.add_argument("--rollback", action="store_true",
+                        help="回滚到最近一次 --upgrade 备份")
+    parser.add_argument("--no-auth", action="store_true", dest="no_auth",
+                        help="不生成访问 token（危险；默认会自动生成）")
+    parser.add_argument("--no-launcher", action="store_true", dest="no_launcher",
+                        help="不创建全局 fleet 命令（测试/受限环境）")
     parser.add_argument("--purge", action="store_true",
                         help="卸载时一并删除数据目录（危险，需明确指定）")
     parser.add_argument("--status", action="store_true", help="查询节点状态")
@@ -2616,7 +2800,7 @@ def _build_parser():
                         help="自定义服务单元目录（测试/自定义 init 用）")
     parser.add_argument("--version", action="store_true", dest="version_flag",
                         help="打印版本号")
-    # ---- v5 旧参数兼容（不报错，尽量映射到 v5.1 行为）----
+    # ---- v5 旧参数兼容（不报错，尽量映射到 v5.2 行为）----
     parser.add_argument("--generate-token", action="store_true", dest="generate_token")
     parser.add_argument("--require-auth", action="store_true", dest="require_auth")
     parser.add_argument("--auth-token", dest="auth_token")
@@ -2674,12 +2858,12 @@ def _namespace_to_opts(args):
             legacy.append("--invite <code> 旧邀请码格式：请改用 --join fleet://join/...")
     if opts.get("auto_start"):
         opts.pop("auto_start", None)
-        legacy.append("--auto-start 已默认开启（v5.1 统一注册开机自启），参数保留兼容")
+        legacy.append("--auto-start 已默认开启（v5.2 统一注册开机自启），参数保留兼容")
     if opts.get("discover_port"):
         opts["discover_port"] = int(opts["discover_port"])
     used_tunnel = [key for key in _LEGACY_TUNNEL_KEYS if opts.pop(key, None)]
     if used_tunnel:
-        legacy.append("v5.1 安装器不再内建隧道/frp/tailnet（%s）："
+        legacy.append("v5.2 安装器不再内建隧道/frp/tailnet（%s）："
                       "请用 fleet 中继工具或系统级隧道" % ", ".join(used_tunnel))
     if legacy:
         opts["_legacy_warnings"] = legacy
@@ -2695,7 +2879,13 @@ def _print_human(result, mode):
             sys.stdout.write("\n")
         return
     lines = []
-    if mode == "uninstall":
+    if mode == "rollback":
+        lines.append("MCP Fleet 回滚结果：%s" % ("成功" if result.get("ok") else "有错误"))
+        if result.get("backup_used"):
+            lines.append("  使用备份: %s" % result["backup_used"])
+        if result.get("previous_install"):
+            lines.append("  失败目录保留在: %s" % result["previous_install"])
+    elif mode == "uninstall":
         lines.append("MCP Fleet 卸载结果：%s" % ("成功" if result.get("ok") else "有错误"))
         for path in result.get("removed") or []:
             lines.append("  已删除: %s" % path)
@@ -2731,6 +2921,20 @@ def _print_human(result, mode):
                                          platform.get("service_manager")))
         lines.append("  安装目录: %s" % paths.get("install_dir", ""))
         lines.append("  数据目录: %s" % paths.get("data_dir", ""))
+        auth = result.get("auth") or {}
+        if auth.get("enabled"):
+            lines.append("  鉴权: 已开启%s" % ("（本次自动生成）" if auth.get("created") else ""))
+            if auth.get("created"):
+                try:
+                    _cfg = json.loads(_read_text(auth.get("path", ""), limit=1 << 20))
+                    _tok = str(_cfg.get("auth_token") or "")
+                except Exception:
+                    _tok = ""
+                if _tok:
+                    lines.append("  token: %s" % _tok)
+                    lines.append("  （只显示一次，请保存到密码管理器；配置文件权限 0600）")
+        else:
+            lines.append("  鉴权: [!] 未开启（--no-auth）")
         node = result.get("node") or {}
         if node.get("node_id"):
             lines.append("  设备码/节点 ID: %s" % node.get("node_id"))
@@ -2772,6 +2976,8 @@ def main(argv=None):
     mode = "install"
     if opts.get("uninstall"):
         mode = "uninstall"
+    elif opts.get("rollback"):
+        mode = "rollback"
     elif opts.get("status"):
         mode = "status"
     elif opts.get("print_unit"):
@@ -2779,6 +2985,8 @@ def main(argv=None):
     try:
         if mode == "uninstall":
             result = uninstall(opts)
+        elif mode == "rollback":
+            result = rollback(opts)
         elif mode == "status":
             result = status(opts)
         elif mode == "print_unit":

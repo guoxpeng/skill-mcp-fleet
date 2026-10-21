@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""fleet_core -- MCP Fleet v5.1 安全与可靠性底座（纯 Python 标准库，3.6+）。
+"""fleet_core -- MCP Fleet v5.2 安全与可靠性底座（纯 Python 标准库，3.6+）。
 
-本模块是 v5.1 协议的安全核心，只依赖标准库、不 import 项目内其他模块，
+本模块是 v5.2 协议的安全核心，只依赖标准库、不 import 项目内其他模块，
 供 `mcp_agent.py` / `fleet_proto.py` / `fleet_install.py` 等集成方按需注入使用：
 
   - 身份        Ed25519（RFC 8032）自实现 keygen/sign/verify
@@ -25,7 +25,7 @@
   * 单向静态 X25519 交换不具备完美前向保密（PFS），需要 PFS 时应每会话
     重新生成临时密钥并丢弃旧密钥。
 
-版本：5.1.0
+版本：5.2.0
 """
 
 import base64
@@ -49,14 +49,14 @@ try:                     # POSIX 才有的跨进程文件锁；Windows 下降级
 except ImportError:      # pragma: no cover - 仅在 Windows 上走这里
     fcntl = None
 
-VERSION = "5.1.0"
+VERSION = "5.2.0"
 
 #: 落盘文件默认权限（仅属主可读写）
 FILE_MODE = 0o600
 #: 目录默认权限（仅属主可进入）
 DIR_MODE = 0o700
 
-#: 密封数据版本前缀：v5.1 第 1 版格式
+#: 密封数据版本前缀：v5.2 第 1 版格式
 SEAL_PREFIX = "enc2$"
 #: 密封数据 nonce 长度（字节）
 SEAL_NONCE_LEN = 16
@@ -67,7 +67,7 @@ SEAL_TAG_LEN = 32
 INVITE_PREFIX = "fleet://join/"
 
 #: 请求签名版本前缀
-REQUEST_SIG_PREFIX = "v5.1"
+REQUEST_SIG_PREFIX = "v5.2"
 
 #: 各类签名/转录的域分隔标签（防止跨用途签名混淆）
 _DOMAIN_INVITE = b"fleet1|invite|"
@@ -423,8 +423,8 @@ def x25519_keypair():
 # 3. HKDF / 密封加密（SHA-256 CTR 流 + HMAC-SHA256，encrypt-then-MAC）
 #
 # 令牌格式：``enc2$<base64(nonce[16] | ciphertext | tag[32])>``
-#   enc_key = HKDF-SHA256(key, salt=nonce, info="fleet/v5.1/seal/enc")
-#   mac_key = HKDF-SHA256(key, salt=nonce, info="fleet/v5.1/seal/mac")
+#   enc_key = HKDF-SHA256(key, salt=nonce, info="fleet/v5.2/seal/enc")
+#   mac_key = HKDF-SHA256(key, salt=nonce, info="fleet/v5.2/seal/mac")
 #   keystream_i = HMAC-SHA256(enc_key, "ctr|" + nonce + i.to_bytes(8,"big"))
 #   tag = HMAC-SHA256(mac_key, "enc2$tag|" + nonce + len(aad) + aad + ct)
 # ===========================================================================
@@ -506,8 +506,8 @@ def seal(key, plaintext, aad=b""):
     plaintext = _as_bytes(plaintext, "plaintext")
     aad = _as_bytes(aad, "aad")
     nonce = os.urandom(SEAL_NONCE_LEN)
-    enc_key = hkdf_sha256(key, nonce, b"fleet/v5.1/seal/enc", 32)
-    mac_key = hkdf_sha256(key, nonce, b"fleet/v5.1/seal/mac", 32)
+    enc_key = hkdf_sha256(key, nonce, b"fleet/v5.2/seal/enc", 32)
+    mac_key = hkdf_sha256(key, nonce, b"fleet/v5.2/seal/mac", 32)
     ciphertext = _xor_bytes(plaintext, _seal_keystream(enc_key, nonce, len(plaintext)))
     tag = _seal_tag(mac_key, nonce, aad, ciphertext)
     return SEAL_PREFIX + _b64e(nonce + ciphertext + tag)
@@ -538,11 +538,11 @@ def open_sealed(key, token, aad=b""):
     nonce = raw[:SEAL_NONCE_LEN]
     ciphertext = raw[SEAL_NONCE_LEN:-SEAL_TAG_LEN]
     tag = raw[-SEAL_TAG_LEN:]
-    mac_key = hkdf_sha256(key, nonce, b"fleet/v5.1/seal/mac", 32)
+    mac_key = hkdf_sha256(key, nonce, b"fleet/v5.2/seal/mac", 32)
     expect = _seal_tag(mac_key, nonce, aad, ciphertext)
     if not hmac.compare_digest(tag, expect):
         raise ValueError("密封数据完整性校验失败（密钥/AAD 不匹配或数据被篡改）")
-    enc_key = hkdf_sha256(key, nonce, b"fleet/v5.1/seal/enc", 32)
+    enc_key = hkdf_sha256(key, nonce, b"fleet/v5.2/seal/enc", 32)
     return _xor_bytes(ciphertext, _seal_keystream(enc_key, nonce, len(ciphertext)))
 
 
@@ -558,7 +558,7 @@ def derive_pair_key(shared_secret, transcript):
         raise ValueError("共享秘密必须是 32 字节")
     transcript = _as_bytes(transcript, "transcript")
     salt = hashlib.sha256(transcript).digest()
-    return hkdf_sha256(shared_secret, salt, b"fleet/v5.1/pair-key", 32)
+    return hkdf_sha256(shared_secret, salt, b"fleet/v5.2/pair-key", 32)
 
 
 # ===========================================================================
@@ -646,7 +646,7 @@ def _request_basis(method, path, ts_text, nonce, body):
 
 
 def sign_request(identity, method, path, body, ts=None, nonce=None):
-    """为出站 HTTP 请求生成 v5.1 签名头。
+    """为出站 HTTP 请求生成 v5.2 签名头。
 
     :param identity: :class:`Identity` 实例
     :param method: HTTP 方法（大小写不敏感，签名内统一大写）
@@ -692,7 +692,7 @@ def _header_get(headers, name):
 
 def verify_request(public_key_b64, method, path, body, headers, guard=None,
                    max_skew_s=300):
-    """校验入站请求的 v5.1 签名、时间窗与 nonce 唯一性。
+    """校验入站请求的 v5.2 签名、时间窗与 nonce 唯一性。
 
     :param public_key_b64: 对端 Ed25519 公钥（base64）
     :param method: HTTP 方法

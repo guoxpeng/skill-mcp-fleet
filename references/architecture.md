@@ -1,7 +1,7 @@
-# 架构 · MCP Fleet v5.1
+# 架构 · MCP Fleet v5.2
 
 > 读者：想理解协议细节、做二次开发或安全评审的人。
-> 产品用法看 `SKILL.md`；模块 API 看 `docs/V5.1-CONTRACT.md`；威胁模型看 `references/security-model.md`。
+> 产品用法看 `SKILL.md`；模块 API 看 `docs/V5.2-CONTRACT.md`；威胁模型看 `references/security-model.md`。
 
 ## 1. 一句话
 
@@ -46,7 +46,7 @@ UDP 发现 + HTTP 消息/同步端点 + 离线信箱 + 多路径中继。设备�
 - 信任等级：
   - `S0` 未配对（仅同网段发现；默认不接受变更类调用）
   - `S1` token 信任（v5 兼容）
-  - `S2` 公钥签名（v5.1 配对）
+  - `S2` 公钥签名（v5.2 配对）
   - `S3` 签名 + TLS（公网/跨网段推荐）
 - 配对时序（当前 CLI：签名邀请 + 公钥交换 + SAS；下方 X25519 前向保密流程为
   `fleet_core` 已提供原语的升级路径，尚未接入 CLI）：
@@ -70,7 +70,7 @@ B: 验证 proof_A → shared = X25519(b_eph, a_pub_eph)
 
 ## 4. 请求与消息
 
-### 4.1 签名请求（v5.1）
+### 4.1 签名请求（v5.2）
 
 ```
 X-Fleet-Node:  <node_id>
@@ -161,6 +161,6 @@ X-Fleet-Sig:   base64(Ed25519("fleet1|METHOD|PATH|ts|nonce|sha256(body)"))
 
 ## 9. 版本与兼容
 
-- MCP `protocolVersion` 2024-11-05；节点 `SERVER_VERSION` 5.1.0。
-- 协议字段新增保持向后兼容（未知字段忽略）；v5 节点可与 v5.1 混跑。
+- MCP `protocolVersion` 2024-11-05；节点 `SERVER_VERSION` 5.2.0。
+- 协议字段新增保持向后兼容（未知字段忽略）；v5 节点可与 v5.2 混跑。
 - 关闭 `compat_v5` 后仅接受签名请求；升级路径见 CHANGELOG。
