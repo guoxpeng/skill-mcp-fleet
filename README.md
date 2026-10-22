@@ -30,7 +30,7 @@ v5.2 把这件事从"能连"推进到**"敢连、好连、会自己想、坏了�
 
 | # | 升级 | 一句话 | 证据 |
 |---|------|--------|------|
-| 1 | **标准 Agent Skill** | 严格遵循 Agent Skills 规范：frontmatter 仅 4 个标准字段、正文 <300 行、渐进披露到 `references/` | `SKILL.md`、`scripts/build_package.py` 生成合规提交包 |
+| 1 | **标准 Agent Skill** | 严格遵循 Agent Skills 规范：frontmatter 仅 4 个标准字段 + 1 个市场版本字段（version）、正文 <300 行、渐进披露到 `references/` | `SKILL.md`、`scripts/build_package.py` 生成合规提交包 |
 | 2 | **默认安全** | Ed25519 身份 + 请求签名 + 防重放 + 认证加密信箱 + 执行策略 + 哈希链审计 + 供应链校验（六层） | `references/security-model.md`、`tests/test_core_51.py`、`SECURITY.md` |
 | 3 | **全平台一条命令** | Android/Termux、飞牛/群晖/威联通/绿联、OpenWrt、Linux、macOS、Windows、Docker、云主机统一安装器，自动识别 init 与守护方式 | `scripts/fleet_install.py`、`references/platform-matrix.md`、`tests/test_installer_51.py` |
 | 4 | **自愈连接** | 对端状态机 + 指数退避/抖动 + 熔断 + 消息去重/退避/死信 + 多路径（局域网/直连/Tailscale，中继配置预留）+ `fleet doctor` | `scripts/fleet_proto.py`、`tests/test_integration_51.py` |
@@ -45,7 +45,7 @@ v5.2 把这件事从"能连"推进到**"敢连、好连、会自己想、坏了�
 | **作品可用性** | 一条命令安装/加入；`fleet doctor` 12 项自检；`scripts/demo.sh` 30 秒双节点演示；测试套件一键回归；卸载/升级/回滚都有路径。 |
 | **Skill 复用率** | 标准 MCP 服务器，Claude Code / Cursor / CodeArts / 自研 Agent 均可接入；工具、平台、提示词、传输均为插件式扩展；Skill 本身可被任意 Agent 复用。 |
 | **技术完成度** | 自研协议层 + 纯标准库密码学（RFC 7748/8032 向量测试）+ 多平台守护 + 自对话协议 + 哈希链审计。不是配置型工具，是完整系统。 |
-| **内容传播力** | 华为云 × 小红书 × 开源社区三通道；历史数据：GitHub 747 次克隆 / 281 独立访客，技能市场浏览 23 次并列全场 114 作品第一（见 `references/传播度证据.md`）。 |
+| **内容传播力** | 华为云 × 小红书 × 开源社区三通道。GitHub 真实克隆峰值单日 248 次（14 天 747 次 / 281 独立访客，快照 10-17）；技能市场上架并进入社区可见列表；小红书笔记 + 市场双通道分发（见 `references/传播度证据.md`）。 |
 
 ## 四、与华为云的结合
 
