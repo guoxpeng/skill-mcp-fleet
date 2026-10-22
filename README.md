@@ -118,7 +118,7 @@ fleet nodes
 ### 6.5 可复现的验证证据
 
 ```bash
-.venv/bin/python -m pytest tests/ -q        # 625 passed, 1 skipped
+.venv/bin/python -m pytest tests/ -q        # 626 passed, 1 skipped
 sh scripts/install.sh --dry-run --json --name demo   # 安装器零副作用预演
 bash scripts/demo.sh                        # 本机双节点 30 秒演示
 ```

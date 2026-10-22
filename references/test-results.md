@@ -1,7 +1,7 @@
 # 真机测试结果 · MCP Fleet v5.2.0
 
 > 本文件记录可复现的真实设备验证。测试时间：2026-10-22。
-> 自动化用例：**625 passed + 1 skipped**（`python3 -m pytest tests/ -q`）。
+> 自动化用例：**626 passed + 1 skipped**（`python3 -m pytest tests/ -q`）。
 > 下列结果来自实际安装/升级/运行，不是单元测试推断。
 
 ## 1. 覆盖矩阵

@@ -25,6 +25,12 @@
   `initialize.instructions` 加入自修复章节。
 - 工具总数 41 设备 + 15 智能 = **56**。
 
+### 打包与发布
+- 提交包改为**根目录平铺**（SKILL.md 在根、30 文件、包内无 MANIFEST.json），
+  满足技能市场格式；MANIFEST/SHA256SUMS 留在 zip 外部。
+- SKILL frontmatter 增加 `version: 5.2.0`，构建时校验与代码版本一致。
+- CI 增加 workflow artifact 上传；`v*` tag 自动上传 Release 并标记 latest。
+
 ### 文档
 - 新增 `references/self-repair.md`（工具/白名单/安全边界/验收标准）。
 - 新增 `references/test-results.md`（macOS / Ubuntu 24.04 / Android 14 真机结果、
@@ -32,7 +38,7 @@
 - SKILL/README/SECURITY 同步到 v5.2。
 
 ### 测试
-- 全量 **625 passed + 1 skipped**；新增自修复工具注册/确认边界/只读保护/有界循环/
+- 全量 **626 passed + 1 skipped**；新增自修复工具注册/确认边界/只读保护/有界循环/
   失败停止、菜单与提示词、CLI 映射测试。
 
 ---

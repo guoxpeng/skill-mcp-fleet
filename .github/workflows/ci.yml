@@ -48,15 +48,17 @@ jobs:
           python3 - <<'PY'
           import json, hashlib, zipfile, pathlib
           zp = next(pathlib.Path("dist").glob("mcp-fleet-v*.zip"))
+          manifest = json.loads((pathlib.Path("dist") / "MANIFEST.json").read_text())
           with zipfile.ZipFile(zp) as z:
-              names = z.namelist()
-              assert any(n.endswith("SKILL.md") for n in names), "package missing SKILL.md"
-              manifest = json.loads(z.read("mcp-fleet/MANIFEST.json"))
-              assert manifest["file_count"] <= 30, manifest["file_count"]
+              names = [n for n in z.namelist() if not n.endswith("/")]
+              assert "SKILL.md" in names, "SKILL.md must be at zip root"
+              assert "MANIFEST.json" not in names, "MANIFEST.json must stay outside the zip"
+              assert not any(n.startswith("mcp-fleet/") for n in names), "zip must be flat"
+              assert len(names) == manifest["file_count"] == 30, (len(names), manifest["file_count"])
               for rel, meta in manifest["files"].items():
-                  data = z.read("mcp-fleet/" + rel)
+                  data = z.read(rel)
                   assert hashlib.sha256(data).hexdigest() == meta["sha256"], rel
-          print("package ok:", zp, len(names), "entries")
+          print("package ok:", zp, len(names), "entries, flat root")
           PY
       - name: Upload package as workflow artifact
         uses: actions/upload-artifact@v4

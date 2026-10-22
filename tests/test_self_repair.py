@@ -83,3 +83,21 @@ def test_repair_loop_stops_on_failure(monkeypatch):
     assert err is True
     assert data["attempts"][0]["ok"] is False
     assert data["remaining"][0]["code"] == "port_unreachable"
+
+
+def test_package_flat_format(tmp_path):
+    """CI/华为云要求：根目录平铺、SKILL.md 在根、包内无 MANIFEST、30 文件。"""
+    import subprocess, sys, zipfile, json, glob, os
+    out = tmp_path / "dist"
+    r = subprocess.run([sys.executable, os.path.join("scripts", "build_package.py"),
+                        "--out", str(out)], capture_output=True, text=True)
+    assert r.returncode == 0, r.stderr
+    zpath = glob.glob(str(out / "*.zip"))[0]
+    with zipfile.ZipFile(zpath) as z:
+        names = [n for n in z.namelist() if not n.endswith("/")]
+    assert "SKILL.md" in names
+    assert "MANIFEST.json" not in names
+    assert not any(n.startswith("mcp-fleet/") for n in names)
+    assert len(names) == 30
+    manifest = json.loads((out / "MANIFEST.json").read_text())
+    assert manifest["file_count"] == 30

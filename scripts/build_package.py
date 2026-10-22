@@ -3,7 +3,10 @@
 """MCP Fleet 参赛提交包生成器（纯标准库）。
 
 把仓库裁剪成一个符合 Agent Skills 规范、≤30 文件、≤40 MB 的提交包，并生成
-SHA256SUMS 与 MANIFEST.json，保证评审可复现、可校验。
+SHA256SUMS 与外部 MANIFEST.json，保证评审可复现、可校验。
+
+提交包为**根目录平铺**结构（SKILL.md 在根），不包含额外 MANIFEST.json 条目，
+避免技能市场把包识别成 31 文件/多一层目录。
 
 用法：
     python3 scripts/build_package.py
@@ -109,10 +112,17 @@ def validate_skill():
         fm = parse_frontmatter(path)
     except ValueError as e:
         return [str(e)]
-    allowed = {"name", "description", "license", "compatibility", "metadata", "allowed-tools"}
+    allowed = {"name", "version", "description", "license", "compatibility",
+               "metadata", "allowed-tools"}
     unknown = set(fm) - allowed
     if unknown:
         errors.append("frontmatter 含非标准字段: %s" % ", ".join(sorted(unknown)))
+    version = str(fm.get("version") or "")
+    if not version:
+        errors.append("frontmatter 缺少 version 字段（技能市场会默认 1.0.0）")
+    elif version != DEFAULT_VERSION:
+        errors.append("frontmatter version=%s 与构建版本 %s 不一致" %
+                      (version, DEFAULT_VERSION))
     name = fm.get("name", "")
     if not re.match(r"^[a-z0-9]+(-[a-z0-9]+)*$", name):
         errors.append("name 必须是小写字母/数字/连字符: %r" % name)
@@ -185,20 +195,18 @@ def build(out_dir, version, with_tests=True, max_files=MAX_FILES):
             src = os.path.join(ROOT, rel)
             digest = sha256_file(src)
             manifest["files"][rel] = {"sha256": digest, "bytes": os.path.getsize(src)}
-            arc = SKILL_NAME + "/" + rel
-            info = zipfile.ZipInfo(arc, date_time=fixed_date)
+            # 根目录平铺：SKILL.md 在 zip 根，不额外加 mcp-fleet/ 前缀
+            info = zipfile.ZipInfo(rel, date_time=fixed_date)
             info.compress_type = zipfile.ZIP_DEFLATED
             with open(src, "rb") as f:
                 zf.writestr(info, f.read())
-        zf.writestr(SKILL_NAME + "/MANIFEST.json",
-                    json.dumps(manifest, ensure_ascii=False, indent=2, sort_keys=True))
 
     # SHA256SUMS：包内文件摘要（不含自身）
     sums_path = os.path.join(out_dir, "SHA256SUMS")
     with open(sums_path, "w", encoding="utf-8") as f:
         f.write("%s  %s\n" % (sha256_file(zip_path), os.path.basename(zip_path)))
         for rel, meta in sorted(manifest["files"].items()):
-            f.write("%s  %s/%s\n" % (meta["sha256"], SKILL_NAME, rel))
+            f.write("%s  %s\n" % (meta["sha256"], rel))
 
     with open(os.path.join(out_dir, "MANIFEST.json"), "w", encoding="utf-8") as f:
         json.dump(manifest, f, ensure_ascii=False, indent=2, sort_keys=True)
