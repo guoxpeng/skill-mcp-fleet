@@ -1,7 +1,7 @@
-# MCP Fleet v5.2 平台安装矩阵
+# MCP Fleet v5.1.1 平台安装矩阵
 
 > **事实来源**：本文所有命令、默认路径、探测规则与限制，均以仓库内
-> `scripts/fleet_install.py`（v5.2.7）的实际实现为准。安装器只依赖 **Python 标准库
+> `scripts/fleet_install.py`（v5.1.1）的实际实现为准。安装器只依赖 **Python 标准库
 > （3.6+）**，不 `pip install` 任何东西，也不会擅自安装系统依赖——缺依赖时只打印
 > 对应平台的安装命令。凡本安装器**尚未实现**的能力，本文在「已知限制 / 仍缺平台」
 > 中如实列出，不做承诺。
@@ -18,7 +18,7 @@ python3 scripts/fleet_install.py --name <节点名> --port 3100
   `--source-dir`、当前目录、脚本所在 `scripts/` 中寻找 `mcp_agent.py` 等节点文件）。
 - 如果只有 `fleet_install.py` 一个文件，请补 `--source-dir /path/to/scripts`。
 - 仓库根 README/SKILL 里的 `sh fleet-install.sh ...` 引导脚本与安装器参数同名
-  （`--name/--port/--dir/--mode/--uninstall`）；**v5.2 全部高级参数以本表为准**，
+  （`--name/--port/--dir/--mode/--uninstall`）；**v5.1.1 全部高级参数以本表为准**，
   例如 `--service`、`--print-unit`、`--status`、`--json`、`--dry-run`。
 
 ### 0.2 常用参数速查（均来自 `--help` 实现）
@@ -48,7 +48,7 @@ python3 scripts/fleet_install.py --name <节点名> --port 3100
 
 **旧参数兼容**：`--invite <邀请码>`（`fleet://` 开头会映射成 `--join`）、
 `--auto-start`、`--tunnel*`、`--frp-*`、`--ssh-*`、`--directory*`、`--tailnet*`
-会被接受；v5.2 不再内建隧道/frp/tailnet，仅在结果 `warnings` 中提示改用中继工具或系统级隧道。
+会被接受；v5.1.1 不再内建隧道/frp/tailnet，仅在结果 `warnings` 中提示改用中继工具或系统级隧道。
 
 ### 0.3 退出码与 JSON
 
@@ -537,7 +537,7 @@ sudo python3 scripts/fleet_install.py --name tencent-ecs --port 3100
 
 ---
 
-## 17. v5.2 安装体验变化（所有平台通用）
+## 17. v5.1.1 安装体验变化（所有平台通用）
 
 - **默认鉴权**：安装时自动生成 `auth_token` 并写入配置（0600），人读输出只显示一次；
   `--no-auth` 才关闭。首次启动时若对外监听且无 token，节点也会自动生成（`auto_secure`）。

@@ -152,55 +152,30 @@
 
 ---
 
-## [5.2.0] — 2026-10-22 · 体验增强：安全默认 / 全局命令 / 升级回滚 / Dashboard 2.0 / 自然语言入口
+## [5.1.1] — 2026-10-22 · 修复合集（默认鉴权 / 升级回滚 / TLS / 邮箱 / 跨平台）
 
-**主题：让普通用户第一次就能装对、连上、看懂、升级。**
+> 按版本规则：5.1.0 之后的小问题统一收敛到 5.1.1，不再逐个占用版本号。
+> 本版包含此前 5.2.0–5.2.7 的全部修复与体验完善。
 
-### 安装体验（P0）
-- **默认鉴权**：安装时自动生成强随机 token（0600），人读输出只打印一次；
-  `--no-auth` 显式关闭并警告；`--dry-run` 零副作用。
-- **全局 `fleet` 命令**：安装器创建 `/usr/local/bin/fleet`、`$PREFIX/bin/fleet`
-  或 `~/.local/bin/fleet`（Windows 为 `fleet.cmd`），写入 manifest，卸载时清理。
-- **升级/回滚**：`--upgrade` 自动备份安装目录（含 mailbox/config）→ 覆盖 → 重启 →
-  健康检查；`--rollback` 恢复最近备份；`fleet update` 直接调用。
-- **Android 14 电池优化**：Termux 安装时自动拉起「忽略电池优化」授权页并提示，
-  降低息屏后台冻结概率。
-- **发布脚本**：`scripts/release.py` 一键创建 GitHub Release 并上传 zip+SHA256SUMS
-  （支持 GITHUB_TOKEN / git 凭据，`--dry-run`，不打印 token）。
+### 安全与默认
+- 安装默认生成随机 auth_token（`--no-auth` 关闭）；对外监听无 token 时自动生成。
+- JSON 安装结果脱敏；自签 TLS 健康检查/回滚/CLI 全链路修复。
 
-### 安全默认（P0）
-- 非 loopback 监听且无 token 时，节点启动自动生成 token（`auto_secure`，可关）；
-  `--allow-insecure` 显式降级。
-- JSON 安装结果中的配置已脱敏，不再回显 token/sudo 密码。
-- 错误信息带下一步：401/403 提示重新配对，连接失败提示查防火墙/Tailscale/doctor。
+### 安装与升级
+- 全局 `fleet` 命令；`--upgrade` 先停旧服务、自动备份；`--rollback` 恢复备份。
+- 发布包缺模板时内置兜底；Docker 只读根/TLS/data_dir 修复。
+- `fleet update` 远端拉最新 release（commit SHA 固定、SHA256 校验），失败回退本地。
 
-### CLI 体验（P1）
-- `fleet ask "<自然语言>" [--run]`：规则意图识别（磁盘/网络/Docker/服务/备份/体检），
-  生成计划 + 可粘贴给 AI 的提示词；`--run` 只执行只读白名单命令并汇总证据。
-- `fleet invite --qr`：有 `qrencode` 时终端显示二维码，缺失时给安装提示。
-- `fleet join --auto-install`：本机未装节点时自动安装再加入。
-- `fleet identity export/import`：口令加密备份/恢复 Ed25519 身份，换机不重配全网。
-- `fleet update [--rollback]`：封装安装器升级/回滚。
+### 体验
+- `fleet ask`、`fleet invite --qr`、`fleet join --auto-install`、
+  `fleet identity export/import`、Dashboard 2.0。
+- `fleet update --rollback`、`fleet selfcheck`（自修复工具见 5.2.0）。
 
-### Dashboard 2.0（P1）
-- 新增：节点指纹/安全状态（审计/签名/TLS/只读）、投递队列（待投递/死信）、
-  Agent 任务时间线、对端指纹与「移除设备」（`POST /fleet/peer_remove`）、
-  `/fleet/tasks` 端点。
-- 数据接口扩展 `identity/security/delivery/tasks`，页面 5s 刷新。
-
-### 文档
-- 新增 `references/quickstart.md`（5 分钟上手）与 `references/troubleshooting.md`
-  （一页排障）；SKILL.md 参考索引同步。
-- 版本统一为 **v5.2.0**。
+### 真机验证
+- macOS(launchd)、Ubuntu 24.04(systemd)、Android 14/Termux 安装/升级/回滚/卸载通过。
 
 ### 测试
-- 全量 **603 passed + 1 skipped**；新增 CLI 14 例、Dashboard/默认鉴权 5 例、
-  安装器 6 例（默认 token/无鉴权/launcher/升级/回滚）。
-
-### 升级注意
-- 从 v5.1 升级会保留数据目录与配置；`fleet update` 自动备份。
-- 首次启动 v5.2 的对外监听节点会自动生成 token；旧 MCP 客户端需补 `Authorization`，
-  或重新配对后在 `peers.json` 使用签名。
+- 全量 **615 passed + 1 skipped**。
 
 ---
 

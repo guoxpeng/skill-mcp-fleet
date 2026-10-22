@@ -155,7 +155,7 @@ def ro_node(tmp_path):
 class TestMcpV51:
     def test_initialize_instructions(self, node):
         res = node.init()
-        assert res["serverInfo"]["version"].startswith("5.2")
+        assert res["serverInfo"]["version"].startswith("5.1")
         instructions = res.get("instructions", "")
         assert len(instructions) > 500
         for key in ("观察", "计划", "执行", "fleet_plan", "安全"):

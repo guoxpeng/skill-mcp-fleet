@@ -5,12 +5,12 @@ license: MIT
 compatibility: Python 3.6+，纯标准库；Linux / macOS / Windows / Android(Termux) / OpenWrt。可选 openssl（自动生成 TLS 证书）与 tailscale（跨网段加速）。
 ---
 
-# MCP Fleet v5.2 · 让所有设备成为一支 AI 团队
+# MCP Fleet v5.1.1 · 让所有设备成为一支 AI 团队
 
 MCP Fleet 把每台设备变成一个**节点**，节点之间对等互联：自动发现、在线直投、离线信箱、
 按能力委派。设备上的 AI Agent 可以直接对话与协作，而不是"人拿遥控器"。
 
-**v5.2 的三件事**：
+**v5.1.1 的三件事**：
 
 1. **一条命令接入**——安装器自动识别 Android/NAS/软路由/云主机/PC，生成服务、开机自启、健康检查，并打印邀请链接。
 2. **默认安全**——每节点 Ed25519 身份、请求签名与防重放、认证加密信箱、执行策略、哈希链审计、供应链校验。
@@ -83,7 +83,7 @@ fleet ask "帮我看下磁盘为什么满了" --run   # 自然语言入口（只
 - `initialize.instructions`：本机操作手册（何时用哪些工具、安全边界、四步法）。
 - `prompts/list`：`fleet-playbook`、`fleet-diagnose`、`fleet-plan`、`fleet-self-review`、
   `fleet-delegate`、`fleet-incident`、`fleet-onboard`。
-- 工具层：41 个设备工具 + 12 个 v5.2 工具（6 个自对话 + 6 个运维）。
+- 工具层：41 个设备工具 + 12 个 v5.1.1 工具（6 个自对话 + 6 个运维）。
 
 ### 自对话四步法（默认工作方式）
 
@@ -217,4 +217,4 @@ A(规划) → propose 任务给 B(执行) → B 回 progress → B 回 result+�
 - 节点被完全攻陷时，攻击者拥有该节点进程权限——这是所有远程执行工具的边界；
   用独立低权限用户 + 只读模式 + 网络隔离降低影响。
 
-> 版本：v5.2.7 ｜ 作者：guoxpeng ｜ 许可：MIT ｜ 仓库：https://github.com/guoxpeng/skill-mcp-fleet
+> 版本：v5.1.1 ｜ 作者：guoxpeng ｜ 许可：MIT ｜ 仓库：https://github.com/guoxpeng/skill-mcp-fleet

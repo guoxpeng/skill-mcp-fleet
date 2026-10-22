@@ -25,7 +25,7 @@
   * 单向静态 X25519 交换不具备完美前向保密（PFS），需要 PFS 时应每会话
     重新生成临时密钥并丢弃旧密钥。
 
-版本：5.2.7
+版本：5.1.1
 """
 
 import base64
@@ -49,7 +49,7 @@ try:                     # POSIX 才有的跨进程文件锁；Windows 下降级
 except ImportError:      # pragma: no cover - 仅在 Windows 上走这里
     fcntl = None
 
-VERSION = "5.2.7"
+VERSION = "5.1.1"
 
 #: 落盘文件默认权限（仅属主可读写）
 FILE_MODE = 0o600

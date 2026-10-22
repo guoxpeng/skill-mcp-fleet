@@ -71,7 +71,7 @@ import uuid
 
 # ---------------------------------------------------------------- 基础
 
-VERSION = "1.2.0"
+VERSION = "5.1.1"
 PROTOCOL = "2024-11-05"
 HERE = os.path.dirname(os.path.abspath(__file__))
 # 登记表位置：
@@ -2420,7 +2420,7 @@ def _fetch_remote_installer():
 
 
 def cmd_update(a):
-    """v5.2.7: 升级本机节点（默认从远端拉最新发布包；--offline 用本地）。"""
+    """v5.1.1: 升级本机节点（默认从远端拉最新发布包；--offline 用本地）。"""
     installer = _installer_path()
     if not installer:
         return die("找不到 fleet_install.py；请重新下载安装包，或手工执行 "

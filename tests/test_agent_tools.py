@@ -29,7 +29,7 @@ class TestToolRegistry:
         assert missing == []
 
     def test_version_is_51(self):
-        assert mp.SERVER_VERSION.startswith("5.2")
+        assert mp.SERVER_VERSION.startswith("5.1")
 
     def test_core_tools_present(self):
         must = {"exec", "read", "write", "edit", "list_dir",

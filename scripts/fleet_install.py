@@ -55,7 +55,7 @@ import sys
 import time
 import urllib.request
 
-VERSION = "5.2.7"
+VERSION = "5.1.1"
 
 # 节点程序（安装时必须拷到安装目录，mcp_agent.py 从自己所在目录读配置）
 NODE_FILES = ["mcp_agent.py", "fleet_proto.py", "dashboard_html.py", "fleet.py"]
@@ -2387,7 +2387,7 @@ def install(opts=None):
         "manifest": paths["manifest_path"],
     }
 
-    # v5.2.7: 升级必须指向真实存在的同一节点，避免“升级成另一个默认节点”
+    # v5.1.1: 升级必须指向真实存在的同一节点，避免“升级成另一个默认节点”
     if opts.get("upgrade") and not dry:
         if not _exists(paths["config_path"]):
             result["errors"].append(
