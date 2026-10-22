@@ -25,7 +25,8 @@ services:
       - no-new-privileges:true
     cap_drop:
       - ALL
-    read_only: true
+    # 注意：不启用 read_only（mailbox/agent 状态写在 /app 挂载卷里，
+    # 只读根会导致节点启动后无法落盘）。加固仍由 cap_drop/no-new-privileges 提供。
     tmpfs:
       - /tmp:rw,noexec,nosuid,size=64m
     healthcheck:

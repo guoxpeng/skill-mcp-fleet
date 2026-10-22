@@ -238,7 +238,7 @@ class MailEngine:
     每个节点一个 MailEngine，管理本地邮箱。
     mailbox/inbox.jsonl + outbox.jsonl + sent.jsonl + cursor.json
     """
-    def __init__(self, base_dir, node_name, secret=None):
+    def __init__(self, base_dir, node_name, secret=None, fallback_secret=None):
         self.dir = os.path.join(base_dir, "mailbox")
         os.makedirs(self.dir, exist_ok=True)
         self.inbox_path = os.path.join(self.dir, "inbox.jsonl")
@@ -246,8 +246,11 @@ class MailEngine:
         self.sent_path = os.path.join(self.dir, "sent.jsonl")
         self.cursor_path = os.path.join(self.dir, "cursor.json")
         self.node_name = node_name
-        # v5.0: 落盘加密密钥（节点 auth_token 派生）。None=不加密（兼容旧部署）
+        # v5.0: 落盘加密密钥（v5.2.2 起为稳定 mailbox.key）。None=不加密。
         self.secret = secret or None
+        # v5.2.2: 旧版本用 auth_token 派生密钥；升级后仍可读旧邮件，
+        # 下次写回时自动用新 mailbox.key 重新加密（平滑迁移）。
+        self._fallback_secret = fallback_secret or None
         # v5.0: RLock（可重入）—— sync_summary() 等方法持锁调用 outbox_pending()
         # 等内部加锁方法。原 Lock 不可重入，v4.1 起 gossip 同步一触发即死锁
         # （测试套件首轮捕获，见 tests/test_mail_engine.py::TestSync）。
@@ -259,6 +262,10 @@ class MailEngine:
         # blob 内仍自带 salt 字段，旧格式（每条独立 salt）解密自动兼容。
         self._salt = self._load_or_create_salt() if self.secret else None
         self._next_id = self._calc_next_id()
+        # v5.2.3: 首次带旧密钥回退启动时，把历史邮件迁移到新 mailbox.key，
+        # 之后 token 再轮换也不影响已迁移数据。marker 避免每次启动重写。
+        if self.secret and self._fallback_secret:
+            self._migrate_legacy_once()
         # v5.0.7: 收件箱 msg_id 去重滑动窗口 —— gossip 双路径（直投 /fleet/mail
         # + 同步 /fleet/poll）在重试/重连场景可能把同一条消息投两次，
         # 窗口内重复 msg_id 直接丢弃。deque 做淘汰顺序，set 做 O(1) 查询。
@@ -308,6 +315,28 @@ class MailEngine:
                 pass
         return m
 
+    def _migrate_legacy_once(self):
+        marker = os.path.join(self.dir, ".rekey-v2")
+        if os.path.exists(marker):
+            return
+        # 先确认所有旧密文都能用「主密钥或回退密钥」解开；有任何一个无法解开
+        # 就整体跳过：宁可保持旧密文可恢复，也不能把占位符写回磁盘。
+        for path in (self.inbox_path, self.outbox_path, self.sent_path):
+            if not os.path.exists(path):
+                continue
+            for msg in self._load_jsonl(path):
+                if msg.get("decrypt_error"):
+                    return
+        try:
+            for path in (self.inbox_path, self.outbox_path, self.sent_path):
+                if os.path.exists(path):
+                    self._save_jsonl(path, self._load_jsonl(path))
+            with io.open(marker, "w", encoding="ascii") as f:
+                f.write("1")
+        except Exception:
+            # 迁移失败不阻塞启动；下次启动会重试（marker 未写入）
+            pass
+
     def _decrypt_field(self, msg):
         """读取后解密 text 字段。旧明文数据（无 enc1$ 前缀）原样返回。"""
         if not self.secret:
@@ -318,7 +347,17 @@ class MailEngine:
             try:
                 m["text"] = decrypt_text(self.secret, t)
             except Exception:
-                pass  # 旧密钥数据/损坏行：保留密文，不中断读取
+                try:
+                    if self._fallback_secret:
+                        m["text"] = decrypt_text(self._fallback_secret, t)
+                    else:
+                        raise ValueError("no fallback")
+                except Exception:
+                    # 不把密文当正文喂给 agent；但保留原始密文，
+                    # 避免任何写回操作把不可恢复的数据覆盖成占位符。
+                    m["_ciphertext"] = t
+                    m["text"] = "[无法解密：邮箱密钥已轮换或数据损坏]"
+                    m["decrypt_error"] = True
         return m
 
     def _calc_next_id(self):
@@ -596,8 +635,20 @@ class MailEngine:
         # -> 这里写回。原实现直接 json.dumps 落盘，密文一经任何重写操作
         # 即整体退化为明文（投递循环每 15s 触发一次，加密静默失效）。
         # 现在写盘前对称过 _encrypt_field（幂等：已是 enc1$ 的不会被二次加密）。
+        safe = []
+        for m in msgs:
+            item = dict(m)
+            original = item.pop("_ciphertext", None)
+            if original is not None:
+                # 解密失败的记录：原样写回旧密文，等待正确密钥恢复
+                item["text"] = original
+                item.pop("decrypt_error", None)
+                safe.append(item)
+            else:
+                safe.append(item)
         if self.secret:
-            msgs = [self._encrypt_field(m) for m in msgs]
+            safe = [self._encrypt_field(m) for m in safe]
+        msgs = safe
         tmp = path + ".tmp"
         with io.open(tmp, "w", encoding="utf-8") as f:
             for m in msgs:

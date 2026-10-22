@@ -55,7 +55,7 @@ import sys
 import time
 import urllib.request
 
-VERSION = "5.2.2"
+VERSION = "5.2.3"
 
 # 节点程序（安装时必须拷到安装目录，mcp_agent.py 从自己所在目录读配置）
 NODE_FILES = ["mcp_agent.py", "fleet_proto.py", "dashboard_html.py", "fleet.py"]
@@ -1360,6 +1360,7 @@ class TermuxAdapter(ServiceAdapter):
 
     def start(self):
         commands = []
+        warnings = []
         rc, out = _run(["termux-wake-lock"], timeout=20)
         commands.append({"cmd": "termux-wake-lock", "rc": rc,
                          "output": out.strip()[:120]})
@@ -1372,7 +1373,6 @@ class TermuxAdapter(ServiceAdapter):
         warnings.append("如系统弹出「允许后台运行」，请点允许；否则 Android 14 "
                         "可能在息屏后冻结 Termux")
         label = self.paths["unit_label"]
-        warnings = []
         if _which("sv"):
             for cmd in (["sv-enable", label], ["sv", "up", label]):
                 if not _which(cmd[0]):
@@ -1454,8 +1454,9 @@ class DockerAdapter(ServiceAdapter):
 
     def extra_vars(self):
         return {"UNIT_PATH": self.unit_path(),
-                "COPY_NODE_LINE": "COPY mcp_agent.py fleet_proto.py "
-                                  "dashboard_html.py ./",
+                "COPY_NODE_LINE": ("COPY mcp_agent.py fleet_proto.py "
+                                   "dashboard_html.py fleet.py "
+                                   "fleet_core.py fleet_agent.py ./"),
                 "COPY_CONFIG_LINE": "mcp_agent_config.example.json"}
 
     def extra_files(self):
@@ -1768,6 +1769,9 @@ def _apply_join(opts):
 
 def _setup_tls(opts, platform, paths):
     """--tls auto 时用 fleet_core 自签证书；不可用则继续 HTTP 并提示。"""
+    if opts.get("service") == "docker":
+        return {"enabled": False, "skipped": True,
+                "warnings": ["Docker 模式默认容器内 HTTP；公网请由反向代理终止 TLS"]}
     if opts.get("tls") != "auto":
         return {"enabled": False, "skipped": True, "warnings": []}
     if opts.get("dry_run"):
@@ -2378,7 +2382,7 @@ def install(opts=None):
         "manifest": paths["manifest_path"],
     }
 
-    # v5.2.2: 升级必须指向真实存在的同一节点，避免“升级成另一个默认节点”
+    # v5.2.3: 升级必须指向真实存在的同一节点，避免“升级成另一个默认节点”
     if opts.get("upgrade") and not dry:
         if not _exists(paths["config_path"]):
             result["errors"].append(

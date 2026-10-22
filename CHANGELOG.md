@@ -12,6 +12,34 @@
 
 ---
 
+---
+
+## [5.2.3] — 2026-10-22 · 真机复测修复：Termux 启动 / 邮箱密钥迁移 / Docker
+
+**手机（Android 14 / Termux）与跨端复测暴露的问题，全部修复并补测试。**
+
+### 修复
+- **Termux 启动崩溃（P0）**：`TermuxAdapter.start()` 在 `warnings=[]` 赋值前使用，
+  真机升级时报 `UnboundLocalError`，服务无法启动。已修正并补单元测试。
+- **邮箱密钥迁移破坏旧邮件（P0）**：v5.2.2 用 auth_token 派生邮箱密钥，
+  升级/轮换后旧邮件被当密文占位符写回，造成不可恢复。现在：
+  - 邮箱固定使用 `data/mailbox.key`，与 token 解耦；
+  - 旧 token 派生数据作为 fallback 自动读取；
+  - 首次启动一次性迁移，遇到任何解不开的邮件则**整体跳过迁移**；
+  - 写回时保留无法解密的原始密文，绝不覆盖成占位符。
+- **Docker 部署**：去掉只读根（mailbox 需落盘）、容器内强制 HTTP（TLS 交反代）、
+  `MCP_FLEET_DATA=/data` 环境变量覆盖数据目录、镜像补齐 `fleet.py/fleet_core/fleet_agent`。
+- **Termux 电池优化**：授权页命令改为可诊断输出，失败不阻塞启动。
+
+### 验证
+- 手机真机：升级成功、默认 token、`$PREFIX/bin/fleet`、唤醒锁 + 电池授权页、
+  `fleet status/doctor` 正常；Mac ↔ 手机 `peer_call` 双向执行、消息投递正常。
+- 全量 **611 passed + 1 skipped**；新增邮箱迁移/不丢数据/Termux 启动回归。
+- 8 种服务单元（systemd/openrc/procd/launchd/schtasks/termux/docker/nohup）
+  静态渲染全部通过。
+
+---
+
 ## [5.2.2] — 2026-10-22 · 修复回滚 TLS / Dashboard 401 / 卸载残留
 
 **v5.2.1 端到端实测继续暴露的 4 个问题，全部修复。**

@@ -549,9 +549,10 @@ def test_termux_unit(tmp_path):
 def test_docker_compose_unit(tmp_path):
     unit = render_unit(tmp_path, "docker")["unit"]
     for marker in ("restart: unless-stopped", "no-new-privileges:true",
-                   "cap_drop:", "read_only: true", "tmpfs:",
-                   "healthcheck:", "logging:"):
+                   "cap_drop:", "tmpfs:", "healthcheck:", "logging:"):
         assert marker in unit
+    # mailbox/agent 状态写 /app 挂载卷，不能开 read_only 根
+    assert "read_only: true" not in unit
     assert "{{" not in unit
 
 
@@ -1544,7 +1545,7 @@ def test_install_sh_no_crlf():
 # 13. 常量与适配器表
 # ===========================================================================
 def test_version_and_adapter_registry():
-    assert fi.VERSION == "5.2.2"
+    assert fi.VERSION == "5.2.3"
     assert set(fi.ADAPTERS) == set(fi.SERVICE_KEYS) - {"auto"}
     for key, cls in fi.ADAPTERS.items():
         assert cls.key == key
@@ -1671,3 +1672,27 @@ def test_upgrade_without_install_refused(tmp_path):
     result = fi.install(opts)
     assert result["ok"] is False
     assert any("没有可升级" in e for e in result["errors"])
+
+
+def test_termux_start_acquires_wake_lock_and_battery_intent(tmp_path, monkeypatch):
+    opts = fi._normalize_opts(make_opts(tmp_path, service="termux",
+                                        name="phone-test"))
+    platform = make_platform(is_termux=True, os="android", distro="termux",
+                             init="termux", service_manager="termux")
+    paths = fi.resolve_paths(opts, platform)
+    adapter = fi.TermuxAdapter(opts, platform, paths)
+    calls = []
+
+    def fake_run(argv, timeout=None):
+        calls.append(list(argv))
+        return 0, ""
+
+    monkeypatch.setattr(fi, "_run", fake_run)
+    monkeypatch.setattr(fi, "_which", lambda name: None)
+    monkeypatch.setattr(fi, "_spawn_detached", lambda *a, **k: 4321)
+    monkeypatch.setattr(fi, "_atomic_write", lambda *a, **k: None)
+    result = adapter.start()
+    assert result["ok"] is True
+    assert any("termux-wake-lock" in " ".join(c) for c in calls)
+    assert any("REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" in " ".join(c) for c in calls)
+    assert any("电池" in w or "后台" in w for w in result["warnings"])

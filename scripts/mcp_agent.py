@@ -104,7 +104,7 @@ for _stream in (sys.stdout, sys.stderr):
 DEFAULT_CONFIG = {
     "name": "node",             # 副端标识（显示在状态页与 serverInfo）
     "tool_prefix": "",          # 工具名前缀，如 "nas_"；留空则用裸名（exec/read/...）
-    "version": "5.2.2",
+    "version": "5.2.3",
     "sudo_password": "",        # 留空且非 root 时会尝试免密 sudo
     "work_dir": "/",            # 默认工作目录
     "command_timeout": 120,     # 秒
@@ -265,7 +265,8 @@ fleet_plan/fleet_reflect/fleet_review（自对话）。
 私钥/邀请码；跨设备操作前确认目标节点与验收标准。""" % (SERVER_NAME)
 
 
-DATA_DIR = CFG.get("data_dir") or HERE
+# 容器/自定义部署可用环境变量覆盖数据目录（Docker compose 传 /data）
+DATA_DIR = os.environ.get("MCP_FLEET_DATA") or CFG.get("data_dir") or HERE
 try:
     os.makedirs(DATA_DIR, mode=0o700, exist_ok=True)
 except Exception:
@@ -1112,51 +1113,46 @@ def _note_peer_agents(peer_name, agents):
 
 
 def _mailbox_secret():
-    """邮箱落盘加密密钥。
+    """邮箱落盘密钥：使用 DATA_DIR/mailbox.key（0600），与 auth_token 解耦。
 
-    优先复用 auth_token（v5 行为，便于旧数据解密）；未配 token 时生成并持久化
-    独立的 32 字节随机密钥（0600），保证**默认就有静态加密**，而不是裸明文。
+    v5.2.3 起不再用 auth_token 派生邮箱密钥：token 轮换/重新生成不会让旧邮件
+    变成不可读密文。旧版本（enc1$/token 派生）的数据由 MailEngine 的
+    fallback_secret 兼容读取，并在下次写回时自动迁移到 mailbox.key。
     """
-    tok = (CFG.get("auth_token") or "").strip()
-    if tok:
-        return tok
     path = os.path.join(DATA_DIR, "mailbox.key")
     try:
-        with open(path, encoding="ascii") as f:
-            val = f.read().strip()
-        if len(val) >= 32:
-            return val
-    except Exception:
+        with io.open(path, "r", encoding="utf-8") as f:
+            key = f.read().strip()
+        if len(key) >= 32:
+            return key
+    except (OSError, IOError):
         pass
-    val = uuid.uuid4().hex + uuid.uuid4().hex
+    key = uuid.uuid4().hex + uuid.uuid4().hex
+    tmp = path + ".tmp"
+    with io.open(tmp, "w", encoding="utf-8") as f:
+        f.write(key)
     try:
-        if _HAS_CORE:
-            _core.atomic_write(path, val, 0o600)
-        else:
-            tmp = path + ".tmp"
-            with open(tmp, "w", encoding="ascii") as f:
-                f.write(val)
-            try:
-                os.chmod(tmp, 0o600)
-            except OSError:
-                pass
-            os.replace(tmp, path)
-    except Exception as e:
-        print("[warn] 邮箱密钥落盘失败（加密仍生效，重启后旧消息不可读）: %s" % e,
-              file=sys.stderr)
-    return val
+        os.chmod(tmp, 0o600)
+    except OSError:
+        pass
+    os.replace(tmp, path)
+    return key
+
 
 def _init_proto():
     """初始化自研通讯协议层（在 main() 中配置加载后调用）。"""
     global _mail_engine, _delivery_engine, _sync_engine
     if not _HAS_PROTO:
         return
-    # v5.2: 有 token 用 token（兼容旧数据），否则用独立持久化密钥——
-    # 保证即使未开鉴权，邮箱也不是明文落盘。
+    # v5.2.3: 邮箱固定使用 mailbox.key；auth_token 只作为旧数据回退密钥，
+    # 避免 token 轮换把历史邮件变成不可读密文。
     _proto_secret = _mailbox_secret()
-    _mail_engine = MailEngine(HERE, SERVER_NAME, secret=_proto_secret)
+    _mail_engine = MailEngine(HERE, SERVER_NAME, secret=_proto_secret,
+                              fallback_secret=(CFG.get("auth_token") or None))
+
     def _get_peers():
         return load_peers().get("nodes", {})
+
     def _verify_peer_token(name):
         """v5.0: 供 UDP hello 验签——返回已配对 peer 的 token。"""
         try:
@@ -1164,6 +1160,7 @@ def _init_proto():
                 return load_peers().get("nodes", {}).get(name, {}).get("token", "") or None
         except Exception:
             return None
+
     # v5.0.2: 投递与同步共享同一熔断器——一个 peer 的健康状态在两条链路一致
     _peer_health = PeerHealth()
     _delivery_engine = MessageDelivery(_mail_engine, _get_peers, self_url(),
@@ -1171,6 +1168,8 @@ def _init_proto():
     _sync_engine = SyncEngine(_mail_engine, _get_peers, self_url(),
                               on_peer_agents=_note_peer_agents,
                               health=_peer_health)
+
+
 def _on_discover(name, ip, port, caps):
     """UDP 发现回调：自动 peer_add。"""
     url = "http://%s:%d/mcp" % (ip, port)

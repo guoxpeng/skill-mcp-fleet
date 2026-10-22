@@ -506,3 +506,59 @@ class TestInboxDedup:
         me2 = MailEngine(str(tmp_path), "node-a")
         assert me2.inbox_append({"msg_id": "r1", "from": "b", "to": "node-a", "text": "dup"}) is False
         assert me2.inbox_count("node-a") == 1
+
+
+class TestMailboxKeyMigration:
+    """v5.2.3: 稳定 mailbox.key + 旧 token 密钥回退 + 失败占位。"""
+
+    def test_fallback_decrypts_legacy_then_rewrites(self, tmp_path):
+        old = MailEngine(str(tmp_path), "node-a", secret="old-token")
+        old.inbox_append({"from": "b", "to": "node-a", "text": "legacy"})
+        new = MailEngine(str(tmp_path), "node-a", secret="new-key",
+                         fallback_secret="old-token")
+        got = new.inbox_read("node-a", mark_read=False)
+        assert got[0]["text"] == "legacy"
+        # 任意写回会用新 key 重加密全部消息
+        new.inbox_append({"from": "b", "to": "node-a", "text": "fresh"})
+        third = MailEngine(str(tmp_path), "node-a", secret="new-key")
+        texts = [m["text"] for m in third.inbox_read("node-a", mark_read=False)]
+        assert "legacy" in texts and "fresh" in texts
+
+    def test_unreadable_shows_placeholder_not_ciphertext(self, tmp_path):
+        old = MailEngine(str(tmp_path), "node-a", secret="old-token")
+        old.inbox_append({"from": "b", "to": "node-a", "text": "secret"})
+        bad = MailEngine(str(tmp_path), "node-a", secret="wrong-key")
+        got = bad.inbox_read("node-a", mark_read=False)
+        assert "无法解密" in got[0]["text"]
+        assert not got[0]["text"].startswith((CRYPTO_PREFIX, CRYPTO_V2_PREFIX))
+
+
+class TestMailboxNoDataLoss:
+    """v5.2.3: 解不开的旧邮件不能被占位符覆盖。"""
+
+    def test_undecryptable_ciphertext_preserved_on_rewrite(self, tmp_path):
+        old = MailEngine(str(tmp_path), "node-a", secret="old-token")
+        old.inbox_append({"from": "b", "to": "node-a", "text": "keep-me"})
+        bad = MailEngine(str(tmp_path), "node-a", secret="wrong-key")
+        assert "无法解密" in bad.inbox_read("node-a", mark_read=False)[0]["text"]
+        # 任意写回：旧密文必须原样保留，不能被占位符覆盖
+        bad.inbox_append({"from": "c", "to": "node-a", "text": "new"})
+        raw = open(os.path.join(str(tmp_path), "mailbox", "inbox.jsonl"),
+                   encoding="utf-8").read()
+        assert CRYPTO_V2_PREFIX in raw
+        # 用正确密钥重新打开，原消息仍然可读
+        good = MailEngine(str(tmp_path), "node-a", secret="old-token")
+        texts = [m["text"] for m in good.inbox_read("node-a", mark_read=False)]
+        assert "keep-me" in texts
+
+    def test_migration_skips_when_any_message_unreadable(self, tmp_path):
+        old = MailEngine(str(tmp_path), "node-a", secret="old-token")
+        old.inbox_append({"from": "b", "to": "node-a", "text": "legacy"})
+        # 新密钥 + 无回退：迁移必须整体跳过，不写 marker
+        MailEngine(str(tmp_path), "node-a", secret="new-key")
+        assert not os.path.exists(
+            os.path.join(str(tmp_path), "mailbox", ".rekey-v2"))
+        raw = open(os.path.join(str(tmp_path), "mailbox", "inbox.jsonl"),
+                   encoding="utf-8").read()
+        good = MailEngine(str(tmp_path), "node-a", secret="old-token")
+        assert "legacy" in [m["text"] for m in good.inbox_read("node-a", mark_read=False)]
