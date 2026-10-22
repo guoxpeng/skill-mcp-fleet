@@ -1,5 +1,6 @@
 ---
 name: mcp-fleet
+version: 5.2.0
 description: 把 Android 手机、NAS、云服务器、软路由、Windows/macOS/Linux 电脑和 Docker 容器组成一张 AI 对等协作网。一条命令安装节点，邀请链接/设备码安全配对，任意 MCP Agent 即可跨设备执行命令、读写文件、传输文件、查看容器日志、离线留言、按能力委派任务，并内置自对话、自检与故障恢复提示词。当用户提到管理 NAS、远程控制家里电脑、多设备互联、让 AI 操作设备、远程执行命令、软路由排查、云主机纳管、离线留言、设备监控、MCP 组网、多个 agent 协作、fleet 等需求时使用本技能；即使用户没有明确说 "fleet"，只要涉及"用聊天指挥另一台设备干活"也应主动使用。
 license: MIT
 compatibility: Python 3.6+，纯标准库；Linux / macOS / Windows / Android(Termux) / OpenWrt。可选 openssl（自动生成 TLS 证书）与 tailscale（跨网段加速）。
