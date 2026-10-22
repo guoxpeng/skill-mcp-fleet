@@ -2357,6 +2357,8 @@ def _local_node_install_info(me):
 # refs/heads/main 路径可绕过 raw.githubusercontent 的 CDN 旧缓存
 REMOTE_INSTALL_SH = ("https://raw.githubusercontent.com/guoxpeng/"
                      "skill-mcp-fleet/refs/heads/main/scripts/install.sh")
+REMOTE_API_COMMIT = ("https://api.github.com/repos/guoxpeng/"
+                     "skill-mcp-fleet/commits/main")
 
 
 def _fetch_remote_installer():
@@ -2364,13 +2366,36 @@ def _fetch_remote_installer():
 
     返回路径或空串；不打印 URL 内容。失败时调用方回退到本地安装器。
     """
+    data = b""
+    urls = []
+    # 1) 先问 GitHub API 要 main 的 commit SHA，再按 SHA 取 install.sh：
+    #    immutable URL 不受 raw CDN 旧缓存影响（/main/ 与 /refs/heads/main/ 都可能旧）
     try:
         req = urllib.request.Request(
-            REMOTE_INSTALL_SH, headers={"User-Agent": "mcp-fleet-update"})
-        with _opener_for(REMOTE_INSTALL_SH).open(req, timeout=20) as resp:
-            data = resp.read()
-        if len(data) < 1000 or b"fleet_install.py" not in data:
-            return ""
+            REMOTE_API_COMMIT, headers={"User-Agent": "mcp-fleet-update",
+                                        "Accept": "application/vnd.github+json"})
+        with _opener_for(REMOTE_API_COMMIT).open(req, timeout=15) as resp:
+            sha = json.loads(resp.read().decode("utf-8")).get("sha") or ""
+        if sha and all(c in "0123456789abcdef" for c in sha.lower()) and len(sha) >= 7:
+            urls.append("https://raw.githubusercontent.com/guoxpeng/"
+                        "skill-mcp-fleet/%s/scripts/install.sh" % sha)
+    except Exception:
+        pass
+    urls.extend([REMOTE_INSTALL_SH,
+                 REMOTE_INSTALL_SH.replace("/refs/heads/main/", "/main/")])
+    for url in urls:
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": "mcp-fleet-update"})
+            with _opener_for(url).open(req, timeout=20) as resp:
+                candidate = resp.read()
+            if len(candidate) >= 1000 and b"fleet_install.py" in candidate:
+                data = candidate
+                break
+        except Exception:
+            continue
+    if not data:
+        return ""
+    try:
         # Termux/精简系统可能没有可写的 /tmp：优先落到用户 HOME
         try:
             fd, path = tempfile.mkstemp(prefix="fleet-install-", suffix=".sh",
@@ -2389,7 +2414,7 @@ def _fetch_remote_installer():
 
 
 def cmd_update(a):
-    """v5.2.5: 升级本机节点（默认从远端拉最新发布包；--offline 用本地）。"""
+    """v5.2.6: 升级本机节点（默认从远端拉最新发布包；--offline 用本地）。"""
     installer = _installer_path()
     if not installer:
         return die("找不到 fleet_install.py；请重新下载安装包，或手工执行 "

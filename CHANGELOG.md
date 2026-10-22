@@ -18,6 +18,19 @@
 
 ---
 
+---
+
+## [5.2.6] — 2026-10-22 · 远端更新按 commit SHA 取文件（彻底绕开 raw CDN 缓存）
+
+- `raw.githubusercontent.com/.../main/` 与 `/refs/heads/main/` 都可能返回旧缓存
+  （实测一个 5.2.4、一个 5.2.5）。现在先查 GitHub API `commits/main` 拿不可变
+  commit SHA，再按 `/<sha>/scripts/install.sh` 取文件；API 失败才回退两个分支 URL。
+- 手机实测：`fleet update` 下载 5.2.5、SHA256 校验通过、停旧服务、健康 OK，
+  版本 5.2.4→5.2.5；本版继续自更新到 5.2.6 验证。
+- 全量 **615 passed + 1 skipped**。
+
+---
+
 ## [5.2.5] — 2026-10-22 · 远端更新最后两处修复（缓存 / 临时目录）
 
 - **远端 install.sh 缓存**：`raw.githubusercontent.com/.../main/` 有 CDN 旧缓存，
