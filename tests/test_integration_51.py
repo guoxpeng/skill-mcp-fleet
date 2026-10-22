@@ -176,7 +176,7 @@ class TestMcpV51:
     def test_tools_include_v51(self, node):
         node.init()
         tools = node.rpc("tools/list", {})[1]["result"]["tools"]
-        assert len(tools) == 53
+        assert len(tools) == 56
         names = {t["name"] for t in tools}
         assert {"fleet_help", "fleet_plan", "fleet_reflect", "fleet_review",
                 "fleet_handoff", "fleet_doctor", "fleet_identity",

@@ -23,7 +23,7 @@ MCP Fleet 让 AI Agent 在你的设备上执行命令、读写文件、管理服
 最小复现脚本。我们承诺 **72 小时内响应**；修复后在致谢中列出报告者（除非要求匿名）。
 请勿在修复发布前公开细节。
 
-## v5.2 安全设计（六层）
+## v5.2 安全设计（六层 + 自修复边界）
 
 ### 第 1 层 · 身份与信任
 
@@ -43,6 +43,13 @@ MCP Fleet 让 AI Agent 在你的设备上执行命令、读写文件、管理服
 - 非 loopback 监听且无 token 时，节点启动会自动生成 token 并写配置（`auto_secure`）；
   `--allow-insecure` 可显式降级。
 - JSON 安装结果中的配置已脱敏，不回显 token/sudo 密码。
+
+### 自修复的安全边界（v5.2）
+
+- `fleet_selfcheck` 只读；`fleet_repair*` 必须 `confirm=<节点名>`。
+- 只允许重启服务、修权限、清 stale pid；回滚需显式 `allow_rollback`。
+- 只读节点拒绝；不删数据、不轮换 token、不执行任意命令；失败立即停并上报。
+- 每次修复写哈希链审计，可用 `fleet_audit_verify` 复核。
 
 ### 第 2 层 · 传输与请求
 

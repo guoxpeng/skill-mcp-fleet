@@ -24,9 +24,9 @@
 - 设备上的 Agent 之间可以发消息、谈验收标准、互相复核结果；
 - 整套系统**零第三方依赖、不依赖任何中心服务、一条命令安装**。
 
-v5.2 把这件事从"能连"推进到**"敢连、好连、会自己想"**。
+v5.2 把这件事从"能连"推进到**"敢连、好连、会自己想、坏了能自修"**。
 
-## 二、v5.2 五大升级
+## 二、v5.2 六大升级
 
 | # | 升级 | 一句话 | 证据 |
 |---|------|--------|------|
@@ -35,6 +35,7 @@ v5.2 把这件事从"能连"推进到**"敢连、好连、会自己想"**。
 | 3 | **全平台一条命令** | Android/Termux、飞牛/群晖/威联通/绿联、OpenWrt、Linux、macOS、Windows、Docker、云主机统一安装器，自动识别 init 与守护方式 | `scripts/fleet_install.py`、`references/platform-matrix.md`、`tests/test_installer_51.py` |
 | 4 | **自愈连接** | 对端状态机 + 指数退避/抖动 + 熔断 + 消息去重/退避/死信 + 多路径（局域网/直连/Tailscale，中继配置预留）+ `fleet doctor` | `scripts/fleet_proto.py`、`tests/test_integration_51.py` |
 | 5 | **Agent 自对话** | MCP `initialize.instructions` + 7 个 prompts + 6 个自对话工具 + 结构化委派信封 + 确定性编排器 | `scripts/fleet_agent.py`、`references/agent-playbook.md`、`references/self-dialogue-protocol.md` |
+| 6 | **自检与自修复** | `fleet_selfcheck` 只读诊断；`fleet_repair_loop` 有界自愈（重启/权限/pid，失败即停）；审计可复核 | `scripts/mcp_agent.py`、`scripts/fleet.py`、`references/self-repair.md` |
 
 ## 三、评审五维自评
 
@@ -80,7 +81,7 @@ fleet nodes
 
 ## 六、核心能力
 
-### 6.1 设备能力（41 个设备工具 + 12 个 v5.2 工具）
+### 6.1 设备能力（41 个设备工具 + 15 个 v5.2 工具）
 
 执行/后台任务、文件读写编辑搜索/二进制传输、进程、Docker、systemd、网络诊断、
 系统信息、节点互控（多跳）、消息总线、能力声明与任务委派、群组、临时/长期连接、
@@ -103,18 +104,21 @@ fleet nodes
 - 结构化信封：propose/accept/counter/progress/result/fail/review/handoff，带 thread、
   验收标准、超时；编排器确定性执行，可接 LLM。
 
-### 6.4 v5.2 体验增强
+### 6.4 v5.2 菜单、提示词与自修复
 
 - 默认生成访问 token（`--no-auth` 才关闭）、全局 `fleet` 命令；
 - `fleet update / --rollback` 原子升级回滚、`fleet identity export/import`；
 - `fleet ask "..." [--run]` 自然语言入口、`fleet invite --qr` 扫码配对；
 - Dashboard 2.0：设备指纹/移除、投递队列、Agent 任务时间线、安全状态；
-- 普通用户文档：[5 分钟上手](references/quickstart.md)、[一页排障](references/troubleshooting.md)。
+- `fleet` 无参数菜单重做：状态 + 命令 + 可直接复制的 AI 提示词；`fleet prompt [主题]`；
+- `fleet selfcheck` / `fleet repair --auto`：只读诊断 + 有界自修复（重启/权限/pid）；
+- 普通用户文档：[5 分钟上手](references/quickstart.md)、[一页排障](references/troubleshooting.md)、
+  [自修复](references/self-repair.md)、[真机测试结果](references/test-results.md)。
 
 ### 6.5 可复现的验证证据
 
 ```bash
-.venv/bin/python -m pytest tests/ -q        # 615 passed, 1 skipped
+.venv/bin/python -m pytest tests/ -q        # 625 passed, 1 skipped
 sh scripts/install.sh --dry-run --json --name demo   # 安装器零副作用预演
 bash scripts/demo.sh                        # 本机双节点 30 秒演示
 ```
@@ -134,12 +138,12 @@ bash scripts/demo.sh                        # 本机双节点 30 秒演示
 
 ```bash
 python3 scripts/build_package.py
-# → dist/mcp-fleet-v5.2.7.zip + SHA256SUMS + MANIFEST.json
+# → dist/mcp-fleet-v5.2.0.zip + SHA256SUMS + MANIFEST.json
 ```
 
 - 提交包文件数 **≤ 30**、大小 **≤ 40 MB**，由脚本自动裁剪并以清单/SHA256 固化。
 - 纯标准库、零第三方运行时依赖、MIT 许可、可离线部署。
-- 版本：代码 `SERVER_VERSION=5.2.7` ＝ git tag `v5.2.7` ＝ GitHub Release。
+- 版本：代码 `SERVER_VERSION=5.2.0` ＝ git tag `v5.2.0` ＝ GitHub Release。
   完整演进见 `CHANGELOG.md`。
 
 ## 八、仓库结构

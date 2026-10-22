@@ -10,11 +10,12 @@ compatibility: Python 3.6+，纯标准库；Linux / macOS / Windows / Android(Te
 MCP Fleet 把每台设备变成一个**节点**，节点之间对等互联：自动发现、在线直投、离线信箱、
 按能力委派。设备上的 AI Agent 可以直接对话与协作，而不是"人拿遥控器"。
 
-**v5.2 的三件事**：
+**v5.2 的四件事**：
 
 1. **一条命令接入**——安装器自动识别 Android/NAS/软路由/云主机/PC，生成服务、开机自启、健康检查，并打印邀请链接。
 2. **默认安全**——每节点 Ed25519 身份、请求签名与防重放、认证加密信箱、执行策略、哈希链审计、供应链校验。
 3. **Agent 自带说明书**——MCP `initialize.instructions` + 7 个 prompts + 6 个自对话工具，让 agent 会观察、计划、执行、反思。
+4. **自检与自修复**——`fleet_selfcheck` 返回可机读 findings；`fleet_repair_loop` 在安全白名单内自动重启/修权限/清 pid，失败即停并报告。
 
 ---
 
@@ -57,6 +58,8 @@ fleet nodes                  # 全网节点、在线状态、RTT、能力
 fleet doctor                 # 12 项自检：时钟偏差/端口/防火墙/磁盘/权限/对端可达/TLS
 fleet send nas-a3f2 "hello"  # 给节点上的 agent 发消息
 fleet ask "帮我看下磁盘为什么满了" --run   # 自然语言入口（只读诊断）
+fleet selfcheck               # 只读自检 + 修复计划
+fleet repair --auto           # 有界自修复（最多 2 次，失败即停）
 ```
 
 ### 平台一键命令
@@ -83,7 +86,7 @@ fleet ask "帮我看下磁盘为什么满了" --run   # 自然语言入口（只
 - `initialize.instructions`：本机操作手册（何时用哪些工具、安全边界、四步法）。
 - `prompts/list`：`fleet-playbook`、`fleet-diagnose`、`fleet-plan`、`fleet-self-review`、
   `fleet-delegate`、`fleet-incident`、`fleet-onboard`。
-- 工具层：41 个设备工具 + 12 个 v5.2 工具（6 个自对话 + 6 个运维）。
+- 工具层：41 个设备工具 + 15 个 v5.2 工具（6 个自对话 + 6 个运维 + 3 个自修复）。
 
 ### 自对话四步法（默认工作方式）
 
@@ -111,6 +114,23 @@ A 上的 Agent：
 协议与状态机见 `references/self-dialogue-protocol.md`。
 
 **当任务涉及多轮协作、需要验收或需要解释时，先读 `references/agent-playbook.md`。**
+
+---
+
+## 二·五、自检与自修复（v5.2）
+
+连接上的 Agent 不需要猜：先只读自检，再按白名单修复。
+
+```text
+fleet_selfcheck      → findings（code/severity/action/repairable）+ repair_plan
+fleet_repair_loop    → 自检 → 修可修项 → 复检，默认 2 次、最多 3 次
+fleet_repair         → 单动作：restart_service / fix_permissions / clear_stale_pid / rollback
+```
+
+安全边界：写操作必须 `confirm=<节点名>`；只读节点拒绝；只允许重启/权限/pid（rollback 需显式）；
+不删数据、不轮换 token、不执行任意命令；失败立即停并返回 remaining。详见 `references/self-repair.md`。
+
+`fleet`（无参数）或 `fleet menu` 已内置可直接复制的提示词；`fleet prompt self_repair` 单独输出。
 
 ---
 
@@ -196,6 +216,8 @@ A(规划) → propose 任务给 B(执行) → B 回 progress → B 回 result+�
 | 文件 | 什么时候读 |
 |------|-----------|
 | `references/quickstart.md` | 第一次使用 / 给普通用户看：5 分钟上手 |
+| `references/self-repair.md` | 自修复工具、白名单动作、安全边界、Agent 提示词 |
+| `references/test-results.md` | macOS/Ubuntu/Android 真机测试结果与已知限制 |
 | `references/troubleshooting.md` | 出问题先看这一页：症状 → 原因 → 命令 |
 | `references/agent-playbook.md` | **执行多步任务前必读**：决策树、工具矩阵、失败恢复、示例 |
 | `references/self-dialogue-protocol.md` | 多 Agent 协作、消息信封、状态机、验收 |
@@ -217,4 +239,4 @@ A(规划) → propose 任务给 B(执行) → B 回 progress → B 回 result+�
 - 节点被完全攻陷时，攻击者拥有该节点进程权限——这是所有远程执行工具的边界；
   用独立低权限用户 + 只读模式 + 网络隔离降低影响。
 
-> 版本：v5.2.7 ｜ 作者：guoxpeng ｜ 许可：MIT ｜ 仓库：https://github.com/guoxpeng/skill-mcp-fleet
+> 版本：v5.2.0 ｜ 作者：guoxpeng ｜ 许可：MIT ｜ 仓库：https://github.com/guoxpeng/skill-mcp-fleet

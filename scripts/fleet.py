@@ -71,9 +71,43 @@ import uuid
 
 # ---------------------------------------------------------------- 基础
 
-VERSION = "1.2.0"
+VERSION = "5.2.0"
 PROTOCOL = "2024-11-05"
 HERE = os.path.dirname(os.path.abspath(__file__))
+
+# v5.2: CLI 内置提示词。菜单/`fleet prompt` 直接输出，可原样粘给 AI 客户端。
+PROMPT_PACK = {
+    "self_repair": (
+        "你是 MCP Fleet 节点上的运维 agent。先调用 fleet_selfcheck 获取结构化发现；"
+        "如果存在可修复项，调用 fleet_repair_loop(confirm=<节点名>, max_attempts=2)，"
+        "只允许它做重启/权限/pid 修复；失败立即停止，把 remaining findings 原样报告，"
+        "禁止循环重试、禁止执行未列出的命令、禁止删除数据或轮换 token。"),
+    "diagnose": (
+        "先用只读工具（fleet_doctor、sysinfo、ps、docker_ps、net_check、df）收集证据，"
+        "再给结论。任何删除/重启/改配置前先向我确认；最后按“结论/证据/建议”三段式回复，"
+        "每条结论必须引用具体命令输出。"),
+    "collaborate": (
+        "用 fleet_plan 把目标拆成带验收标准的小步；按节点能力把步骤分给 self 或 peer，"
+        "每步执行后检查验收条件；连续两次失败就停止并请求人工介入，不要无限重试。"),
+    "pair": (
+        "用 fleet_invite 生成邀请，让对方执行 fleet join；首次配对必须核对两端 6 位 SAS，"
+        "不一致立即中止。配对后用 fleet nodes 确认在线与指纹。"),
+    "upgrade": (
+        "升级前先 fleet status 记录当前版本与指纹；执行 fleet update（会下载 Release 并校验 "
+        "SHA256、停旧服务、重启）；健康检查失败用 fleet update --rollback，"
+        "仍失败则保留 .failed-* 目录与日志并报告。"),
+}
+
+
+def prompt_text(topic=None):
+    """返回提示词文本；topic 为空则返回全部（带标题）。"""
+    if topic:
+        return PROMPT_PACK.get(topic, "未知提示词：%s（可选 %s）"
+                               % (topic, ", ".join(sorted(PROMPT_PACK))))
+    out = []
+    for key in ("self_repair", "diagnose", "collaborate", "pair", "upgrade"):
+        out.append("### %s\n%s" % (key, PROMPT_PACK[key]))
+    return "\n\n".join(out)
 # 登记表位置：
 #   * 本脚本装在节点目录里（同目录有 mcp_agent_config.json，v3.5 安装器会这么放）
 #     → 用 <节点目录>/peers.json，与本节点 agent 的 peers / peer_call 工具共用一份对等节点表；
@@ -2420,7 +2454,7 @@ def _fetch_remote_installer():
 
 
 def cmd_update(a):
-    """v5.2.7: 升级本机节点（默认从远端拉最新发布包；--offline 用本地）。"""
+    """v5.2.0: 升级本机节点（默认从远端拉最新发布包；--offline 用本地）。"""
     installer = _installer_path()
     if not installer:
         return die("找不到 fleet_install.py；请重新下载安装包，或手工执行 "
@@ -2876,6 +2910,20 @@ def build_parser():
     sp.add_argument("text", help="你想做什么，例如：帮我看下磁盘为什么满了")
     sp.add_argument("--run", action="store_true", help="立即执行只读诊断步骤")
     sp.set_defaults(func=cmd_ask)
+    sp = local(sub.add_parser("selfcheck", help="v5.2: 本机只读自检（finding + 修复计划）"))
+    sp.set_defaults(func=cmd_selfcheck)
+    sp = local(sub.add_parser("repair", help="v5.2: 自修复（默认只给计划；--auto 有界自愈）"))
+    sp.add_argument("--auto", action="store_true", help="执行有界自愈循环（最多 2/3 次）")
+    sp.add_argument("--attempts", type=int, default=2)
+    sp.add_argument("--restart", action="store_true", help="只重启服务")
+    sp.add_argument("--fix-permissions", action="store_true", dest="fix_permissions")
+    sp.add_argument("--clear-stale-pid", action="store_true", dest="clear_stale_pid")
+    sp.add_argument("--rollback", action="store_true", help="回滚最近备份（高风险）")
+    sp.set_defaults(func=cmd_repair)
+    sp = sub.add_parser("prompt", help="v5.2: 查看内置 AI 提示词")
+    sp.add_argument("topic", nargs="?", default="",
+                    help="self_repair/diagnose/collaborate/pair/upgrade")
+    sp.set_defaults(func=cmd_prompt)
     sp = local(sub.add_parser("update", help="v5.2: 升级/回滚本机节点"))
     sp.add_argument("--rollback", action="store_true", help="回滚到最近一次升级备份")
     sp.add_argument("--offline", action="store_true",
@@ -2954,68 +3002,150 @@ def build_parser():
     return p
 
 
-def show_fleet_status():
-    """v5.0.6.3: 无参数时显示本机状态 + 中文命令说明。"""
-    import urllib.request
-    # 清屏
-    os.system("clear" if os.name != "nt" else "cls")
-    print("=" * 60)
-    print("  MCP Fleet · AI 对等协作网 · 主控 CLI v5.0.6")
-    print("=" * 60)
+def _tool_text(a, tool, args=None):
+    got = _local_mcp(a)
+    if not got:
+        return None, "本机没有运行中的节点"
+    me, client = got
+    try:
+        text, is_err = client.call(tool, args or {})
+        return (text, is_err), me
+    except Exception as e:
+        return None, "调用 %s 失败：%s" % (tool, e)
 
-    # ---- 本机状态 ----
-    nodes = load_registry().get("nodes", {})
-    print("\n  【本机状态】")
-    if not nodes:
-        print("    还没有任何副端。")
+
+def cmd_selfcheck(a):
+    """v5.2: 只读自检，输出可机读 findings 与修复计划。"""
+    res, me = _tool_text(a, "fleet_selfcheck")
+    if res is None:
+        return die(me)
+    text, is_err = res
+    if getattr(a, "json", False):
+        print(text)
+        return 1 if is_err else 0
+    try:
+        data = json.loads(text)
+    except Exception:
+        print(text)
+        return 1 if is_err else 0
+    print("自检结果：%s" % ("通过" if data.get("ok") else "有严重问题"))
+    print("  %s" % data.get("summary", ""))
+    for f in data.get("findings") or []:
+        print("  [%-8s] %-20s %s" % (f.get("severity"), f.get("code"),
+                                     f.get("title")))
+        if f.get("detail"):
+            print("             %s" % f.get("detail"))
+    plan = data.get("repair_plan") or []
+    print("  修复计划：%s" % (", ".join(plan) if plan else "无自动修复项"))
+    if plan:
+        print("  执行：fleet repair --auto（有界，最多 2 次）")
+    return 1 if is_err else 0
+
+
+def cmd_repair(a):
+    """v5.2: 自修复。默认只给计划；--auto 走有界自愈循环。"""
+    got = _local_mcp(a)
+    if not got:
+        return die("本机没有运行中的节点")
+    me, client = got
+    name = me.get("name") or ""
+    if getattr(a, "auto", False):
+        args = {"confirm": name, "max_attempts": getattr(a, "attempts", 2),
+                "allow_rollback": bool(getattr(a, "rollback", False))}
+        tool = "fleet_repair_loop"
     else:
-        print("    已登记副端：%d 个" % len(nodes))
-        for i, (n, m) in enumerate(sorted(nodes.items()), 1):
-            url = m.get("url", "?")
-            has_token = bool(m.get("token", ""))
-            # 探活
-            status = "  在线" if probe_anonymous(url, timeout=3) else "  离线"
-            print("    [%d] %-15s %-40s %s %s" % (
-                i, n, url[:40], status, "(已配令牌)" if has_token else "(无令牌)"))
+        action = None
+        if getattr(a, "restart", False):
+            action = "restart_service"
+        elif getattr(a, "fix_permissions", False):
+            action = "fix_permissions"
+        elif getattr(a, "clear_stale_pid", False):
+            action = "clear_stale_pid"
+        elif getattr(a, "rollback", False):
+            action = "rollback"
+        if not action:
+            # 默认只读：先自检并展示计划
+            return cmd_selfcheck(a)
+        args = {"action": action, "confirm": name}
+        tool = "fleet_repair"
+    try:
+        text, is_err = client.call(tool, args)
+    except Exception as e:
+        return die("修复调用失败：%s" % e)
+    if getattr(a, "json", False):
+        print(text)
+        return 1 if is_err else 0
+    try:
+        data = json.loads(text)
+    except Exception:
+        print(text)
+        return 1 if is_err else 0
+    print("修复结果：%s" % ("成功" if data.get("ok") else "仍有问题"))
+    if data.get("attempts"):
+        for item in data["attempts"]:
+            print("  - %s: %s" % (item.get("action"),
+                                  "ok" if item.get("ok") else "失败"))
+            print("    %s" % (item.get("detail") or ""))
+    if data.get("remaining"):
+        print("  未解决（需人工）：")
+        for f in data["remaining"]:
+            print("    [%s] %s：%s" % (f.get("severity"), f.get("code"),
+                                       f.get("title")))
+    elif data.get("next"):
+        print("  %s" % data.get("next"))
+    return 1 if is_err else 0
 
-    # ---- 本机 agent 信息（如果有） ----
-    for cfg_path in agent_config_paths().get("workbuddy", []):
-        if os.path.isfile(cfg_path):
-            try:
-                cfg = load_json_config(cfg_path)
-                servers = cfg.get(servers_key(cfg), {})
-                if servers:
-                    print("\n  【本机 agent】")
-                    for name, v in list(servers.items())[:3]:
-                        url = v.get("url", "")
-                        token = _token_from_headers(v)
-                        print("    %s  %s  %s" % (
-                            name, url[:45], "已配令牌" if token else "未配令牌"))
-                    break
-            except Exception:
-                pass
-            break
 
-    # ---- 常用命令 ----
-    print("\n  【常用命令】")
-    print("    fleet list                    列出已登记的副端")
-    print("    fleet add --name x --url ...  添加副端")
-    print("    fleet probe <名字>            连通性体检")
-    print("    fleet doctor <名字>           完整链路体检")
-    print("    fleet exec <名字> <命令>      在副端执行命令")
-    print("    fleet tools <名字>            列副端工具清单")
-    print("    fleet health                  批量体检全部节点")
-    print("    fleet menu                    进入中文交互菜单")
-    print("    fleet install-cmd --name pi   打印副端安装命令")
-    print("    fleet pair <地址> --token T   双向配对")
+def cmd_prompt(a):
+    """v5.2: 打印内置提示词（可原样粘给 AI 客户端）。"""
+    topic = (getattr(a, "topic", "") or "").strip()
+    if topic and topic not in PROMPT_PACK:
+        return die("未知主题：%s（可选 %s）" % (topic, ", ".join(PROMPT_PACK)))
+    print(prompt_text(topic or None))
+    return 0
 
-    print("\n  【快速开始】")
-    print("    1. 在副端安装：bash <(curl -fsSL <URL>) --name my-pc")
-    print("    2. 在主端注册：fleet add --name my-pc --url http://IP:3100/mcp --token <令牌>")
-    print("    3. 远程操控：fleet exec my-pc \"hostname; df -h\"")
-    print()
-    print("  输入 fleet menu 进入中文交互菜单")
-    print("=" * 60)
+
+def show_fleet_status():
+    """v5.2: 无参数时显示一屏式菜单（状态 + 命令 + 内置提示词），不阻塞等输入。"""
+    print("=" * 66)
+    print("  MCP Fleet v%s · AI 对等协作网 · 主控 CLI" % VERSION)
+    print("=" * 66)
+    me = local_node()
+    print("\n  【本机状态】")
+    if not me:
+        print("    未检测到本机节点。安装：sh scripts/install.sh --name <名字>")
+        print("    或只作为控制端：fleet add --name x --url http://IP:3100/mcp --token T")
+    else:
+        peers = 0
+        try:
+            peers = len(load_peers().get("nodes", {}))
+        except Exception:
+            pass
+        print("    节点: %-16s 指纹: %s" % (me.get("name"), me.get("fingerprint") or "-"))
+        print("    地址: %s" % me.get("url"))
+        print("    对端: %d 个 · 鉴权: %s" % (
+            peers, "已开启" if me.get("token") else "未开启"))
+    print("""
+  【常用命令】
+    fleet status / nodes / doctor        节点状态、对端、体检
+    fleet selfcheck                     只读自检（可机读故障列表）
+    fleet repair [--auto]               自修复：先给计划；--auto 有界自动修复
+    fleet update [--rollback]           升级 / 回滚（SHA256 校验）
+    fleet ask "<自然语言>" [--run]       生成计划 + 只读诊断
+    fleet prompt [主题]                 查看内置提示词
+    fleet menu                          交互式菜单
+    fleet invite --qr / join <URI>      邀请配对
+    fleet identity show/export/import   身份查看/备份/恢复
+
+  【可直接粘给 AI 的提示词】（完整版：fleet prompt）
+    · 自检修复：先 fleet_selfcheck；有可修项再 fleet_repair_loop，失败即停并报告。
+    · 排障：先只读收集证据，再给“结论/证据/建议”，变更前先确认。
+    · 协作：fleet_plan 拆步 + 验收标准，按能力分给 self/peer，失败两次停止。
+
+  安全：fleet repair 只做重启/权限/pid 等白名单动作；rollback 需显式开启；
+        不会删除数据、轮换 token 或执行任意命令。
+""")
+    print("=" * 66)
     return 0
 
 
@@ -3031,7 +3161,7 @@ def cmd_menu(a):
         if clear:
             os.system("clear" if os.name != "nt" else "cls")
         print("=" * 56)
-        print("  MCP Fleet · AI 对等协作网 · 主控 CLI v5.0.6")
+        print("  MCP Fleet v%s · AI 对等协作网 · 主控 CLI" % VERSION)
         print("=" * 56)
 
     def _node_list():
@@ -3096,7 +3226,13 @@ def cmd_menu(a):
   [15] SSH 远程装副端（bootstrap）
   [16] 局域网发现（discover）
 
+  【自愈与提示词】
+  [17] 本机自检 / 自修复（selfcheck + repair）
+  [18] 查看 AI 提示词（prompt）
+
   [0] 退出""")
+        print("")
+        print("  提示词速用：fleet prompt self_repair  然后原样粘给 AI 客户端。")
         print()
         try:
             choice = input("  请选择 (0-16): ").strip()
@@ -3283,6 +3419,26 @@ def cmd_menu(a):
             deep = input("  深度扫描（慢）? (y/N): ").strip().lower() == "y"
             args = argparse.Namespace(deep=deep)
             cmd_discover_proto(args)
+            input("\n  按回车继续...")
+
+        elif choice == "17":
+            _banner()
+            args = argparse.Namespace(json=False, timeout=30, self_url=None)
+            cmd_selfcheck(args)
+            try:
+                yn = input("\n  尝试自动修复可修项? (y/N): ").strip().lower()
+            except (EOFError, KeyboardInterrupt):
+                yn = ""
+            if yn == "y":
+                args = argparse.Namespace(json=False, auto=True, attempts=2,
+                                          rollback=False, timeout=120,
+                                          self_url=None)
+                cmd_repair(args)
+            input("\n  按回车继续...")
+
+        elif choice == "18":
+            _banner()
+            print(prompt_text())
             input("\n  按回车继续...")
 
         else:

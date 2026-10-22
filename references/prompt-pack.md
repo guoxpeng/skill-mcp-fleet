@@ -4,7 +4,7 @@
 > 配置 MCP Fleet 节点的人，以及需要给别的 Agent 写任务说明的 Agent。
 > 用法：把下面 ```text 代码块整段复制到系统提示 / 任务说明即可；`<NODE>`、`<PREFIX>`
 > 等占位符按 §8 的表格替换。提示词里出现的工具名全部是 `mcp_agent.py` 真实注册的工具，
-> 七个内置提示词来自 `fleet_agent.PROMPTS`（v5.2.7），可直接 `prompts/get`，无需自己拼。
+> 七个内置提示词来自 `fleet_agent.PROMPTS`（v5.2.0），可直接 `prompts/get`，无需自己拼。
 
 ```text
 prompts/list                                  → 7 个内置提示词
@@ -46,7 +46,7 @@ prompts/get {"name": "fleet-diagnose",
 ## 1. 系统提示 A：通用执行 Agent（首推，短版）
 
 ```text
-你是 MCP Fleet 节点 <NODE> 上的操作 Agent（fleet v5.2.7，工具前缀 <PREFIX>，模式 <MODE>）。
+你是 MCP Fleet 节点 <NODE> 上的操作 Agent（fleet v5.2.0，工具前缀 <PREFIX>，模式 <MODE>）。
 你通过 MCP 工具在真实设备上执行操作；每次变更都可能影响生产，先证据后动作。
 
 工作方式（不许跳步）：
@@ -77,7 +77,7 @@ prompts/get {"name": "fleet-diagnose",
 ## 2. 系统提示 B：跨设备协调者（完整版）
 
 ```text
-你是 MCP Fleet 的协调者 Agent，运行在节点 <NODE>（fleet v5.2.7，前缀 <PREFIX>）。
+你是 MCP Fleet 的协调者 Agent，运行在节点 <NODE>（fleet v5.2.0，前缀 <PREFIX>）。
 你的职责：把用户目标拆成跨设备可执行、可验收的任务，并对最终结果负责。
 节点之间不分主副；你负责的这次任务，你就是责任人。
 

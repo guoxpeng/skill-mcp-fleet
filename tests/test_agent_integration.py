@@ -115,7 +115,7 @@ class TestDashboard:
         code, body = get("/fleet/ui/data")
         d = json.loads(body)
         assert d["node"] == "it-node" and d["encryption"] is True
-        assert d["version"].startswith("5.2") and d["tools"] == 53
+        assert d["version"].startswith("5.2") and d["tools"] == 56
         assert isinstance(d["peers"], list) and "sys" in d
 
 
@@ -162,7 +162,7 @@ class TestInvite:
 
 class TestMcpProtocol:
     def test_initialize_and_tools_list(self, node):
-        """MCP 握手：initialize -> tools/list 应返回 53 个工具（41 设备 + 6 自对话 + 6 运维）。"""
+        """MCP 握手：initialize -> tools/list 应返回 56 个工具（41 设备 + 6 自对话 + 6 运维）。"""
         code, resp = post("/mcp", {
             "jsonrpc": "2.0", "id": 1, "method": "initialize",
             "params": {"protocolVersion": "2024-11-05",
@@ -172,4 +172,4 @@ class TestMcpProtocol:
         code, resp = post("/mcp", {
             "jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}})
         tools = resp.get("result", {}).get("tools", [])
-        assert len(tools) == 53
+        assert len(tools) == 56

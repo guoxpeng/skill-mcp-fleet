@@ -104,7 +104,7 @@ for _stream in (sys.stdout, sys.stderr):
 DEFAULT_CONFIG = {
     "name": "node",             # 副端标识（显示在状态页与 serverInfo）
     "tool_prefix": "",          # 工具名前缀，如 "nas_"；留空则用裸名（exec/read/...）
-    "version": "5.2.7",
+    "version": "5.2.0",
     "sudo_password": "",        # 留空且非 root 时会尝试免密 sudo
     "work_dir": "/",            # 默认工作目录
     "command_timeout": 120,     # 秒
@@ -1115,7 +1115,7 @@ def _note_peer_agents(peer_name, agents):
 def _mailbox_secret():
     """邮箱落盘密钥：使用 DATA_DIR/mailbox.key（0600），与 auth_token 解耦。
 
-    v5.2.7 起不再用 auth_token 派生邮箱密钥：token 轮换/重新生成不会让旧邮件
+    v5.2.0 起不再用 auth_token 派生邮箱密钥：token 轮换/重新生成不会让旧邮件
     变成不可读密文。旧版本（enc1$/token 派生）的数据由 MailEngine 的
     fallback_secret 兼容读取，并在下次写回时自动迁移到 mailbox.key。
     """
@@ -1144,7 +1144,7 @@ def _init_proto():
     global _mail_engine, _delivery_engine, _sync_engine
     if not _HAS_PROTO:
         return
-    # v5.2.7: 邮箱固定使用 mailbox.key；auth_token 只作为旧数据回退密钥，
+    # v5.2.0: 邮箱固定使用 mailbox.key；auth_token 只作为旧数据回退密钥，
     # 避免 token 轮换把历史邮件变成不可读密文。
     _proto_secret = _mailbox_secret()
     _mail_engine = MailEngine(HERE, SERVER_NAME, secret=_proto_secret,
@@ -2618,6 +2618,7 @@ READ_ONLY_BLOCKED = {
     "peer_call", "peer_add", "peer_remove", "delegate", "group_form", "group_disband",
     # v5.2 运维/自对话中会改变外部状态的
     "fleet_token_rotate", "fleet_handoff",
+    "fleet_repair", "fleet_repair_loop",
 }
 
 # 查找表：带前缀名、裸名、以及旧版 nas_ 前缀名都接受（向后兼容）
@@ -2760,6 +2761,317 @@ def _doctor_time():
     return True, time.strftime("%F %T")
 
 
+
+# ---------------------------------------------------------------------------
+# v5.2: 自检 / 自修复（连接上的 agent 可据此发现并修复常见故障）
+# ---------------------------------------------------------------------------
+_SELFCHECK_ACTIONS = {
+    "restart_service": "重启本节点服务（ctl/systemd/launchd/Termux 统一入口）",
+    "fix_permissions": "修正配置/数据/mailbox 权限（0600/0700）",
+    "clear_stale_pid": "清理残留 pid 文件（进程已不存在时）",
+    "rollback": "回滚到最近一次升级备份（高风险，需 allow_rollback）",
+}
+
+
+def _pid_alive_local(pid):
+    try:
+        pid = int(pid)
+        if pid <= 0:
+            return False
+        if os.name == "nt":
+            import ctypes
+            handle = ctypes.windll.kernel32.OpenProcess(0x1000, False, pid)
+            if handle:
+                ctypes.windll.kernel32.CloseHandle(handle)
+                return True
+            return False
+        os.kill(pid, 0)
+        return True
+    except Exception:
+        return False
+
+
+def _listener_pid(port):
+    """返回监听该端口的 PID（仅当命令行含 mcp_agent.py，避免误杀其它服务）。"""
+    import subprocess as _sp
+    pid = ""
+    try:
+        p = _sp.run(["lsof", "-nP", "-iTCP:%d" % int(port), "-sTCP:LISTEN", "-t"],
+                    stdout=_sp.PIPE, stderr=_sp.DEVNULL, timeout=10)
+        pid = (p.stdout.decode().strip().splitlines() or [""])[0]
+    except Exception:
+        pid = ""
+    if not pid:
+        try:
+            p = _sp.run(["ss", "-ltnp"], stdout=_sp.PIPE,
+                        stderr=_sp.DEVNULL, timeout=10)
+            for line in p.stdout.decode("utf-8", "replace").splitlines():
+                if (":%d " % int(port)) in line and "pid=" in line:
+                    pid = line.split("pid=")[1].split(",")[0]
+                    break
+        except Exception:
+            pid = ""
+    if not pid.isdigit():
+        return 0
+    # 校验进程确实是我们自己的节点，避免误杀端口上的其它程序
+    try:
+        if os.path.exists("/proc/%s/cmdline" % pid):
+            cmd = open("/proc/%s/cmdline" % pid, "rb").read().decode("utf-8", "replace")
+        else:
+            p = _sp.run(["ps", "-p", pid, "-o", "command="], stdout=_sp.PIPE,
+                        stderr=_sp.DEVNULL, timeout=10)
+            cmd = p.stdout.decode("utf-8", "replace")
+        return int(pid) if "mcp_agent.py" in cmd else 0
+    except Exception:
+        return 0
+
+
+def _selfcheck_findings():
+    """返回结构化发现列表（只读，不修改任何状态）。"""
+    import shutil
+    findings = []
+
+    def add(code, severity, title, detail="", action=None, repairable=False):
+        findings.append({"code": code, "severity": severity, "title": title,
+                         "detail": str(detail)[:300], "action": action,
+                         "repairable": bool(repairable and action)})
+
+    # 配置 / 身份
+    if not os.path.exists(CONFIG_PATH):
+        add("config_missing", "critical", "配置文件不存在", CONFIG_PATH,
+            "restart_service", False)
+    else:
+        if os.stat(CONFIG_PATH).st_mode & 0o077:
+            add("config_perm", "high", "配置权限过宽",
+                oct(os.stat(CONFIG_PATH).st_mode & 0o777),
+                "fix_permissions", True)
+    if IDENTITY is None:
+        add("identity_missing", "high", "节点身份缺失（token 降级）",
+            "fleet_core 未启用或 identity.json 损坏", None, False)
+    if not (CFG.get("auth_token") or CFG.get("require_signature")):
+        add("auth_disabled", "medium", "未启用鉴权",
+            "token 与签名都未开启；对外监听时风险高", None, False)
+    # 审计链
+    try:
+        if AUDIT_CHAIN is not None and not AUDIT_CHAIN.verify()[0]:
+            add("audit_broken", "high", "审计哈希链校验失败",
+                "日志可能被篡改/损坏，请保留现场", None, False)
+    except Exception as e:
+        add("audit_error", "high", "审计链无法校验", repr(e), None, False)
+    # 磁盘
+    try:
+        free = shutil.disk_usage(DATA_DIR).free
+        if free < 100 * 1024 * 1024:
+            add("disk_low", "critical", "数据目录磁盘不足",
+                "%.1f MB free" % (free / 1048576.0), None, False)
+    except Exception as e:
+        add("disk_error", "high", "磁盘检查失败", repr(e), None, False)
+    # 端口
+    ok_port, port_detail = _doctor_port()
+    if not ok_port:
+        add("port_unreachable", "critical", "本机监听端口不可连",
+            port_detail, "restart_service", True)
+    # 权限目录
+    for label, path, mode in (("data_dir", DATA_DIR, 0o700),
+                              ("mailbox", os.path.join(HERE, "mailbox"), 0o700)):
+        if os.path.exists(path):
+            try:
+                cur = os.stat(path).st_mode & 0o077
+                if cur:
+                    add("dir_perm", "medium", "%s 权限过宽" % label,
+                        oct(os.stat(path).st_mode & 0o777),
+                        "fix_permissions", True)
+            except Exception:
+                pass
+            if not os.access(path, os.W_OK):
+                add("dir_unwritable", "high", "%s 不可写" % label, path,
+                    "fix_permissions", True)
+    # 残留 pid
+    pid_path = os.path.join(DATA_DIR, "fleet.pid")
+    try:
+        if os.path.exists(pid_path):
+            pid = open(pid_path, encoding="ascii").read().strip()
+            if pid and not _pid_alive_local(pid):
+                listener = _listener_pid(int(CFG.get("port") or LISTEN_PORT or 3100))
+                if listener:
+                    add("stale_pid", "high", "pid 文件与实际进程不一致",
+                        "pidfile=%s, listener=%s" % (pid, listener),
+                        "restart_service", True)
+                else:
+                    add("stale_pid", "medium", "残留 pid 文件（进程已退出）",
+                        "pid=%s" % pid, "clear_stale_pid", True)
+    except Exception:
+        pass
+    return findings
+
+
+def t_fleet_selfcheck(a):
+    """只读自检：返回可机读的故障发现与修复计划，不修改任何状态。"""
+    findings = _selfcheck_findings()
+    critical = [f for f in findings if f["severity"] == "critical"]
+    plan = []
+    for f in findings:
+        if f["repairable"] and f["action"] not in plan:
+            plan.append(f["action"])
+    return _json_text({
+        "ok": not critical,
+        "summary": "%d 项发现（critical=%d，可自动修复=%d）"
+                   % (len(findings), len(critical),
+                      sum(1 for f in findings if f["repairable"])),
+        "findings": findings,
+        "repair_plan": plan,
+        "actions": _SELFCHECK_ACTIONS,
+        "next": ("先调用 fleet_repair_loop（最多 3 次）自动修复；"
+                 "仍失败则把 findings 原样报告给用户，不要猜测。"),
+    }), bool(critical)
+
+
+def _sh_quote_local(text):
+    return "'" + str(text).replace("'", "'\\''") + "'"
+
+
+def _repair_do(action):
+    """执行单个白名单修复动作；返回 (ok, detail)。"""
+    if action == "restart_service":
+        ctl = os.path.join(HERE, "fleet-ctl.sh")
+        if not os.path.exists(ctl):
+            return False, "找不到 fleet-ctl.sh（请手工 systemctl restart）"
+        port = int(CFG.get("port") or LISTEN_PORT or 3100)
+        pid_path = os.path.join(DATA_DIR, "fleet.pid")
+        listener = _listener_pid(port)
+        # 校准 pidfile：ctl restart 依赖它找到旧进程，避免双进程
+        if listener:
+            try:
+                with open(pid_path + ".tmp", "w", encoding="ascii") as f:
+                    f.write(str(listener))
+                os.replace(pid_path + ".tmp", pid_path)
+            except OSError:
+                pass
+        # 不能在本进程里同步 kill 自己：调度 1 秒后的外部重启，先返回响应
+        helper = ("sleep 1; sh %s restart" % _sh_quote_local(ctl))
+        try:
+            subprocess.Popen(["sh", "-c", helper], cwd=HERE,
+                             stdin=subprocess.DEVNULL,
+                             stdout=subprocess.DEVNULL,
+                             stderr=subprocess.DEVNULL,
+                             start_new_session=True)
+        except Exception as e:
+            return False, "调度重启失败: %r" % (e,)
+        return True, "重启已调度（约 1 秒后执行；请等待 10 秒后重新自检）"
+    if action == "fix_permissions":
+        fixed = []
+        for path, mode in ((CONFIG_PATH, 0o600),
+                           (DATA_DIR, 0o700),
+                           (os.path.join(HERE, "mailbox"), 0o700)):
+            try:
+                if os.path.exists(path):
+                    os.chmod(path, mode)
+                    fixed.append(path)
+            except Exception as e:
+                return False, "chmod %s 失败: %r" % (path, e)
+        return True, "已修正: %s" % ", ".join(fixed)
+    if action == "clear_stale_pid":
+        pid_path = os.path.join(DATA_DIR, "fleet.pid")
+        try:
+            if os.path.exists(pid_path):
+                pid = open(pid_path, encoding="ascii").read().strip()
+                if pid and _pid_alive_local(pid):
+                    return False, "进程 %s 仍存活，拒绝清理 pid" % pid
+                os.remove(pid_path)
+                return True, "已清理 %s" % pid_path
+            return True, "无 pid 文件"
+        except Exception as e:
+            return False, "清理 pid 失败: %r" % (e,)
+    if action == "rollback":
+        installer = os.path.join(HERE, "fleet_install.py")
+        if not os.path.exists(installer):
+            return False, "找不到 fleet_install.py，无法回滚"
+        name = str(CFG.get("name") or SERVER_NAME)
+        argv = [sys.executable, installer, "--rollback",
+                "--name", name, "--dir", HERE, "--data-dir", DATA_DIR]
+        try:
+            p = subprocess.run(argv, stdout=subprocess.PIPE,
+                               stderr=subprocess.STDOUT, timeout=240)
+            out = p.stdout.decode("utf-8", "replace").strip()[-1000:]
+            return p.returncode == 0, "exit=%d %s" % (p.returncode, out)
+        except Exception as e:
+            return False, "回滚失败: %r" % (e,)
+    return False, "未知修复动作: %s" % action
+
+
+def t_fleet_repair(a):
+    """执行单个白名单修复动作；必须 confirm=节点名，默认拒绝。"""
+    a = a or {}
+    action = str(a.get("action") or "")
+    if CFG.get("read_only"):
+        return "只读节点拒绝修复动作", True
+    if action not in _SELFCHECK_ACTIONS:
+        return "未知动作：%s（可选 %s）" % (action, ", ".join(_SELFCHECK_ACTIONS)), True
+    if a.get("confirm") not in (SERVER_NAME, True):
+        return ("需要确认：action=%s 且 confirm=%s（防误操作）"
+                % (action, SERVER_NAME)), True
+    ok, detail = _repair_do(action)
+    _audit_call("fleet_repair", {"action": action}, "ok" if ok else "error", detail[:200])
+    return _json_text({"ok": ok, "action": action, "detail": detail}), not ok
+
+
+def t_fleet_repair_loop(a):
+    """有界自愈：自检 → 修复可修项 → 复检，最多 max_attempts 次（默认 2，上限 3）。
+
+    安全边界：只允许重启/权限/pid 三类动作；rollback 需 allow_rollback=true；
+    绝不动数据、token、代码；只读节点直接拒绝。失败即停并报告。
+    """
+    a = a or {}
+    if CFG.get("read_only"):
+        return "只读节点拒绝自愈", True
+    if a.get("confirm") not in (SERVER_NAME, True):
+        return "需要确认：confirm=%s" % SERVER_NAME, True
+    try:
+        max_attempts = max(1, min(3, int(a.get("max_attempts") or 2)))
+    except Exception:
+        max_attempts = 2
+    allow_rollback = bool(a.get("allow_rollback"))
+    before = _selfcheck_findings()
+    attempts = []
+    findings = before
+    for _ in range(max_attempts):
+        todo = [f for f in findings if f["repairable"]]
+        if allow_rollback:
+            todo += [f for f in findings if f["code"] in ("version_broken", "rollback_needed")]
+        if not todo:
+            break
+        action = todo[0]["action"]
+        if action == "rollback" and not allow_rollback:
+            break
+        ok, detail = _repair_do(action)
+        _audit_call("fleet_repair_loop", {"action": action}, "ok" if ok else "error",
+                    detail[:200])
+        attempts.append({"action": action, "ok": ok, "detail": detail,
+                         "findings_left": len(findings)})
+        if not ok:
+            break
+        if action == "restart_service":
+            # 重启由外部进程在 1s 后执行；本进程不能立即复检（会先被杀）
+            return _json_text({
+                "ok": True, "before": before, "after": findings,
+                "attempts": attempts, "repaired_actions": [action],
+                "remaining": [], "restart_scheduled": True,
+                "next": "等待约 10 秒后重新连接并调用 fleet_selfcheck 确认。",
+            }), False
+        findings = _selfcheck_findings()
+    after = _selfcheck_findings()
+    repaired = [action for action in _SELFCHECK_ACTIONS
+                if not any(f["action"] == action for f in after)]
+    return _json_text({
+        "ok": not any(f["severity"] == "critical" for f in after),
+        "before": before, "after": after, "attempts": attempts,
+        "repaired_actions": repaired,
+        "remaining": [f for f in after if f["severity"] in ("critical", "high")],
+        "next": ("若仍有 critical/high：停止自愈，把 remaining 报告给用户；"
+                 "禁止循环重试或执行未列出的命令。"),
+    }), any(f["severity"] == "critical" for f in after)
+
+
 def t_fleet_token_rotate(a):
     """轮换 auth_token（需要 confirm=节点名，防误触发）。"""
     if not (a or {}).get("confirm"):
@@ -2811,6 +3123,17 @@ OPERATIONAL_TOOLS = [
      {"type": "object", "properties": {"host": {"type": "string"},
                                        "port": {"type": "number"},
                                        "ttl": {"type": "number"}}}),
+    ("fleet_selfcheck", "只读自检：返回可机读故障发现、严重级别、建议动作与修复计划；不修改状态。",
+     {"type": "object", "properties": {}}),
+    ("fleet_repair", "执行单个白名单修复动作（restart_service/fix_permissions/clear_stale_pid/rollback）；必须 confirm=节点名。",
+     {"type": "object", "properties": {
+         "action": {"type": "string", "enum": ["restart_service", "fix_permissions",
+                                               "clear_stale_pid", "rollback"]},
+         "confirm": {"type": "string"}}}),
+    ("fleet_repair_loop", "有界自愈：自检→修复可修项→复检，最多 3 次；只允许安全动作，失败即停并报告。",
+     {"type": "object", "properties": {
+         "max_attempts": {"type": "number"}, "allow_rollback": {"type": "boolean"},
+         "confirm": {"type": "string"}}}),
 ]
 
 OPERATIONAL_FUNCS = {
@@ -2820,6 +3143,9 @@ OPERATIONAL_FUNCS = {
     "fleet_doctor": t_fleet_doctor,
     "fleet_token_rotate": t_fleet_token_rotate,
     "fleet_invite": t_fleet_invite,
+    "fleet_selfcheck": t_fleet_selfcheck,
+    "fleet_repair": t_fleet_repair,
+    "fleet_repair_loop": t_fleet_repair_loop,
 }
 
 # 合并自对话工具（fleet_help/think/plan/reflect/review/handoff）
@@ -2829,7 +3155,8 @@ for _name, _desc, _schema in OPERATIONAL_TOOLS:
     V51_TOOLS.append({"name": _name, "description": _desc, "inputSchema": _schema,
                      "annotations": {"readOnlyHint": _name in (
                          "fleet_identity", "fleet_metrics", "fleet_audit_verify",
-                         "fleet_doctor", "fleet_invite")}})
+                         "fleet_doctor", "fleet_invite",
+                         "fleet_selfcheck")}})
     V51_FUNCS[_name] = OPERATIONAL_FUNCS[_name]
 if _HAS_AGENT:
     try:

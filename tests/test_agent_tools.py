@@ -8,7 +8,7 @@ mp = pytest.importorskip("mcp_agent", reason="mcp_agent 导入失败")
 
 class TestToolRegistry:
     def test_tool_count(self):
-        assert len(mp.TOOLS) == 53
+        assert len(mp.TOOLS) == 56
 
     def test_tool_schema_structure(self):
         """每个工具必须有 name/description/inputSchema(dict)。"""
@@ -472,7 +472,7 @@ class TestReadOnlyMode:
         """tools/list 仍返回完整 41 工具（read-only 靠调用层拦截，工具数声明不变）。"""
         self._set(True)
         try:
-            assert len(mp.TOOLS) == 53
+            assert len(mp.TOOLS) == 56
         finally:
             self._set(False)
 

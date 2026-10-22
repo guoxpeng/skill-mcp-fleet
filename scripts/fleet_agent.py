@@ -62,7 +62,7 @@ try:  # Python 3.6+ 均有 urllib.request；显式兜底便于极简环境
 except ImportError:  # pragma: no cover - 正常 CPython 不会走到
     urllib = None
 
-VERSION = "5.2.7"
+VERSION = "5.2.0"
 
 # MCP initialize instructions 硬上限（契约要求 ≤ 6000 字符）
 MAX_INSTRUCTIONS = 6000
@@ -1773,6 +1773,7 @@ _INSTRUCTIONS_TEMPLATE = """# MCP Fleet 节点 · Agent 操作手册
 | 多步任务 | fleet_plan → msg_send(信封) | 每步必须有验收标准 |
 | 收尾 | fleet_review | 逐条判定验收，不臆断通过 |
 | 失败复盘 | fleet_reflect | 记录教训再升级 |
+| 节点异常/自修复 | fleet_selfcheck → fleet_repair_loop | 只做白名单动作，失败即停 |
 
 ## 3. 安全边界（红线）
 - 写操作/重启/删除前确认：目标节点、路径、影响面；不确定就问。
@@ -1799,6 +1800,12 @@ _INSTRUCTIONS_TEMPLATE = """# MCP Fleet 节点 · Agent 操作手册
 1) 同语义重试 1 次（只换超时/参数）；2) 换同能力备用节点；3) 降级为局部结论；
 4) fleet_reflect 记录阻塞点 + fleet_handoff 交人；5) 明确说明已完成/未完成/继续所需条件。
 
+## 6.5 自修复（v5.2）
+- 发现节点异常（健康失败、端口不可连、权限/pid 异常、升级后异常）：先 `$PREFIX$fleet_selfcheck`，读取 findings 与 repair_plan。
+- 有可修项再调 `$PREFIX$fleet_repair_loop(confirm=<节点名>, max_attempts=2)`；它只允许重启服务/修权限/清 stale pid；rollback 必须显式 `allow_rollback=true`。
+- 失败立即停止，把 remaining 原样报告给用户；**禁止循环重试、禁止执行未列出的命令、禁止删除数据/轮换 token**。
+- 修复动作写入审计链，收尾用 `$PREFIX$fleet_audit_verify` 复核。
+
 ## 7. 常见任务模板
 - 诊断：sysinfo → docker_ps/ps → 相关日志 → 结论（现象/根因假设/下一步）
 - 变更：read 配置 → dryRun edit → 备份 → restart → 健康检查(http_get) → 回滚方案
@@ -1808,7 +1815,7 @@ _INSTRUCTIONS_TEMPLATE = """# MCP Fleet 节点 · Agent 操作手册
 ## 8. 结构化消息与自检
 - 信封 kind：propose / accept / counter / progress / result / fail / review / handoff / hello；
   字段 v / kind / thread_id / from / to / payload / task_id / deadline_ms；普通文本仍可直接发（兼容）。
-- 自检：目标写清了吗？每步有验收标准吗？输出可复现吗？密钥外泄了吗？结论有证据吗？下一步谁做？
+- 自检：目标写清了吗？每步有验收标准吗？输出可复现吗？密钥外泄了吗？结论有证据吗？下一步谁做？节点异常先 fleet_selfcheck，再按需 fleet_repair_loop。
 
 > 完整手册 references/agent-playbook.md；协议 references/self-dialogue-protocol.md；
 > 可粘贴提示词 references/prompt-pack.md。

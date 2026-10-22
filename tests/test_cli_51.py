@@ -200,3 +200,34 @@ class TestUpdateAndParser:
                                             "--auto-install"]):
             args = parser.parse_args(argv)
             assert getattr(args, "func", None) is not None
+
+
+class TestPromptAndRepairCLI:
+    def test_prompt_pack_output(self, capsys):
+        assert fleet.cmd_prompt(ns(topic="self_repair")) == 0
+        out = capsys.readouterr().out
+        assert "fleet_selfcheck" in out and "fleet_repair_loop" in out
+
+    def test_no_arg_menu_has_prompts(self, monkeypatch, capsys):
+        monkeypatch.setattr(fleet, "local_node", lambda *a, **k: None)
+        assert fleet.show_fleet_status() == 0
+        out = capsys.readouterr().out
+        assert "fleet selfcheck" in out and "fleet prompt" in out
+        assert "自检修复" in out
+
+    def test_repair_auto_calls_loop(self, monkeypatch):
+        called = {}
+
+        class C:
+            def call(self, tool, args=None, timeout=None):
+                called["tool"] = tool
+                called["args"] = args or {}
+                return json.dumps({"ok": True}), False
+
+        monkeypatch.setattr(fleet, "_local_mcp",
+                            lambda a: ({"name": "n1", "url": "x", "token": ""}, C()))
+        rc = fleet.cmd_repair(ns(auto=True, attempts=2, rollback=False,
+                                 json=False, self_url=None, timeout=30))
+        assert rc == 0
+        assert called["tool"] == "fleet_repair_loop"
+        assert called["args"]["confirm"] == "n1"

@@ -241,14 +241,18 @@ class MailEngine:
     def __init__(self, base_dir, node_name, secret=None, fallback_secret=None):
         self.dir = os.path.join(base_dir, "mailbox")
         os.makedirs(self.dir, exist_ok=True)
+        try:
+            os.chmod(self.dir, 0o700)   # 邮箱可能含密文/游标，默认仅本人可读
+        except OSError:
+            pass
         self.inbox_path = os.path.join(self.dir, "inbox.jsonl")
         self.outbox_path = os.path.join(self.dir, "outbox.jsonl")
         self.sent_path = os.path.join(self.dir, "sent.jsonl")
         self.cursor_path = os.path.join(self.dir, "cursor.json")
         self.node_name = node_name
-        # v5.0: 落盘加密密钥（v5.2.2 起为稳定 mailbox.key）。None=不加密。
+        # v5.0: 落盘加密密钥（v5.1.1 起为稳定 mailbox.key）。None=不加密。
         self.secret = secret or None
-        # v5.2.2: 旧版本用 auth_token 派生密钥；升级后仍可读旧邮件，
+        # v5.1.1: 旧版本用 auth_token 派生密钥；升级后仍可读旧邮件，
         # 下次写回时自动用新 mailbox.key 重新加密（平滑迁移）。
         self._fallback_secret = fallback_secret or None
         # v5.0: RLock（可重入）—— sync_summary() 等方法持锁调用 outbox_pending()
@@ -262,7 +266,7 @@ class MailEngine:
         # blob 内仍自带 salt 字段，旧格式（每条独立 salt）解密自动兼容。
         self._salt = self._load_or_create_salt() if self.secret else None
         self._next_id = self._calc_next_id()
-        # v5.2.3: 首次带旧密钥回退启动时，把历史邮件迁移到新 mailbox.key，
+        # v5.1.1: 首次带旧密钥回退启动时，把历史邮件迁移到新 mailbox.key，
         # 之后 token 再轮换也不影响已迁移数据。marker 避免每次启动重写。
         if self.secret and self._fallback_secret:
             self._migrate_legacy_once()

@@ -1,206 +1,65 @@
 # Changelog · MCP Fleet
 
 所有版本的更新说明。版本号与 `scripts/mcp_agent.py` 内 `DEFAULT_CONFIG["version"]` 对齐，
-每个里程碑版本对应一个 git tag 与一次华为云技能市场提交（submit_id）。
-参赛文档中的 "v4.6" / "v5.0" 等简称为对应语义化版本的里程碑标记。
+每个里程碑版本对应一个 git tag 与一次技能市场提交。
 
 ---
 
----
+## [5.2.0] — 2026-10-22 · 新功能：自修复 + 菜单提示词 + 真机测试文档
 
----
+### 新增：Agent 自修复
+- **`fleet_selfcheck`**（只读）：返回结构化 findings（code/severity/action/repairable）
+  与 repair_plan；覆盖配置权限、身份、鉴权、审计链、磁盘、端口、data/mailbox
+  权限、pid 文件与实际进程不一致。
+- **`fleet_repair`**（需确认）：白名单动作 `restart_service` / `fix_permissions` /
+  `clear_stale_pid` / `rollback`；必须 `confirm=<节点名>`，只读节点拒绝。
+- **`fleet_repair_loop`**（需确认）：自检 → 修可修项 → 复检，默认 2 次、上限 3 次；
+  失败立即停止并返回 remaining；不删数据、不轮换 token、不执行任意命令。
+- 重启类修复先校准 pidfile，再调度 1 秒后的外部重启，避免在工具进程内杀自己/起双进程。
+- 每次修复写入哈希链审计，可用 `fleet_audit_verify` 复核。
 
----
-
----
-
----
-
----
-
----
-
----
-
-## [5.2.7] — 2026-10-22 · 自签 TLS 本机 CLI 修复（Ubuntu 真机）
-
-- **问题**：云主机用 `--tls auto` 自签证书、通过公网 IP 访问时，
-  `fleet status/doctor/ask` 报 `CERTIFICATE_VERIFY_FAILED`。原因是 CLI 只对
-  私网/回环豁免证书校验，公网 IP 的本机节点也被当成公网对端。
-- **修复**：`MCPClient` / 本机 HTTP 查询新增 `insecure` 语义，仅“本机节点命令”
-  豁免自签校验；公网对端仍走系统 CA。`_opener_for(url, insecure=...)` 显式区分。
-- **Ubuntu 24.04 真机验证**：systemd 安装、自签 TLS 健康检查、默认 token、
-  Dashboard、systemd kill -9 自愈、远端更新 SHA256、回滚、卸载清理全部通过。
-- 全量 **615 passed + 1 skipped**。
-
----
-
-## [5.2.6] — 2026-10-22 · 远端更新按 commit SHA 取文件（彻底绕开 raw CDN 缓存）
-
-- `raw.githubusercontent.com/.../main/` 与 `/refs/heads/main/` 都可能返回旧缓存
-  （实测一个 5.2.4、一个 5.2.5）。现在先查 GitHub API `commits/main` 拿不可变
-  commit SHA，再按 `/<sha>/scripts/install.sh` 取文件；API 失败才回退两个分支 URL。
-- 手机实测：`fleet update` 下载 5.2.5、SHA256 校验通过、停旧服务、健康 OK，
-  版本 5.2.4→5.2.5；本版继续自更新到 5.2.6 验证。
-- 全量 **615 passed + 1 skipped**。
-
----
-
-## [5.2.5] — 2026-10-22 · 远端更新最后两处修复（缓存 / 临时目录）
-
-- **远端 install.sh 缓存**：`raw.githubusercontent.com/.../main/` 有 CDN 旧缓存，
-  手机端拉到旧版本（5.2.3）。改用 `/refs/heads/main/` 路径，确保拿到最新发布号。
-- **`tempfile` 未导入**：`_fetch_remote_installer()` 缺 `import tempfile`，异常被
-  吞掉后永远回退本地安装器；补齐导入。
-- **Termux 无 /tmp**：远端安装器优先在 `$HOME` 建临时文件，并给子进程补 `TMPDIR`。
-- 手机实测：`fleet update` → 下载 5.2.4 → SHA256 校验通过 → 停旧服务 → 健康 OK，
-  版本从 5.2.3 正确升到 5.2.4；随后 5.2.5 发布再自更新验证。
-- 全量 **615 passed + 1 skipped**。
-
----
-
-## [5.2.4] — 2026-10-22 · 升级真正重启 / 远端热更新 / HTTPS 校验加固
-
-**手机 `fleet update` 实测暴露：升级时端口占用误判、旧进程未停（“升级了但没重启”）。**
-
-### 修复
-- **升级先停旧服务**：`--upgrade` 在预检前调用 `adapter.stop()`，升级后启动的
-  确实是新代码；升级/回滚跳过端口占用检查（旧服务马上停）。
-- **`fleet update` 默认拉最新发布包**：从 raw main 取最新 `install.sh`，由它下载
-  Release 资产并校验 SHA256；`--offline` 才用节点目录本地安装器；Windows 无 sh
-  自动回退本地安装器。
-- **HTTPS 证书校验**：自签豁免仅限私网/回环；GitHub 等公网请求恢复系统默认校验，
-  防中间人。
-- **Termux 唤醒锁失败告警**：`termux-wake-lock` 返回非 0 时明确提示可能被冻结。
-- **Docker/邮箱/Termux 修复**沿用 5.2.3。
-
-### 测试
-- 全量 **614 passed + 1 skipped**；新增升级停止顺序/远端更新/端口跳过回归。
-
----
-
-## [5.2.3] — 2026-10-22 · 真机复测修复：Termux 启动 / 邮箱密钥迁移 / Docker
-
-**手机（Android 14 / Termux）与跨端复测暴露的问题，全部修复并补测试。**
-
-### 修复
-- **Termux 启动崩溃（P0）**：`TermuxAdapter.start()` 在 `warnings=[]` 赋值前使用，
-  真机升级时报 `UnboundLocalError`，服务无法启动。已修正并补单元测试。
-- **邮箱密钥迁移破坏旧邮件（P0）**：v5.2.2 用 auth_token 派生邮箱密钥，
-  升级/轮换后旧邮件被当密文占位符写回，造成不可恢复。现在：
-  - 邮箱固定使用 `data/mailbox.key`，与 token 解耦；
-  - 旧 token 派生数据作为 fallback 自动读取；
-  - 首次启动一次性迁移，遇到任何解不开的邮件则**整体跳过迁移**；
-  - 写回时保留无法解密的原始密文，绝不覆盖成占位符。
-- **Docker 部署**：去掉只读根（mailbox 需落盘）、容器内强制 HTTP（TLS 交反代）、
-  `MCP_FLEET_DATA=/data` 环境变量覆盖数据目录、镜像补齐 `fleet.py/fleet_core/fleet_agent`。
-- **Termux 电池优化**：授权页命令改为可诊断输出，失败不阻塞启动。
-
-### 验证
-- 手机真机：升级成功、默认 token、`$PREFIX/bin/fleet`、唤醒锁 + 电池授权页、
-  `fleet status/doctor` 正常；Mac ↔ 手机 `peer_call` 双向执行、消息投递正常。
-- 全量 **611 passed + 1 skipped**；新增邮箱迁移/不丢数据/Termux 启动回归。
-- 8 种服务单元（systemd/openrc/procd/launchd/schtasks/termux/docker/nohup）
-  静态渲染全部通过。
-
----
-
-## [5.2.2] — 2026-10-22 · 修复回滚 TLS / Dashboard 401 / 卸载残留
-
-**v5.2.1 端到端实测继续暴露的 4 个问题，全部修复。**
-
-### 修复
-- **回滚后服务起成 HTTP、客户端按 HTTPS 连（P0）**：`rollback()` 创建适配器时没有
-  从恢复的配置读 `tls_cert/tls_key`，导致进程不带 `--tls-cert` 启动，
-  `fleet status` 报 `SSL: WRONG_VERSION_NUMBER`。现在回滚前把配置里的
-  TLS/只读/鉴权参数带回 opts。
-- **Dashboard 页面 401（P0）**：`/fleet/ui` 静态页被鉴权闸门拦截，但浏览器
-  token 走 URL fragment（不会发送到服务器），页面根本打不开。现在页面本身免鉴权，
-  `/fleet/ui/data` 仍需 token/签名；新增回归测试。
-- **Dashboard 任务步数显示 0**：任务存储字段是 `event_count` 而非 `steps`，
-  已兼容读取。
-- **卸载残留启动器/安装目录**：`--uninstall` 现在删除全局 `fleet` 启动器
-  （校验内容归属，防误删同名文件）；`--purge` 连安装目录一起清，默认卸载保留
-  `data/` 与 `mailbox/` 并明确提示。
-
-### 测试
-- 全量 **606 passed + 1 skipped**；新增 Dashboard 页面免鉴权/数据鉴权、升级
-  目标保护、卸载清理回归。
-
----
-
-## [5.2.1] — 2026-10-22 · 修复升级目标解析 / HTTPS 健康检查 / 发布包模板兜底
-
-**v5.2.0 实测暴露的 3 个真实缺陷，已修复并补回归测试。**
-
-### 修复
-- **`fleet update/--rollback` 升级错节点（P0）**：CLI 调用安装器时未传
-  `--name/--dir/--data-dir/--port/--service`，安装器按默认主机名新建了另一个节点，
-  导致健康检查失败、回滚找不到备份。现在 `_local_node_install_info()` 从本机
-  配置/manifest 读取真实目标并显式传入；安装器新增“升级目标不匹配/不存在”拒绝。
-- **自签 TLS 节点健康检查失败（P0）**：`health_check` 只请求 http，而 `--tls auto`
-  实际监听 https，导致安装成功但健康检查 401/重置。现在按 TLS 状态使用 https +
-  自签证书校验豁免（仅本机回环）；同时把 `tls_cert/tls_key` 写回配置，
-  `fleet status/ask/doctor` 也能识别 https 与自签证书。
-- **发布包缺 service-templates 导致跨平台安装失败（P0）**：Release 包只带 3 个
-  模板，OpenWrt/Termux/Windows/nohup 等适配器报“缺少模板”。现在
-  `fleet_install.py` 内置 10 个模板兜底，发布包不带 templates 也能全平台安装。
-
-### 测试
-- 全量 **605 passed + 1 skipped**；新增升级目标不匹配/不存在、CLI 更新参数、
-  HTTPS 健康检查覆盖。
-
----
-
-## [5.2.0] — 2026-10-22 · 体验增强：安全默认 / 全局命令 / 升级回滚 / Dashboard 2.0 / 自然语言入口
-
-**主题：让普通用户第一次就能装对、连上、看懂、升级。**
-
-### 安装体验（P0）
-- **默认鉴权**：安装时自动生成强随机 token（0600），人读输出只打印一次；
-  `--no-auth` 显式关闭并警告；`--dry-run` 零副作用。
-- **全局 `fleet` 命令**：安装器创建 `/usr/local/bin/fleet`、`$PREFIX/bin/fleet`
-  或 `~/.local/bin/fleet`（Windows 为 `fleet.cmd`），写入 manifest，卸载时清理。
-- **升级/回滚**：`--upgrade` 自动备份安装目录（含 mailbox/config）→ 覆盖 → 重启 →
-  健康检查；`--rollback` 恢复最近备份；`fleet update` 直接调用。
-- **Android 14 电池优化**：Termux 安装时自动拉起「忽略电池优化」授权页并提示，
-  降低息屏后台冻结概率。
-- **发布脚本**：`scripts/release.py` 一键创建 GitHub Release 并上传 zip+SHA256SUMS
-  （支持 GITHUB_TOKEN / git 凭据，`--dry-run`，不打印 token）。
-
-### 安全默认（P0）
-- 非 loopback 监听且无 token 时，节点启动自动生成 token（`auto_secure`，可关）；
-  `--allow-insecure` 显式降级。
-- JSON 安装结果中的配置已脱敏，不再回显 token/sudo 密码。
-- 错误信息带下一步：401/403 提示重新配对，连接失败提示查防火墙/Tailscale/doctor。
-
-### CLI 体验（P1）
-- `fleet ask "<自然语言>" [--run]`：规则意图识别（磁盘/网络/Docker/服务/备份/体检），
-  生成计划 + 可粘贴给 AI 的提示词；`--run` 只执行只读白名单命令并汇总证据。
-- `fleet invite --qr`：有 `qrencode` 时终端显示二维码，缺失时给安装提示。
-- `fleet join --auto-install`：本机未装节点时自动安装再加入。
-- `fleet identity export/import`：口令加密备份/恢复 Ed25519 身份，换机不重配全网。
-- `fleet update [--rollback]`：封装安装器升级/回滚。
-
-### Dashboard 2.0（P1）
-- 新增：节点指纹/安全状态（审计/签名/TLS/只读）、投递队列（待投递/死信）、
-  Agent 任务时间线、对端指纹与「移除设备」（`POST /fleet/peer_remove`）、
-  `/fleet/tasks` 端点。
-- 数据接口扩展 `identity/security/delivery/tasks`，页面 5s 刷新。
+### 新增：菜单与内置提示词
+- `fleet` 无参数重做为一屏式菜单：本机状态、常用命令、可直接粘给 AI 的提示词。
+- `fleet prompt [self_repair|diagnose|collaborate|pair|upgrade]`。
+- 交互菜单新增 `[17] 自检/自修复`、`[18] 查看 AI 提示词`；
+  `initialize.instructions` 加入自修复章节。
+- 工具总数 41 设备 + 15 智能 = **56**。
 
 ### 文档
-- 新增 `references/quickstart.md`（5 分钟上手）与 `references/troubleshooting.md`
-  （一页排障）；SKILL.md 参考索引同步。
-- 版本统一为 **v5.2.0**。
+- 新增 `references/self-repair.md`（工具/白名单/安全边界/验收标准）。
+- 新增 `references/test-results.md`（macOS / Ubuntu 24.04 / Android 14 真机结果、
+  修复过的真实缺陷、未覆盖项）。
+- SKILL/README/SECURITY 同步到 v5.2。
 
 ### 测试
-- 全量 **603 passed + 1 skipped**；新增 CLI 14 例、Dashboard/默认鉴权 5 例、
-  安装器 6 例（默认 token/无鉴权/launcher/升级/回滚）。
+- 全量 **625 passed + 1 skipped**；新增自修复工具注册/确认边界/只读保护/有界循环/
+  失败停止、菜单与提示词、CLI 映射测试。
 
-### 升级注意
-- 从 v5.1 升级会保留数据目录与配置；`fleet update` 自动备份。
-- 首次启动 v5.2 的对外监听节点会自动生成 token；旧 MCP 客户端需补 `Authorization`，
-  或重新配对后在 `peers.json` 使用签名。
+---
+
+## [5.1.1] — 2026-10-22 · 修复合集（默认鉴权 / 升级回滚 / TLS / 邮箱 / 跨平台）
+
+> 按版本规则：5.1.0 之后的小问题统一收敛到 5.1.1，不再逐个占用版本号。
+
+### 安全与默认
+- 安装默认生成随机 auth_token（`--no-auth` 关闭）；对外监听无 token 时自动生成。
+- JSON 安装结果脱敏；自签 TLS 健康检查/回滚/CLI 全链路修复。
+
+### 安装与升级
+- 全局 `fleet` 命令；`--upgrade` 先停旧服务、自动备份；`--rollback` 恢复备份。
+- 发布包缺模板时内置兜底；Docker 只读根/TLS/data_dir 修复。
+- `fleet update` 远端拉最新 release（commit SHA 固定、SHA256 校验），失败回退本地。
+
+### 体验
+- `fleet ask`、`fleet invite --qr`、`fleet join --auto-install`、
+  `fleet identity export/import`、Dashboard 2.0。
+- `fleet update --rollback`、`fleet selfcheck`（自修复工具见 5.2.0）。
+
+### 真机验证
+- macOS(launchd)、Ubuntu 24.04(systemd)、Android 14/Termux 安装/升级/回滚/卸载通过。
+
+### 测试
+- 全量 **615 passed + 1 skipped**。
 
 ---
 

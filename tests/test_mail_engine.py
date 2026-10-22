@@ -509,7 +509,7 @@ class TestInboxDedup:
 
 
 class TestMailboxKeyMigration:
-    """v5.2.3: 稳定 mailbox.key + 旧 token 密钥回退 + 失败占位。"""
+    """v5.1.1: 稳定 mailbox.key + 旧 token 密钥回退 + 失败占位。"""
 
     def test_fallback_decrypts_legacy_then_rewrites(self, tmp_path):
         old = MailEngine(str(tmp_path), "node-a", secret="old-token")
@@ -534,7 +534,7 @@ class TestMailboxKeyMigration:
 
 
 class TestMailboxNoDataLoss:
-    """v5.2.3: 解不开的旧邮件不能被占位符覆盖。"""
+    """v5.1.1: 解不开的旧邮件不能被占位符覆盖。"""
 
     def test_undecryptable_ciphertext_preserved_on_rewrite(self, tmp_path):
         old = MailEngine(str(tmp_path), "node-a", secret="old-token")

@@ -3,13 +3,13 @@
 > 读者：需要**跨 Agent / 跨设备异步协作**的调用方、协调者 Agent、执行者 Agent。
 > 范围：消息信封 JSON schema、kind 语义、状态机、thread/task/deadline、验收标准、
 > 超时重试、人机确认点，以及它与**邮箱**、**委派**、**编排器**的关系。
-> 机器实现以 `scripts/fleet_agent.py`（v5.2.7）为准：`ENVELOPE_KINDS`、
+> 机器实现以 `scripts/fleet_agent.py`（v5.2.0）为准：`ENVELOPE_KINDS`、
 > `make_envelope()`、`validate_envelope()`、`parse_envelope()`、`encode_envelope()`、
 > `envelope_expired()`、`review_acceptance()`、`TaskStore`、`Orchestrator`。
 > 配套阅读：`agent-playbook.md`（怎么干活）、`prompt-pack.md`（怎么把规则喂给模型）。
 
 示例 JSON 的字段与约束逐字对照代码，并已通过 `validate_envelope()` 校验；示例统一
-使用 `fleet_agent.VERSION`（当前 `"5.2.7"`），时间戳只是「某次运行时刻」。
+使用 `fleet_agent.VERSION`（当前 `"5.2.0"`），时间戳只是「某次运行时刻」。
 
 **章节导航**：§0 速查 · §1 传输层 · §2 信封 schema（强校验字段） · §3 各 kind 的
 payload 约定 · §4 状态机 · §5 thread/task/deadline/验收 · §6 错误与重试 ·
@@ -141,7 +141,7 @@ ENVELOPE_KINDS = ("propose", "accept", "counter", "progress", "result", "fail",
 
 | 字段 | 必填 | 规则 | 失败时的错误信息（会直接给模型看） |
 |---|---|---|---|
-| `v` | 是 | 字符串；`主版本号 = v.split(".")[0]` 必须是数字且 `>= 5` | `缺少协议版本字段 v（应为 "5.2.7"）` / `协议版本不支持: '4.9.0'（本节点要求主版本 >= 5，当前 5.2.7）` |
+| `v` | 是 | 字符串；`主版本号 = v.split(".")[0]` 必须是数字且 `>= 5` | `缺少协议版本字段 v（应为 "5.2.0"）` / `协议版本不支持: '4.9.0'（本节点要求主版本 >= 5，当前 5.2.0）` |
 | `kind` | 是 | 必须是九种之一 | `缺少 kind 字段（应为 …）` / `非法信封 kind 'bogus'：必须是 … 之一` |
 | `thread_id` | 是 | 字符串，`^[A-Za-z0-9_.-]{1,64}$` | `缺少 thread_id（…）` / `非法 thread_id '…'：只允许 1-64 位…` |
 | `from` | 是 | 字符串，`^[A-Za-z0-9_.-]{1,32}$`，不允许 `*` | `非法 from '…'：只允许 1-32 位…` |
@@ -154,7 +154,7 @@ ENVELOPE_KINDS = ("propose", "accept", "counter", "progress", "result", "fail",
 
 | 输入 | 结果 |
 |---|---|
-| `v="5"` / `v="5.2.7"` / `v="5.2.7"` / `v="5.9.0"` | 通过（只比较主版本，不设上限） |
+| `v="5"` / `v="5.2.0"` / `v="5.2.0"` / `v="5.9.0"` | 通过（只比较主版本，不设上限） |
 | `v="4.9.0"` / `v="v5.2"` | 拒绝（主版本 < 5） |
 | `to="*"` | 通过（广播语义，见 §1） |
 | `deadline_ms=true` / `deadline_ms=0` | 拒绝 |
@@ -182,7 +182,7 @@ make_envelope(kind, thread_id, from_, to, payload,
   text = encode_envelope(env)          # 单行 JSON，放进 msg_send.text
   ```
 
-- **版本号取值**：`v` 由 `make_envelope()` 自动填 `fleet_agent.VERSION`（当前 `"5.2.7"`），
+- **版本号取值**：`v` 由 `make_envelope()` 自动填 `fleet_agent.VERSION`（当前 `"5.2.0"`），
   校验门槛是主版本号 `>= 5`（接受 5.x / 6.x / 7.x 等更高版本）。手写信封时直接取
   `VERSION` 即可，不要写死旧版本号；低于 5 的版本会被拒绝并提示
   「本节点要求主版本 >= 5」。
@@ -439,7 +439,7 @@ make_envelope(kind, thread_id, from_, to, payload,
 收到 `kind="invalid"` 时，不要猜、不要静默丢弃。约定回复一个 `fail`：
 
 ```json
-{"v": "5.2.7", "kind": "fail", "thread_id": "th-bad00001",
+{"v": "5.2.0", "kind": "fail", "thread_id": "th-bad00001",
  "from": "nas", "to": "mac",
  "payload": {"reason": "非法 thread_id '../x'：只允许 1-64 位字母/数字/_.-",
              "error_class": "protocol", "attempts": 1, "need": "nothing"}}
@@ -449,8 +449,8 @@ make_envelope(kind, thread_id, from_, to, payload,
 
 | 错误信息（原文） | 根因 | 修法 |
 |---|---|---|
-| `缺少协议版本字段 v（应为 "5.2.7"）` | 漏了 `v` | 补 `"v": "5.2.7"`（即 `fleet_agent.VERSION`） |
-| `协议版本不支持: '4.9.0'（本节点要求主版本 >= 5，当前 5.2.7）` | 旧版信封/旧客户端 | 升级，或改发纯文本消息 |
+| `缺少协议版本字段 v（应为 "5.2.0"）` | 漏了 `v` | 补 `"v": "5.2.0"`（即 `fleet_agent.VERSION`） |
+| `协议版本不支持: '4.9.0'（本节点要求主版本 >= 5，当前 5.2.0）` | 旧版信封/旧客户端 | 升级，或改发纯文本消息 |
 | `非法信封 kind 'bogus'：必须是 … 之一` | kind 拼错/自创 | 只用九种 kind；自定义语义放 payload |
 | `payload 必须是 dict（结构化正文）` | payload 写成数组 | 包成对象，如 `{"items":[…]}` |
 | `非法 task_id 'a..b'…` | 含 `..` | 换成普通 ID（`t-20261022-nginx`） |
@@ -633,7 +633,7 @@ exec_async`、`msg_send`、`peer_call/peer_add/peer_remove/delegate/group_*`，�
 
 ```json
 {
-  "v": "5.2.7", "kind": "handoff", "thread_id": "th-9c41d0ab",
+  "v": "5.2.0", "kind": "handoff", "thread_id": "th-9c41d0ab",
   "from": "mac", "to": "nas",
   "payload": {
     "goal": "恢复 nas 上 nginx 容器（反复 OOM 重启）",
@@ -655,7 +655,7 @@ exec_async`、`msg_send`、`peer_call/peer_add/peer_remove/delegate/group_*`，�
 
 ```json
 {
-  "v": "5.2.7", "kind": "accept", "thread_id": "th-9c41d0ab",
+  "v": "5.2.0", "kind": "accept", "thread_id": "th-9c41d0ab",
   "from": "nas", "to": "mac",
   "payload": {"accepted": true, "eta_s": 180,
               "note": "先核对内存限制与宿主可用内存，再调整上限"},
@@ -667,7 +667,7 @@ exec_async`、`msg_send`、`peer_call/peer_add/peer_remove/delegate/group_*`，�
 
 ```json
 {
-  "v": "5.2.7", "kind": "progress", "thread_id": "th-9c41d0ab",
+  "v": "5.2.0", "kind": "progress", "thread_id": "th-9c41d0ab",
   "from": "nas", "to": "mac",
   "payload": {"pct": 60, "stage": "restart",
               "message": "内存上限 256m → 1g，正在重启容器",
@@ -680,7 +680,7 @@ exec_async`、`msg_send`、`peer_call/peer_add/peer_remove/delegate/group_*`，�
 
 ```json
 {
-  "v": "5.2.7", "kind": "result", "thread_id": "th-9c41d0ab",
+  "v": "5.2.0", "kind": "result", "thread_id": "th-9c41d0ab",
   "from": "nas", "to": "mac",
   "payload": {
     "status": "success",
@@ -702,7 +702,7 @@ exec_async`、`msg_send`、`peer_call/peer_add/peer_remove/delegate/group_*`，�
 
 ```json
 {
-  "v": "5.2.7", "kind": "review", "thread_id": "th-9c41d0ab",
+  "v": "5.2.0", "kind": "review", "thread_id": "th-9c41d0ab",
   "from": "mac", "to": "nas",
   "payload": {
     "verdict": "pass",
@@ -722,7 +722,7 @@ exec_async`、`msg_send`、`peer_call/peer_add/peer_remove/delegate/group_*`，�
 
 ```json
 {
-  "v": "5.2.7", "kind": "handoff", "thread_id": "th-2b77e1c4",
+  "v": "5.2.0", "kind": "handoff", "thread_id": "th-2b77e1c4",
   "from": "mac", "to": "router",
   "payload": {
     "goal": "检查 router 上防火墙规则是否误拦 8080",
@@ -738,7 +738,7 @@ exec_async`、`msg_send`、`peer_call/peer_add/peer_remove/delegate/group_*`，�
 
 ```json
 {
-  "v": "5.2.7", "kind": "accept", "thread_id": "th-2b77e1c4",
+  "v": "5.2.0", "kind": "accept", "thread_id": "th-2b77e1c4",
   "from": "router", "to": "mac",
   "payload": {"accepted": true, "eta_s": 120},
   "created_ms": 1792601876000
@@ -749,7 +749,7 @@ exec_async`、`msg_send`、`peer_call/peer_add/peer_remove/delegate/group_*`，�
 
 ```json
 {
-  "v": "5.2.7", "kind": "fail", "thread_id": "th-2b77e1c4",
+  "v": "5.2.0", "kind": "fail", "thread_id": "th-2b77e1c4",
   "from": "router", "to": "mac",
   "payload": {
     "reason": "执行 iptables 需要 root，当前 agent 无权限",
@@ -766,7 +766,7 @@ exec_async`、`msg_send`、`peer_call/peer_add/peer_remove/delegate/group_*`，�
 
 ```json
 {
-  "v": "5.2.7", "kind": "review", "thread_id": "th-2b77e1c4",
+  "v": "5.2.0", "kind": "review", "thread_id": "th-2b77e1c4",
   "from": "mac", "to": "router",
   "payload": {
     "verdict": "inconclusive",
@@ -785,7 +785,7 @@ exec_async`、`msg_send`、`peer_call/peer_add/peer_remove/delegate/group_*`，�
 
 ```json
 {
-  "v": "5.2.7", "kind": "handoff", "thread_id": "th-5d0a88e2",
+  "v": "5.2.0", "kind": "handoff", "thread_id": "th-5d0a88e2",
   "from": "mac", "to": "router-2",
   "payload": {
     "goal": "在备用节点复查 8080 拦截规则（同能力备用节点）",
@@ -806,7 +806,7 @@ exec_async`、`msg_send`、`peer_call/peer_add/peer_remove/delegate/group_*`，�
 
 ```json
 {
-  "v": "5.2.7", "kind": "propose", "thread_id": "th-c0ffee31",
+  "v": "5.2.0", "kind": "propose", "thread_id": "th-c0ffee31",
   "from": "mac", "to": "nas",
   "payload": {
     "goal": "今晚 23:00 在 nas 执行全量备份到 /volume2/backup",
@@ -822,7 +822,7 @@ exec_async`、`msg_send`、`peer_call/peer_add/peer_remove/delegate/group_*`，�
 
 ```json
 {
-  "v": "5.2.7", "kind": "counter", "thread_id": "th-c0ffee31",
+  "v": "5.2.0", "kind": "counter", "thread_id": "th-c0ffee31",
   "from": "nas", "to": "mac",
   "payload": {
     "reason": "/volume2 只剩 12%，全量备份会写满",
@@ -841,7 +841,7 @@ exec_async`、`msg_send`、`peer_call/peer_add/peer_remove/delegate/group_*`，�
 
 ```json
 {
-  "v": "5.2.7", "kind": "propose", "thread_id": "th-c0ffee31",
+  "v": "5.2.0", "kind": "propose", "thread_id": "th-c0ffee31",
   "from": "mac", "to": "nas",
   "payload": {
     "goal": "先清理 7 天前的增量备份，再执行全量备份",
@@ -858,7 +858,7 @@ exec_async`、`msg_send`、`peer_call/peer_add/peer_remove/delegate/group_*`，�
 
 ```json
 {
-  "v": "5.2.7", "kind": "accept", "thread_id": "th-c0ffee31",
+  "v": "5.2.0", "kind": "accept", "thread_id": "th-c0ffee31",
   "from": "nas", "to": "mac",
   "payload": {"accepted": true, "eta_s": 900,
               "note": "先清理再备份，完成后回 result"},
@@ -870,7 +870,7 @@ exec_async`、`msg_send`、`peer_call/peer_add/peer_remove/delegate/group_*`，�
 
 ```json
 {
-  "v": "5.2.7", "kind": "result", "thread_id": "th-c0ffee31",
+  "v": "5.2.0", "kind": "result", "thread_id": "th-c0ffee31",
   "from": "nas", "to": "mac",
   "payload": {
     "status": "success",
@@ -907,7 +907,7 @@ exec_async`、`msg_send`、`peer_call/peer_add/peer_remove/delegate/group_*`，�
 
 ## 附：代码映射与测试
 
-| 能力 | 代码位置（fleet_agent.py v5.2.7） |
+| 能力 | 代码位置（fleet_agent.py v5.2.0） |
 |---|---|
 | kind 白名单 | `ENVELOPE_KINDS` |
 | 构造 + 默认值 + 自校验 | `make_envelope()` |
