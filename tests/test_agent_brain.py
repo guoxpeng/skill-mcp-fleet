@@ -312,23 +312,23 @@ class TestEnvelope:
         assert not ok and "v" in error
 
     def test_validate_missing_kind(self):
-        ok, error = fa.validate_envelope({"v": "5.2.4", "thread_id": "th",
+        ok, error = fa.validate_envelope({"v": "5.2.5", "thread_id": "th",
                                           "from": "a", "to": "b", "payload": {}})
         assert not ok and "kind" in error
 
     def test_validate_invalid_kind(self):
-        ok, error = fa.validate_envelope({"v": "5.2.4", "kind": "bogus",
+        ok, error = fa.validate_envelope({"v": "5.2.5", "kind": "bogus",
                                           "thread_id": "th", "from": "a",
                                           "to": "b", "payload": {}})
         assert not ok and "kind" in error
 
     def test_validate_missing_thread(self):
-        ok, error = fa.validate_envelope({"v": "5.2.4", "kind": "propose",
+        ok, error = fa.validate_envelope({"v": "5.2.5", "kind": "propose",
                                           "from": "a", "to": "b", "payload": {}})
         assert not ok and "thread_id" in error
 
     def test_validate_bad_names(self):
-        base = {"v": "5.2.4", "kind": "propose", "thread_id": "th-1",
+        base = {"v": "5.2.5", "kind": "propose", "thread_id": "th-1",
                 "from": "a b", "to": "b", "payload": {}}
         ok, error = fa.validate_envelope(base)
         assert not ok and "from" in error
@@ -342,13 +342,13 @@ class TestEnvelope:
         assert fa.validate_envelope(env)[0]
 
     def test_validate_payload_must_be_dict(self):
-        ok, error = fa.validate_envelope({"v": "5.2.4", "kind": "propose",
+        ok, error = fa.validate_envelope({"v": "5.2.5", "kind": "propose",
                                           "thread_id": "th", "from": "a",
                                           "to": "b", "payload": []})
         assert not ok and "payload" in error
 
     def test_validate_invalid_task_id(self):
-        ok, error = fa.validate_envelope({"v": "5.2.4", "kind": "propose",
+        ok, error = fa.validate_envelope({"v": "5.2.5", "kind": "propose",
                                           "thread_id": "th", "from": "a",
                                           "to": "b", "payload": {},
                                           "task_id": "../x"})

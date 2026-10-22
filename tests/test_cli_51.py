@@ -150,6 +150,10 @@ class TestQRAndJoin:
 
 
 class TestUpdateAndParser:
+    def test_remote_install_url_bypasses_raw_cache(self):
+        # raw.githubusercontent 的 /main/ 路径有 CDN 旧缓存；必须用 refs/heads/main
+        assert "refs/heads/main" in fleet.REMOTE_INSTALL_SH
+
     def _fake_update_env(self, monkeypatch, seen):
         monkeypatch.setattr(fleet, "local_node", lambda *a, **k: {"name": "n",
                                                                   "dir": "/x"})
@@ -158,7 +162,7 @@ class TestUpdateAndParser:
             "data_dir": "/x/data", "service": "nohup"})
         monkeypatch.setattr(fleet, "_installer_path", lambda: "/tmp/i.py")
         monkeypatch.setattr(fleet.subprocess, "call",
-                            lambda argv: seen.append(argv) or 0)
+                            lambda argv, **kw: seen.append(argv) or 0)
 
     def test_update_maps_upgrade(self, monkeypatch):
         seen = []

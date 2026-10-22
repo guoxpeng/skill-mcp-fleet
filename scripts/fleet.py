@@ -63,6 +63,7 @@ import shutil
 import socket
 import subprocess
 import sys
+import tempfile
 import time
 import urllib.error
 import urllib.request
@@ -2353,8 +2354,9 @@ def _local_node_install_info(me):
             "dir": d, "port": port, "data_dir": data_dir, "service": service}
 
 
+# refs/heads/main 路径可绕过 raw.githubusercontent 的 CDN 旧缓存
 REMOTE_INSTALL_SH = ("https://raw.githubusercontent.com/guoxpeng/"
-                     "skill-mcp-fleet/main/scripts/install.sh")
+                     "skill-mcp-fleet/refs/heads/main/scripts/install.sh")
 
 
 def _fetch_remote_installer():
@@ -2369,7 +2371,12 @@ def _fetch_remote_installer():
             data = resp.read()
         if len(data) < 1000 or b"fleet_install.py" not in data:
             return ""
-        fd, path = tempfile.mkstemp(prefix="fleet-install-", suffix=".sh")
+        # Termux/精简系统可能没有可写的 /tmp：优先落到用户 HOME
+        try:
+            fd, path = tempfile.mkstemp(prefix="fleet-install-", suffix=".sh",
+                                        dir=os.path.expanduser("~"))
+        except OSError:
+            fd, path = tempfile.mkstemp(prefix="fleet-install-", suffix=".sh")
         with os.fdopen(fd, "wb") as f:
             f.write(data)
         try:
@@ -2382,7 +2389,7 @@ def _fetch_remote_installer():
 
 
 def cmd_update(a):
-    """v5.2.4: 升级本机节点（默认从远端拉最新发布包；--offline 用本地）。"""
+    """v5.2.5: 升级本机节点（默认从远端拉最新发布包；--offline 用本地）。"""
     installer = _installer_path()
     if not installer:
         return die("找不到 fleet_install.py；请重新下载安装包，或手工执行 "
@@ -2416,8 +2423,16 @@ def cmd_update(a):
     print(dim("    方式: %s" % ("远端最新发布包（SHA256 校验）"
                                 if remote else "本地安装器（离线/下载失败回退）")))
     print(dim("    执行: %s" % " ".join(argv)))
+    env = dict(os.environ)
+    if not env.get("TMPDIR"):
+        tmp = os.path.expanduser("~/.cache/fleet-tmp")
+        try:
+            os.makedirs(tmp, exist_ok=True)
+            env["TMPDIR"] = tmp
+        except OSError:
+            pass
     try:
-        return subprocess.call(argv)
+        return subprocess.call(argv, env=env)
     finally:
         if remote:
             try:
