@@ -8,6 +8,31 @@
 
 ---
 
+---
+
+## [5.2.1] — 2026-10-22 · 修复升级目标解析 / HTTPS 健康检查 / 发布包模板兜底
+
+**v5.2.0 实测暴露的 3 个真实缺陷，已修复并补回归测试。**
+
+### 修复
+- **`fleet update/--rollback` 升级错节点（P0）**：CLI 调用安装器时未传
+  `--name/--dir/--data-dir/--port/--service`，安装器按默认主机名新建了另一个节点，
+  导致健康检查失败、回滚找不到备份。现在 `_local_node_install_info()` 从本机
+  配置/manifest 读取真实目标并显式传入；安装器新增“升级目标不匹配/不存在”拒绝。
+- **自签 TLS 节点健康检查失败（P0）**：`health_check` 只请求 http，而 `--tls auto`
+  实际监听 https，导致安装成功但健康检查 401/重置。现在按 TLS 状态使用 https +
+  自签证书校验豁免（仅本机回环）；同时把 `tls_cert/tls_key` 写回配置，
+  `fleet status/ask/doctor` 也能识别 https 与自签证书。
+- **发布包缺 service-templates 导致跨平台安装失败（P0）**：Release 包只带 3 个
+  模板，OpenWrt/Termux/Windows/nohup 等适配器报“缺少模板”。现在
+  `fleet_install.py` 内置 10 个模板兜底，发布包不带 templates 也能全平台安装。
+
+### 测试
+- 全量 **605 passed + 1 skipped**；新增升级目标不匹配/不存在、CLI 更新参数、
+  HTTPS 健康检查覆盖。
+
+---
+
 ## [5.2.0] — 2026-10-22 · 体验增强：安全默认 / 全局命令 / 升级回滚 / Dashboard 2.0 / 自然语言入口
 
 **主题：让普通用户第一次就能装对、连上、看懂、升级。**

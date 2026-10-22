@@ -150,21 +150,32 @@ class TestQRAndJoin:
 
 
 class TestUpdateAndParser:
-    def test_update_maps_upgrade(self, monkeypatch):
-        seen = []
+    def _fake_update_env(self, monkeypatch, seen):
+        monkeypatch.setattr(fleet, "local_node", lambda *a, **k: {"name": "n",
+                                                                  "dir": "/x"})
+        monkeypatch.setattr(fleet, "_local_node_install_info", lambda me: {
+            "name": "n", "dir": "/x", "port": 3100,
+            "data_dir": "/x/data", "service": "nohup"})
         monkeypatch.setattr(fleet, "_installer_path", lambda: "/tmp/i.py")
         monkeypatch.setattr(fleet.subprocess, "call",
                             lambda argv: seen.append(argv) or 0)
-        assert fleet.cmd_update(ns(rollback=False, json=True)) == 0
+
+    def test_update_maps_upgrade(self, monkeypatch):
+        seen = []
+        self._fake_update_env(monkeypatch, seen)
+        assert fleet.cmd_update(ns(rollback=False, json=True,
+                                   self_url=None, timeout=10)) == 0
         assert "--upgrade" in seen[0] and "--json" in seen[0]
+        assert "--name" in seen[0] and "/x" in seen[0]
+        assert "--service" in seen[0]
 
     def test_update_maps_rollback(self, monkeypatch):
         seen = []
-        monkeypatch.setattr(fleet, "_installer_path", lambda: "/tmp/i.py")
-        monkeypatch.setattr(fleet.subprocess, "call",
-                            lambda argv: seen.append(argv) or 0)
-        assert fleet.cmd_update(ns(rollback=True, json=False)) == 0
+        self._fake_update_env(monkeypatch, seen)
+        assert fleet.cmd_update(ns(rollback=True, json=False,
+                                   self_url=None, timeout=10)) == 0
         assert "--rollback" in seen[0]
+        assert "/x/data" in seen[0]
 
     def test_parser_new_commands(self):
         parser = fleet.build_parser()

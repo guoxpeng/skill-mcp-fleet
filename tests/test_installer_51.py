@@ -1106,7 +1106,7 @@ def test_service_command_table():
 def test_health_check_retry_then_success(monkeypatch):
     calls = {"n": 0}
 
-    def fake(port, token=None, timeout=3.0, host="127.0.0.1"):
+    def fake(port, token=None, timeout=3.0, host="127.0.0.1", **kw):
         calls["n"] += 1
         ok = calls["n"] >= 2
         return {"ok": ok, "url": "http://x:%d/health" % port}
@@ -1544,7 +1544,7 @@ def test_install_sh_no_crlf():
 # 13. 常量与适配器表
 # ===========================================================================
 def test_version_and_adapter_registry():
-    assert fi.VERSION == "5.2.0"
+    assert fi.VERSION == "5.2.1"
     assert set(fi.ADAPTERS) == set(fi.SERVICE_KEYS) - {"auto"}
     for key, cls in fi.ADAPTERS.items():
         assert cls.key == key
@@ -1655,3 +1655,19 @@ def test_rollback_without_backup(tmp_path):
     result = fi.rollback(opts)
     assert result["ok"] is False
     assert any("没有可用备份" in e for e in result["errors"])
+
+
+def test_upgrade_refuses_wrong_target(tmp_path):
+    opts = make_opts(tmp_path, name="real-node")
+    assert fi.install(opts)["ok"] is True
+    wrong = dict(opts, name="other-node", upgrade=True)
+    result = fi.install(wrong)
+    assert result["ok"] is False
+    assert any("不匹配" in e for e in result["errors"])
+
+
+def test_upgrade_without_install_refused(tmp_path):
+    opts = make_opts(tmp_path, name="missing", upgrade=True)
+    result = fi.install(opts)
+    assert result["ok"] is False
+    assert any("没有可升级" in e for e in result["errors"])

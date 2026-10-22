@@ -55,7 +55,7 @@ import sys
 import time
 import urllib.request
 
-VERSION = "5.2.0"
+VERSION = "5.2.1"
 
 # 节点程序（安装时必须拷到安装目录，mcp_agent.py 从自己所在目录读配置）
 NODE_FILES = ["mcp_agent.py", "fleet_proto.py", "dashboard_html.py", "fleet.py"]
@@ -841,6 +841,21 @@ def _extra_agent_args(opts):
 _TOKEN_RE = re.compile(r"\{\{([A-Z0-9_]+)\}\}")
 
 
+# v5.2: 内置模板兜底（发布包不携带 templates 时仍能在所有平台安装）
+_BUILTIN_TEMPLATES = {
+    'Dockerfile': '# MCP Fleet 节点镜像（纯标准库，无需 pip 依赖）\n# 构建（仓库根目录）：docker build -f scripts/service-templates/Dockerfile -t mcp-fleet:{{VERSION}} .\n# 运行：docker run -d --name mcp-fleet -p 3100:3100 --restart unless-stopped \\\n#         --security-opt no-new-privileges:true --cap-drop ALL mcp-fleet:{{VERSION}}\nFROM python:3.12-alpine\n\n# tini 做 PID 1：正确转发信号给 python（否则 docker stop 等 10s 才 SIGKILL）\n# curl 供健康检查与人工排障；纯标准库运行不需要 pip\nRUN apk add --no-cache tini curl\n\nWORKDIR /app\n{{COPY_NODE_LINE}}\nCOPY {{COPY_CONFIG_LINE}} ./mcp_agent_config.example.json\n\nEXPOSE {{PORT}}\n# 容器内以 root 运行（exec 工具需要），加固靠 no-new-privileges/cap-drop/read-only\nHEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \\\n  CMD python3 -c "import sys,urllib.request;sys.exit(0 if urllib.request.urlopen(\'http://127.0.0.1:{{PORT}}/health\',timeout=3).status==200 else 1)"\n\nENTRYPOINT ["/sbin/tini", "--"]\nCMD ["python3", "-u", "/app/mcp_agent.py", "--host", "0.0.0.0", "--port", "{{PORT}}"]\n',
+    'check-deps.sh': '#!/bin/sh\n# MCP Fleet 离线包依赖检查（POSIX sh；只检查，不自动安装）\n# 用法：sh check-deps.sh\n# 退出码：0 = 依赖齐全；1 = 缺少必需依赖（会打印对应安装命令）\nset -u\nMISSING=0\n\nhave() { command -v "$1" >/dev/null 2>&1; }\n\nsay() { printf \'%s\\n\' "$*"; }\n\nos_hint() {\n    if [ -n "${PREFIX:-}" ] && printf \'%s\' "$PREFIX" | grep -q com.termux; then\n        say "  pkg update && pkg install python"\n    elif [ -f /etc/openwrt_release ]; then\n        say "  opkg update && opkg install python3-light python3-urllib"\n    elif [ -f /etc/alpine-release ]; then\n        say "  apk add python3"\n    elif [ -f /etc/debian_version ]; then\n        say "  apt-get update && apt-get install -y python3"\n    elif [ -f /etc/redhat-release ]; then\n        say "  dnf install -y python3"\n    elif [ "$(uname -s 2>/dev/null)" = "Darwin" ]; then\n        say "  xcode-select --install   # 或 brew install python3"\n    else\n        say "  请用系统包管理器安装 Python 3.6+"\n    fi\n}\n\nsay "MCP Fleet 依赖检查"\nsay "------------------"\n\nif have python3; then\n    if python3 -c \'import sys;raise SystemExit(0 if sys.version_info>=(3,6) else 1)\' 2>/dev/null; then\n        say "[ok] python3: $(python3 -V 2>&1)"\n    else\n        say "[!!] python3 版本过低（需要 3.6+）：$(python3 -V 2>&1)"\n        os_hint\n        MISSING=1\n    fi\nelse\n    say "[!!] 缺少 python3"\n    os_hint\n    MISSING=1\nfi\n\nif have tar; then say "[ok] tar"; else say "[!!] 缺少 tar（解包离线包需要）"; MISSING=1; fi\n\n# 下载工具仅在在线安装时需要\nif have curl || have wget; then\n    say "[ok] curl/wget"\nelse\n    say "[!!] 缺少 curl 或 wget（联网安装需要）"\n    MISSING=1\nfi\n\n# 校验工具：sha256sum / shasum / openssl / python3 任一即可\nif have sha256sum || have shasum || have openssl; then\n    say "[ok] SHA256 校验工具"\nelif have python3; then\n    say "[ok] SHA256 校验工具（python3 兜底）"\nelse\n    say "[!!] 缺少 SHA256 校验工具"\n    MISSING=1\nfi\n\nif [ "$MISSING" -eq 0 ]; then\n    say "------------------"\n    say "依赖齐全，可以安装：sh install.sh --offline <本目录> --name <名字> --port <端口>"\n    exit 0\nfi\nsay "------------------"\nsay "请先补齐上面的依赖再安装。"\nexit 1\n',
+    'com.mcpfleet.node.plist': '<?xml version="1.0" encoding="UTF-8"?>\n<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">\n<!-- MCP Fleet 节点 {{DISPLAY_NAME}}（launchd：RunAtLoad 开机自启 + KeepAlive 崩溃重拉） -->\n<plist version="1.0">\n<dict>\n    <key>Label</key>\n    <string>{{LAUNCHD_LABEL}}</string>\n    <key>ProgramArguments</key>\n    <array>\n        <string>{{PYTHON}}</string>\n        <string>-u</string>\n        <string>{{AGENT_PATH}}</string>\n        <string>--host</string>\n        <string>{{HOST}}</string>\n        <string>--port</string>\n        <string>{{PORT}}</string>{{EXTRA_PLIST_ARGS}}\n    </array>\n    <key>WorkingDirectory</key>\n    <string>{{INSTALL_DIR}}</string>\n    <key>RunAtLoad</key>\n    <true/>\n    <key>KeepAlive</key>\n    <true/>\n    <key>ThrottleInterval</key>\n    <integer>10</integer>\n    <key>ProcessType</key>\n    <string>Background</string>\n    <key>Umask</key>\n    <integer>63</integer>\n    <key>StandardOutPath</key>\n    <string>{{LOG_DIR}}/agent.log</string>\n    <key>StandardErrorPath</key>\n    <string>{{LOG_DIR}}/agent.log</string>\n{{USERNAME_BLOCK}}\n</dict>\n</plist>\n',
+    'fleet-compose.yml': '# MCP Fleet 节点 {{DISPLAY_NAME}} —— Docker / docker compose 部署\n# 用法（在本目录）：docker compose -f fleet-compose.yml up -d\n# 开机自启由 restart: unless-stopped 保证（宿主机 Docker 服务自启即可）\nservices:\n  fleet:\n    build:\n      context: .\n      dockerfile: Dockerfile\n    image: {{IMAGE_TAG}}\n    container_name: {{UNIT_LABEL}}\n    restart: unless-stopped\n    ports:\n      - "{{PORT}}:{{PORT}}"\n    volumes:\n      - "{{DATA_DIR}}:/data"\n      - "{{INSTALL_DIR}}:/app"\n    working_dir: /app\n    environment:\n      - MCP_FLEET_NAME={{DISPLAY_NAME}}\n      - MCP_FLEET_PORT={{PORT}}\n      - MCP_FLEET_DATA=/data\n    command: ["python3", "-u", "/app/mcp_agent.py", "--host", "{{HOST}}", "--port", "{{PORT}}"]\n    # ---- 容器加固 ----\n    security_opt:\n      - no-new-privileges:true\n    cap_drop:\n      - ALL\n    read_only: true\n    tmpfs:\n      - /tmp:rw,noexec,nosuid,size=64m\n    healthcheck:\n      test: ["CMD", "python3", "-c", "import sys,urllib.request;sys.exit(0 if urllib.request.urlopen(\'http://127.0.0.1:{{PORT}}/health\',timeout=3).status==200 else 1)"]\n      interval: 30s\n      timeout: 5s\n      retries: 3\n      start_period: 15s\n    logging:\n      driver: json-file\n      options:\n        max-size: "10m"\n        max-file: "3"\n',
+    'fleet.nohup': '#!/bin/sh\n# MCP Fleet 节点 {{DISPLAY_NAME}} 控制脚本（无服务管理器时的降级方案）\n# 用法：sh {{CTL_PATH}} start|stop|restart|status|log\nset -eu\nNAME="{{UNIT_LABEL}}"\nDIR="{{INSTALL_DIR}}"\nPY={{CMD_PYTHON}}\nAGENT={{CMD_AGENT}}\nPORT="{{PORT}}"\nPIDF="{{PID_FILE}}"\nLOG="{{LOG_DIR}}/agent.log"\n\nstart() {\n    if status >/dev/null 2>&1; then\n        echo "[$NAME] 已在运行 (pid $(cat "$PIDF"))"\n        return 0\n    fi\n    mkdir -p "$(dirname "$PIDF")" "$(dirname "$LOG")"\n    cd "$DIR"\n    nohup "$PY" -u "$AGENT" --host {{HOST}} --port "$PORT"{{EXTRA_ARGS}} >>"$LOG" 2>&1 &\n    echo $! > "$PIDF"\n    echo "[$NAME] 已启动 (pid $(cat "$PIDF"))，日志: $LOG"\n}\n\nstop() {\n    if [ -f "$PIDF" ]; then\n        PID="$(cat "$PIDF" 2>/dev/null || echo)"\n        if [ -n "$PID" ] && kill -0 "$PID" 2>/dev/null; then\n            kill "$PID" 2>/dev/null || true\n            sleep 1\n            kill -9 "$PID" 2>/dev/null || true\n            echo "[$NAME] 已停止 (pid $PID)"\n        fi\n        rm -f "$PIDF"\n    else\n        echo "[$NAME] 未运行"\n    fi\n}\n\nstatus() {\n    if [ -f "$PIDF" ]; then\n        PID="$(cat "$PIDF" 2>/dev/null || echo)"\n        if [ -n "$PID" ] && kill -0 "$PID" 2>/dev/null; then\n            echo "[$NAME] 运行中 (pid $PID)"\n            return 0\n        fi\n    fi\n    echo "[$NAME] 未运行"\n    return 1\n}\n\ncase "${1:-status}" in\n    start) start ;;\n    stop) stop ;;\n    restart) stop; start ;;\n    status) status ;;\n    log) tail -n "${2:-40}" "$LOG" ;;\n    *) echo "用法: sh $0 {start|stop|restart|status|log [n]}"; exit 2 ;;\nesac\n',
+    'fleet.openrc': '#!/sbin/openrc-run\n# MCP Fleet 节点 {{DISPLAY_NAME}}（OpenRC：Alpine / Gentoo）\n# 安装：install -m755 fleet.openrc /etc/init.d/{{UNIT_LABEL}} && rc-update add {{UNIT_LABEL}} default\nname="{{UNIT_LABEL}}"\ndescription="MCP Fleet 节点 {{DISPLAY_NAME}}（HTTP {{PORT}}）"\ncommand={{CMD_PYTHON}}\ncommand_args="-u {{CMD_AGENT}} --host {{HOST}} --port {{PORT}}{{EXTRA_ARGS}}"\ndirectory="{{INSTALL_DIR}}"\ncommand_user="{{SERVICE_USER}}"\ncommand_background="yes"\npidfile="/run/{{UNIT_LABEL}}.pid"\noutput_log="{{LOG_DIR}}/agent.log"\nerror_log="{{LOG_DIR}}/agent.err.log"\n\n# supervise-daemon = OpenRC 的 Restart=always 等价物（崩溃 3 秒后重拉，无限次）\nsupervisor="supervise-daemon"\nrespawn_delay=3\nrespawn_max=0\n\ndepend() {\n    need net\n    after firewall\n}\n',
+    'fleet.procd': '#!/bin/sh /etc/rc.common\n# MCP Fleet 节点 {{DISPLAY_NAME}}（OpenWrt procd：respawn 自动重启）\n# 安装：cp fleet.procd /etc/init.d/{{UNIT_LABEL}} && chmod 755 /etc/init.d/{{UNIT_LABEL}}\n#       /etc/init.d/{{UNIT_LABEL}} enable && /etc/init.d/{{UNIT_LABEL}} start\nUSE_PROCD=1\nSTART=99\nSTOP=10\n\nstart_service() {\n    procd_open_instance "mcp-fleet"\n    procd_set_param command {{CMD_PYTHON}} -u {{CMD_AGENT}} --host {{HOST}} --port {{PORT}}{{EXTRA_ARGS}}\n    # respawn <阈值秒> <重试次数> <重试窗口秒>：崩溃后 5s 重拉，无限次\n    procd_set_param respawn 3600 5 5\n    procd_set_param stdout 1\n    procd_set_param stderr 1\n    procd_set_param file "{{CONFIG_PATH}}"\n    procd_set_param limits nofile="4096 4096"\n    procd_set_param user "{{SERVICE_USER}}"\n    procd_set_param group "{{SERVICE_GROUP}}"\n    procd_close_instance\n}\n\nstop_service() {\n    procd_kill "mcp-fleet" 2>/dev/null\n}\n',
+    'fleet.schtasks.xml': '<?xml version="1.0" encoding="UTF-8"?>\n<!-- MCP Fleet 节点 {{DISPLAY_NAME}}（Windows 计划任务：登录自启 + 失败重拉）\n     注册：schtasks /Create /F /TN "{{TASK_NAME}}" /XML "{{UNIT_PATH}}"\n     删除：schtasks /Delete /F /TN "{{TASK_NAME}}" -->\n<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">\n  <RegistrationInfo>\n    <Author>MCP Fleet {{VERSION}}</Author>\n    <Description>MCP Fleet 节点 {{DISPLAY_NAME}}（HTTP {{PORT}}）</Description>\n  </RegistrationInfo>\n  <Triggers>\n    <LogonTrigger>\n      <Enabled>true</Enabled>\n    </LogonTrigger>\n    <BootTrigger>\n      <Enabled>true</Enabled>\n      <Delay>PT30S</Delay>\n    </BootTrigger>\n  </Triggers>\n  <Principals>\n    <Principal id="Author">\n      <RunLevel>HighestAvailable</RunLevel>\n      <LogonType>InteractiveToken</LogonType>\n    </Principal>\n  </Principals>\n  <Settings>\n    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>\n    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>\n    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>\n    <AllowHardTerminate>true</AllowHardTerminate>\n    <StartWhenAvailable>true</StartWhenAvailable>\n    <ExecutionTimeLimit>PT0S</ExecutionTimeLimit>\n    <Enabled>true</Enabled>\n    <Hidden>true</Hidden>\n    <RestartOnFailure>\n      <Interval>PT1M</Interval>\n      <Count>999</Count>\n    </RestartOnFailure>\n    <IdleSettings>\n      <StopOnIdleEnd>false</StopOnIdleEnd>\n      <RestartOnIdle>false</RestartOnIdle>\n    </IdleSettings>\n  </Settings>\n  <Actions Context="Author">\n    <Exec>\n      <Command>{{CMD_PYTHON_WIN}}</Command>\n      <Arguments>-u "{{AGENT_PATH}}" --host {{HOST}} --port {{PORT}}{{EXTRA_ARGS_WIN}}</Arguments>\n      <WorkingDirectory>{{INSTALL_DIR}}</WorkingDirectory>\n    </Exec>\n  </Actions>\n</Task>\n',
+    'fleet.service': '[Unit]\nDescription=MCP Fleet 节点 {{DISPLAY_NAME}}（HTTP {{PORT}}，v{{VERSION}}）\nDocumentation=https://github.com/mcp-fleet/mcp-fleet\nAfter=network-online.target\nWants=network-online.target\n# 常驻服务应当一直重试：关闭 systemd 的启动频率限制\nStartLimitIntervalSec=0\n\n[Service]\nType=simple\nWorkingDirectory={{INSTALL_DIR}}\nExecStart={{CMD_PYTHON}} -u {{CMD_AGENT}} --host {{HOST}} --port {{PORT}}{{EXTRA_ARGS}}\nRestart=always\nRestartSec=3\nTimeoutStopSec=10\nKillMode=mixed\nStandardOutput=append:{{LOG_DIR}}/agent.log\nStandardError=append:{{LOG_DIR}}/agent.log\nUMask=0077\n{{USER_LINE}}\n{{HOME_LINE}}\n{{WATCHDOG_LINE}}\n\n# ---- 安全加固（v5.1 契约：只允许写数据/日志/安装目录，其余只读）----\nNoNewPrivileges=yes\nPrivateTmp=yes\nProtectSystem=strict\nProtectKernelTunables=yes\nProtectKernelModules=yes\nProtectControlGroups=yes\nRestrictSUIDSGID=yes\nLockPersonality=yes\nRestrictRealtime=yes\nSystemCallArchitectures=native\nReadWritePaths={{INSTALL_DIR}} {{DATA_DIR}} {{LOG_DIR}}\n\n[Install]\nWantedBy=multi-user.target\n',
+    'fleet.termux': '#!/data/data/com.termux/files/usr/bin/sh\n# MCP Fleet 节点 {{DISPLAY_NAME}}（Termux：sv 托管 + 唤醒锁）\n# 安装位置：$PREFIX/var/service/{{UNIT_LABEL}}/run（需 pkg install termux-services）\n# 开机自启需要另外安装 Termux:Boot 插件，并把本脚本的启动命令放进 ~/.termux/boot/\n# 先拿唤醒锁：Android 冻结后台进程会导致节点失联\ncommand -v termux-wake-lock >/dev/null 2>&1 && termux-wake-lock || true\nexec 2>&1\nexec {{CMD_PYTHON}} -u {{CMD_AGENT}} --host {{HOST}} --port {{PORT}}{{EXTRA_ARGS}}\n',
+}
+
+
 def load_template(name):
     """读取 service-templates/<name>；缺失时抛可读错误。"""
     path = os.path.join(TEMPLATE_DIR, name)
@@ -848,6 +863,9 @@ def load_template(name):
         with open(path, "r", encoding="utf-8") as fh:
             return fh.read()
     except OSError as exc:
+        # 发布包可能只带核心文件：用内置模板兜底，保证全平台可安装
+        if name in _BUILTIN_TEMPLATES:
+            return _BUILTIN_TEMPLATES[name]
         raise InstallerError("缺少服务模板 %s（%s）" % (path, exc))
 
 
@@ -2009,14 +2027,27 @@ def _manifest_paths(manifest, opts, platform):
 # ---------------------------------------------------------------------------
 # 健康检查
 # ---------------------------------------------------------------------------
-def _health_once(port, token=None, timeout=3.0, host="127.0.0.1"):
+def _ssl_unverified():
+    """健康检查用：接受自签证书（只连 127.0.0.1，不校验主机名）。"""
+    import ssl
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    return ctx
+
+
+def _health_once(port, token=None, timeout=3.0, host="127.0.0.1",
+                 scheme="http"):
     """单次 GET /health，返回结构化结果（不抛异常）。"""
-    url = "http://%s:%d/health" % (host, int(port))
+    url = "%s://%s:%d/health" % (scheme, host, int(port))
     request = urllib.request.Request(url)
     if token:
         request.add_header("Authorization", "Bearer " + token)
     # 强制禁代理：本机代理软件可能把回环请求转走，误判节点宕机
-    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    handlers = [urllib.request.ProxyHandler({})]
+    if scheme == "https":
+        handlers.append(urllib.request.HTTPSHandler(context=_ssl_unverified()))
+    opener = urllib.request.build_opener(*handlers)
     try:
         response = opener.open(request, timeout=timeout)
         try:
@@ -2041,17 +2072,18 @@ def _health_once(port, token=None, timeout=3.0, host="127.0.0.1"):
 
 
 def health_check(port, token=None, attempts=3, timeout=3.0, host="127.0.0.1",
-                 backoff=None):
-    """HTTP /health 健康检查：最多 attempts 次，指数退避。
+                 backoff=None, scheme="http"):
+    """HTTP(S) /health 健康检查：最多 attempts 次，指数退避。
 
     返回 {"ok","attempts","url","last","history"}；全失败也不抛异常。
     """
     backoff = backoff or (0.5, 1.0, 2.0)
     history = []
-    last = {"ok": False, "url": "http://%s:%d/health" % (host, int(port))}
+    last = {"ok": False, "url": "%s://%s:%d/health" % (scheme, host, int(port))}
     total = max(1, int(attempts))
     for attempt in range(1, total + 1):
-        last = _health_once(port, token=token, timeout=timeout, host=host)
+        last = _health_once(port, token=token, timeout=timeout, host=host,
+                            scheme=scheme)
         last["attempt"] = attempt
         history.append(last)
         if last.get("ok"):
@@ -2061,7 +2093,7 @@ def health_check(port, token=None, attempts=3, timeout=3.0, host="127.0.0.1",
             delay = backoff[min(attempt - 1, len(backoff) - 1)]
             _sleep(delay)
     return {"ok": False, "attempts": total,
-            "url": "http://%s:%d/health" % (host, int(port)),
+            "url": "%s://%s:%d/health" % (scheme, host, int(port)),
             "last": last, "history": history}
 
 
@@ -2270,8 +2302,15 @@ def rollback(opts=None):
         start = adapter.start()
         result["start"] = start
         port = int((manifest or {}).get("port") or opts.get("port") or DEFAULT_PORT)
+        _cfg2 = {}
+        try:
+            import json as _json
+            _cfg2 = _json.loads(_read_text(paths["config_path"], limit=1 << 20))
+        except Exception:
+            pass
         health = health_check(port, token=_read_token(paths["config_path"]),
-                              attempts=3)
+                              attempts=3,
+                              scheme="https" if _cfg2.get("tls_cert") else "http")
         result["health"] = health
         result["ok"] = bool(start.get("ok")) and bool(health.get("ok"))
         result["backup_used"] = backup
@@ -2325,6 +2364,24 @@ def install(opts=None):
         "next_steps": [],
         "manifest": paths["manifest_path"],
     }
+
+    # v5.2.1: 升级必须指向真实存在的同一节点，避免“升级成另一个默认节点”
+    if opts.get("upgrade") and not dry:
+        if not _exists(paths["config_path"]):
+            result["errors"].append(
+                "没有可升级的安装：%s 不存在（请确认 --name/--dir）"
+                % paths["config_path"])
+            return result
+        try:
+            _old = json.loads(_read_text(paths["config_path"], limit=1 << 20))
+        except Exception:
+            _old = {}
+        if _old.get("name") and _old.get("name") != opts.get("name"):
+            result["errors"].append(
+                "目标节点不匹配：安装目录属于 %r，但本次 --name=%r；"
+                "请用 fleet update（自动识别）或显式传对 --name/--dir"
+                % (_old.get("name"), opts.get("name")))
+            return result
 
     upgrade_backup = None
     if opts.get("upgrade") and not dry and _exists(paths["config_path"]):
@@ -2422,6 +2479,13 @@ def install(opts=None):
     tls = _setup_tls(opts, platform, paths)
     result["tls"] = tls
     result["warnings"].extend(tls.get("warnings") or [])
+    if tls.get("enabled") and tls.get("cert"):
+        # 写回配置：CLI 需要据此判断 https，fleet status/ask 才能连上
+        cfg["tls_cert"] = tls["cert"]
+        cfg["tls_key"] = tls["key"]
+        _atomic_write(paths["config_path"],
+                      json.dumps(cfg, ensure_ascii=False, indent=2), 0o600)
+        result["config"] = _redact_config(cfg)
 
     # 8) 服务单元
     unit_written = []
@@ -2460,8 +2524,10 @@ def install(opts=None):
         else:
             # 11) 健康检查（3 次退避）
             token = str(cfg.get("auth_token") or "")
+            _scheme = "https" if (result.get("tls") or {}).get("enabled") else "http"
             health = health_check(int(opts.get("port") or DEFAULT_PORT),
-                                 token=token or None, attempts=3)
+                                 token=token or None, attempts=3,
+                                 scheme=_scheme)
             result["health"] = health
             if not health.get("ok"):
                 result["errors"].append(
@@ -2506,7 +2572,14 @@ def status(opts=None):
     port = int((manifest or {}).get("port") or opts.get("port") or DEFAULT_PORT)
     health = None
     if installed:
-        health = _health_once(port, token=_read_token(paths["config_path"]))
+        _cfg = {}
+        try:
+            _cfg = json.loads(_read_text(paths["config_path"], limit=1 << 20))
+        except Exception:
+            pass
+        _scheme = "https" if _cfg.get("tls_cert") else "http"
+        health = _health_once(port, token=_read_token(paths["config_path"]),
+                              scheme=_scheme)
     pid_text = _read_text(paths["pid_file"], limit=32).strip()
     result = {
         "ok": True,

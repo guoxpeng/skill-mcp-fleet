@@ -161,6 +161,6 @@ X-Fleet-Sig:   base64(Ed25519("fleet1|METHOD|PATH|ts|nonce|sha256(body)"))
 
 ## 9. 版本与兼容
 
-- MCP `protocolVersion` 2024-11-05；节点 `SERVER_VERSION` 5.2.0。
+- MCP `protocolVersion` 2024-11-05；节点 `SERVER_VERSION` 5.2.1。
 - 协议字段新增保持向后兼容（未知字段忽略）；v5 节点可与 v5.2 混跑。
 - 关闭 `compat_v5` 后仅接受签名请求；升级路径见 CHANGELOG。

@@ -1202,7 +1202,7 @@ class TestCompatibility:
     """版本常量与 Python 3.6 语法兼容。"""
 
     def test_version(self):
-        assert core.VERSION == "5.2.0"
+        assert core.VERSION == "5.2.1"
 
     def test_python36_syntax(self):
         source_path = core.__file__

@@ -135,9 +135,17 @@ def _opener_for(url):
         direct = direct or ip.is_private or ip.is_loopback or ip.is_link_local
     except ValueError:
         pass
+    import ssl
+    handlers = []
     if direct:
-        return urllib.request.build_opener(urllib.request.ProxyHandler({}))
-    return urllib.request.build_opener()
+        handlers.append(urllib.request.ProxyHandler({}))
+    if urllib.parse.urlsplit(url).scheme == "https":
+        # 局域网节点常为自签证书：只在本机客户端接受（不降低对公网证书的校验）
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+        handlers.append(urllib.request.HTTPSHandler(context=ctx))
+    return urllib.request.build_opener(*handlers)
 
 
 class MCPError(Exception):
@@ -698,6 +706,17 @@ def cmd_probe(a):
 
 
 def cmd_doctor(a):
+    if not getattr(a, "target", None):
+        got = _local_mcp(a)
+        if not got:
+            return die("本机没有运行中的节点；请给 target，或先安装节点后运行 fleet doctor")
+        me, client = got
+        try:
+            text, is_err = client.call("fleet_doctor", {}, timeout=a.timeout)
+        except MCPError as e:
+            return die("本机自检失败：%s" % e)
+        print(text)
+        return 1 if is_err else 0
     url, meta = resolve_target(a.target, a.agent, a.port)
     base = base_of(url)
     host, _, port = base.split("//", 1)[-1].partition("/")[0].partition(":")
@@ -1545,10 +1564,13 @@ def local_node(self_url=None):
             return open(os.path.join(d, fn), encoding="utf-8").read().strip()
         except Exception:
             return ""
+    _scheme = "https" if cfg.get("tls_cert") else "http"
     url = (self_url or cfg.get("self_url") or _read("current_url.txt") or "").strip()
+    if url.startswith("http://") and _scheme == "https":
+        url = "https://" + url[len("http://"):]
     if not url:
         _port = _read("port.txt") or str(cfg.get("port") or "3100")
-        url = "http://%s:%s" % (_lan_ip(), _port)
+        url = "%s://%s:%s" % (_scheme, _lan_ip(), _port)
     url = url.rstrip("/")
     if not re.search(r"/(mcp|sse)$", url):
         url += "/mcp"
@@ -2081,7 +2103,7 @@ def _http_json(url, token="", timeout=10):
     req = _ur.Request(url)
     if token:
         req.add_header("Authorization", "Bearer " + token)
-    with _ur.urlopen(req, timeout=timeout) as resp:
+    with _opener_for(url).open(req, timeout=timeout) as resp:
         return json.loads(resp.read().decode("utf-8"))
 
 
@@ -2175,7 +2197,7 @@ def cmd_metrics(a):
     if me.get("token"):
         req.add_header("Authorization", "Bearer " + me["token"])
     try:
-        with _ur.urlopen(req, timeout=10) as resp:
+        with _opener_for(base).open(req, timeout=10) as resp:
             sys.stdout.write(resp.read().decode("utf-8"))
     except Exception as e:
         return die("读取指标失败：%s" % e)
@@ -2296,16 +2318,62 @@ def _installer_path():
     return ""
 
 
+def _local_node_install_info(me):
+    """从本机节点配置/manifest 推出升级所需的 name/dir/port/data-dir/service。"""
+    d = me.get("dir") or ""
+    cfg = {}
+    try:
+        cfg = load_json_config(os.path.join(d, "mcp_agent_config.json"))
+    except Exception:
+        cfg = {}
+    manifest = {}
+    candidates = []
+    if cfg.get("data_dir"):
+        candidates.append(os.path.join(cfg["data_dir"], "manifest.json"))
+    candidates.append(os.path.join(d, "data", "manifest.json"))
+    candidates.append(os.path.join(d, ".fleet-manifest.json"))
+    for cand in candidates:
+        try:
+            with open(cand, encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data.get("manifest_path"), str):   # pointer 文件
+                with open(data["manifest_path"], encoding="utf-8") as f2:
+                    data = json.load(f2)
+            if isinstance(data, dict) and (data.get("install_dir") or data.get("version")):
+                manifest = data
+                break
+        except Exception:
+            continue
+    port = cfg.get("port") or manifest.get("port") or 3100
+    data_dir = cfg.get("data_dir") or manifest.get("data_dir") or os.path.join(d, "data")
+    service = manifest.get("service") or ""
+    return {"name": me.get("name") or cfg.get("name") or "",
+            "dir": d, "port": port, "data_dir": data_dir, "service": service}
+
+
 def cmd_update(a):
-    """v5.2: 升级 / 回滚本机节点（调用统一安装器）。"""
+    """v5.2: 升级 / 回滚本机节点（调用统一安装器，显式传目标节点参数）。"""
     installer = _installer_path()
     if not installer:
         return die("找不到 fleet_install.py；请重新下载安装包，或手工执行 "
                    "python3 scripts/fleet_install.py --upgrade")
+    me = local_node(getattr(a, "self_url", None))
+    if not me:
+        return die("本机没有已安装的节点；fleet update 只用于升级/回滚本机节点")
+    info = _local_node_install_info(me)
+    if not info.get("name") or not info.get("dir"):
+        return die("无法确定本机节点信息（name/dir）；请检查安装目录与配置")
     argv = [sys.executable, installer,
-            "--rollback" if getattr(a, "rollback", False) else "--upgrade"]
+            "--rollback" if getattr(a, "rollback", False) else "--upgrade",
+            "--name", info["name"], "--port", str(info["port"]),
+            "--dir", info["dir"], "--data-dir", info["data_dir"]]
+    if info.get("service"):
+        argv += ["--service", info["service"]]
     if getattr(a, "json", False):
         argv.append("--json")
+    print(dim("    目标节点: %s (%s, port %s, service %s)"
+              % (info["name"], info["dir"], info["port"],
+                 info.get("service") or "auto")))
     print(dim("    执行: %s" % " ".join(argv)))
     return subprocess.call(argv)
 
@@ -2546,7 +2614,10 @@ def build_parser():
 
     common(sub.add_parser("tools", help="列副端工具清单")).set_defaults(func=cmd_tools)
     common(sub.add_parser("probe", help="连通性 + 握手 + 试调（只读）")).set_defaults(func=cmd_probe)
-    sp = common(sub.add_parser("doctor", help="完整链路体检"))
+    sp = common(sub.add_parser("doctor", help="完整链路体检；不带 target 时做本机自检"),
+                need_target=False)
+    sp.add_argument("target", nargs="?", default=None,
+                    help="副端名字/地址；省略则检查本机节点")
     sp.add_argument("--check-banner", action="store_true",
                     help="额外检测登录 shell 是否往每次返回里塞欢迎横幅")
     sp.add_argument("--dir", help="副端安装目录（默认 /opt/<name>_mcp）")
