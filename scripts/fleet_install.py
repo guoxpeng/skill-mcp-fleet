@@ -55,7 +55,7 @@ import sys
 import time
 import urllib.request
 
-VERSION = "5.2.1"
+VERSION = "5.2.2"
 
 # 节点程序（安装时必须拷到安装目录，mcp_agent.py 从自己所在目录读配置）
 NODE_FILES = ["mcp_agent.py", "fleet_proto.py", "dashboard_html.py", "fleet.py"]
@@ -1944,6 +1944,7 @@ def _write_manifest(opts, platform, paths, service, adapter, unit_written,
         "files": files,
         "dirs": _manifest_dirs(paths),
         "node": result.get("node") or {},
+        "launcher": result.get("launcher") or {},
         "join_uri": result.get("join_uri") or "",
         "platform": {
             "os": platform.get("os"),
@@ -2281,6 +2282,18 @@ def rollback(opts=None):
         result["errors"].append("没有可用备份（需先执行 --upgrade 才会生成）")
         return result
     backup = backups[0]
+    # 回滚时把原配置里的 TLS/只读/鉴权参数带回，避免“配置是 https、进程却起 HTTP”
+    try:
+        _cfg = json.loads(_read_text(paths["config_path"], limit=1 << 20))
+    except Exception:
+        _cfg = {}
+    if _cfg.get("tls_cert") and _cfg.get("tls_key"):
+        opts["tls_cert"] = _cfg["tls_cert"]
+        opts["tls_key"] = _cfg["tls_key"]
+    if _cfg.get("read_only"):
+        opts["read_only"] = True
+    if _cfg.get("require_auth"):
+        opts["require_auth"] = True
     service = (manifest or {}).get("service") or _select_service(opts, platform)
     try:
         adapter = _make_adapter(service, opts, platform, paths)
@@ -2365,7 +2378,7 @@ def install(opts=None):
         "manifest": paths["manifest_path"],
     }
 
-    # v5.2.1: 升级必须指向真实存在的同一节点，避免“升级成另一个默认节点”
+    # v5.2.2: 升级必须指向真实存在的同一节点，避免“升级成另一个默认节点”
     if opts.get("upgrade") and not dry:
         if not _exists(paths["config_path"]):
             result["errors"].append(
@@ -2664,6 +2677,19 @@ def _owned_unit_path(path, paths):
     return _is_within(path, paths["install_dir"])
 
 
+def _owned_launcher(path, paths):
+    """判断某个可执行文件是否本安装器创建的 fleet 启动器（防误删同路径文件）。"""
+    if not path or not is_safe_removal_path(path):
+        return False
+    if os.path.basename(path) not in ("fleet", "fleet.cmd"):
+        return False
+    try:
+        text = _read_text(path, limit=1 << 20)
+    except Exception:
+        return False
+    return "fleet.py" in text and paths["install_dir"] in text
+
+
 def _removal_allowed(path, paths, unit_keys, purge):
     """卸载删除前的白名单校验；返回 (ok, reason)。"""
     if not str(path or "").strip():
@@ -2757,6 +2783,20 @@ def uninstall(opts=None):
         except OSError:
             pass
 
+    # 2.5) 全局 fleet 启动器（可能在 /usr/local/bin、~/.local/bin 或 $PREFIX/bin）
+    launcher = (manifest or {}).get("launcher") or {}
+    launcher_path = launcher.get("path") or ""
+    if launcher_path and _owned_launcher(launcher_path, paths):
+        try:
+            os.remove(launcher_path)
+            result["removed"].append(launcher_path)
+        except OSError as exc:
+            result["warnings"].append("删除启动器失败（可手工删除 %s）：%s"
+                                      % (launcher_path, exc))
+    elif launcher_path:
+        result["warnings"].append("启动器不在管理范围或已被替换，保留：%s"
+                                  % launcher_path)
+
     # 3) 尝试删除空目录（install/log 默认清理；data 默认保留）
     for directory in list((manifest or {}).get("dirs") or []):
         if not directory:
@@ -2797,6 +2837,21 @@ def uninstall(opts=None):
         result["kept"].append(data_dir)
         result["warnings"].append("数据目录已保留（邮箱/身份/日志）：%s；"
                                   "彻底清理请加 --purge" % data_dir)
+
+    # 4.5) --purge：连安装目录一起清（默认卸载保留其中 mailbox 等数据）
+    if opts.get("purge") and _exists(paths["install_dir"]):
+        if not is_safe_removal_path(paths["install_dir"]):
+            result["errors"].append("拒绝删除危险安装目录：%s" % paths["install_dir"])
+        else:
+            try:
+                shutil.rmtree(paths["install_dir"])
+                result["removed"].append(paths["install_dir"])
+            except OSError as exc:
+                result["errors"].append("删除安装目录失败: %s" % exc)
+    elif _exists(paths["install_dir"]):
+        result["kept"].append(paths["install_dir"])
+        result["warnings"].append("安装目录保留（含 mailbox 数据）：%s；"
+                                  "彻底清理请加 --purge" % paths["install_dir"])
 
     result["ok"] = not result["errors"]
     return result

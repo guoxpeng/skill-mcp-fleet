@@ -377,6 +377,23 @@ class TestDashboardV52:
         finally:
             n.stop()
 
+    def test_dashboard_ui_public_data_guarded(self, tmp_path):
+        # 页面本身免鉴权（token 走 fragment），数据接口必须鉴权
+        n = Node(str(tmp_path), name="dash-auth", token="tok-123456")
+        try:
+            with urllib.request.urlopen(n.base + "/fleet/ui", timeout=10) as resp:
+                assert resp.status == 200
+                assert b"Fleet Dashboard" in resp.read()
+            try:
+                urllib.request.urlopen(n.base + "/fleet/ui/data", timeout=10)
+                raise AssertionError("无 token 读取数据应被拒绝")
+            except urllib.error.HTTPError as exc:
+                assert exc.code == 401
+            status, _body = n.get("/fleet/ui/data")
+            assert status == 200
+        finally:
+            n.stop()
+
     def test_unknown_tool_guidance(self, node):
         node.init()
         err, text = node.tool("no_such_tool", {})

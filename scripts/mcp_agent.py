@@ -104,7 +104,7 @@ for _stream in (sys.stdout, sys.stderr):
 DEFAULT_CONFIG = {
     "name": "node",             # 副端标识（显示在状态页与 serverInfo）
     "tool_prefix": "",          # 工具名前缀，如 "nas_"；留空则用裸名（exec/read/...）
-    "version": "5.2.1",
+    "version": "5.2.2",
     "sudo_password": "",        # 留空且非 root 时会尝试免密 sudo
     "work_dir": "/",            # 默认工作目录
     "command_timeout": 120,     # 秒
@@ -1241,7 +1241,9 @@ def _dashboard_data():
                     "task_id": t.get("task_id", ""),
                     "goal": (t.get("goal") or t.get("title") or "")[:100],
                     "status": t.get("status", ""),
-                    "steps": len(t.get("steps") or []),
+                    "steps": (t.get("event_count")
+                              or len(t.get("plan") or [])
+                              or len(t.get("steps") or [])),
                     "updated": t.get("updated_ms") or t.get("created_ms"),
                 })
         except Exception:
@@ -3167,9 +3169,17 @@ class Handler(BaseHTTPRequestHandler):
     def _guard(self, body=b""):
         """鉴权闸门。返回 True 表示已拦截（响应也发完了）。
 
-        v5.2 顺序：IP 白名单 → Ed25519 签名（如带 X-Fleet-Sig）→ require_signature
-        → 旧 token 兼容。签名请求通过后 `_trusted=True` 且记录 `_peer_node`。
+        v5.2 顺序：IP 白名单 → Dashboard 静态页放行 → Ed25519 签名 →
+        require_signature → 旧 token 兼容。签名请求通过后 `_trusted=True`。
         """
+        # Dashboard 静态页必须免鉴权：token 走 URL fragment（不会发送到服务器），
+        # 否则浏览器首次 GET /fleet/ui 会被 401，页面根本加载不出来。
+        # 数据接口 /fleet/ui/data 仍然要求 token/签名。
+        if (self.command == "GET"
+                and _request_path(self.path) == "/fleet/ui"):
+            self._trusted = False
+            self._peer_node = ""
+            return False
         ip = self.client_address[0] if self.client_address else "?"
         self._trusted = False
         self._peer_node = ""

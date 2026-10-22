@@ -217,4 +217,4 @@ A(规划) → propose 任务给 B(执行) → B 回 progress → B 回 result+�
 - 节点被完全攻陷时，攻击者拥有该节点进程权限——这是所有远程执行工具的边界；
   用独立低权限用户 + 只读模式 + 网络隔离降低影响。
 
-> 版本：v5.2.1 ｜ 作者：guoxpeng ｜ 许可：MIT ｜ 仓库：https://github.com/guoxpeng/skill-mcp-fleet
+> 版本：v5.2.2 ｜ 作者：guoxpeng ｜ 许可：MIT ｜ 仓库：https://github.com/guoxpeng/skill-mcp-fleet
