@@ -20,6 +20,21 @@
 
 ---
 
+---
+
+## [5.2.7] — 2026-10-22 · 自签 TLS 本机 CLI 修复（Ubuntu 真机）
+
+- **问题**：云主机用 `--tls auto` 自签证书、通过公网 IP 访问时，
+  `fleet status/doctor/ask` 报 `CERTIFICATE_VERIFY_FAILED`。原因是 CLI 只对
+  私网/回环豁免证书校验，公网 IP 的本机节点也被当成公网对端。
+- **修复**：`MCPClient` / 本机 HTTP 查询新增 `insecure` 语义，仅“本机节点命令”
+  豁免自签校验；公网对端仍走系统 CA。`_opener_for(url, insecure=...)` 显式区分。
+- **Ubuntu 24.04 真机验证**：systemd 安装、自签 TLS 健康检查、默认 token、
+  Dashboard、systemd kill -9 自愈、远端更新 SHA256、回滚、卸载清理全部通过。
+- 全量 **615 passed + 1 skipped**。
+
+---
+
 ## [5.2.6] — 2026-10-22 · 远端更新按 commit SHA 取文件（彻底绕开 raw CDN 缓存）
 
 - `raw.githubusercontent.com/.../main/` 与 `/refs/heads/main/` 都可能返回旧缓存

@@ -1545,7 +1545,7 @@ def test_install_sh_no_crlf():
 # 13. 常量与适配器表
 # ===========================================================================
 def test_version_and_adapter_registry():
-    assert fi.VERSION == "5.2.6"
+    assert fi.VERSION == "5.2.7"
     assert set(fi.ADAPTERS) == set(fi.SERVICE_KEYS) - {"auto"}
     for key, cls in fi.ADAPTERS.items():
         assert cls.key == key

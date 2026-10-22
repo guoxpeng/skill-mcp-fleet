@@ -104,7 +104,7 @@ for _stream in (sys.stdout, sys.stderr):
 DEFAULT_CONFIG = {
     "name": "node",             # 副端标识（显示在状态页与 serverInfo）
     "tool_prefix": "",          # 工具名前缀，如 "nas_"；留空则用裸名（exec/read/...）
-    "version": "5.2.6",
+    "version": "5.2.7",
     "sudo_password": "",        # 留空且非 root 时会尝试免密 sudo
     "work_dir": "/",            # 默认工作目录
     "command_timeout": 120,     # 秒
@@ -1115,7 +1115,7 @@ def _note_peer_agents(peer_name, agents):
 def _mailbox_secret():
     """邮箱落盘密钥：使用 DATA_DIR/mailbox.key（0600），与 auth_token 解耦。
 
-    v5.2.6 起不再用 auth_token 派生邮箱密钥：token 轮换/重新生成不会让旧邮件
+    v5.2.7 起不再用 auth_token 派生邮箱密钥：token 轮换/重新生成不会让旧邮件
     变成不可读密文。旧版本（enc1$/token 派生）的数据由 MailEngine 的
     fallback_secret 兼容读取，并在下次写回时自动迁移到 mailbox.key。
     """
@@ -1144,7 +1144,7 @@ def _init_proto():
     global _mail_engine, _delivery_engine, _sync_engine
     if not _HAS_PROTO:
         return
-    # v5.2.6: 邮箱固定使用 mailbox.key；auth_token 只作为旧数据回退密钥，
+    # v5.2.7: 邮箱固定使用 mailbox.key；auth_token 只作为旧数据回退密钥，
     # 避免 token 轮换把历史邮件变成不可读密文。
     _proto_secret = _mailbox_secret()
     _mail_engine = MailEngine(HERE, SERVER_NAME, secret=_proto_secret,

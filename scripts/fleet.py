@@ -125,7 +125,7 @@ def die(msg, code=1):
 # ---------------------------------------------------------------- MCP 客户端
 
 
-def _opener_for(url):
+def _opener_for(url, insecure=False):
     """内网/本机地址不走 http_proxy：机器上配了代理时，局域网节点会被代理成 404/超时。"""
     import ipaddress
     import urllib.parse
@@ -141,8 +141,9 @@ def _opener_for(url):
     if direct:
         handlers.append(urllib.request.ProxyHandler({}))
     if urllib.parse.urlsplit(url).scheme == "https":
-        if direct:
-            # 局域网节点常为自签证书：仅私网/回环豁免校验
+        if direct or insecure:
+            # 本机/局域网节点常为自签证书：仅在本机命令或私网/回环时豁免校验；
+            # 公网对端（insecure=False 且非私网）仍使用系统 CA。
             ctx = ssl.create_default_context()
             ctx.check_hostname = False
             ctx.verify_mode = ssl.CERT_NONE
@@ -158,8 +159,9 @@ class MCPError(Exception):
 class MCPClient:
     """Streamable HTTP 客户端：initialize → notifications/initialized → tools/*"""
 
-    def __init__(self, url, timeout=30, token=""):
+    def __init__(self, url, timeout=30, token="", insecure=False):
         self.url = url
+        self.insecure = bool(insecure)
         self.timeout = timeout
         self.sid = None
         self.info = {}
@@ -177,7 +179,8 @@ class MCPClient:
         if self.sid:
             req.add_header("Mcp-Session-Id", self.sid)
         try:
-            with _opener_for(self.url).open(req, timeout=timeout or self.timeout) as r:
+            with _opener_for(self.url, insecure=self.insecure).open(
+                    req, timeout=timeout or self.timeout) as r:
                 if r.headers.get("Mcp-Session-Id"):
                     self.sid = r.headers["Mcp-Session-Id"]
                 body = r.read().decode("utf-8", "ignore")
@@ -2098,15 +2101,16 @@ def _local_mcp(a):
     me = local_node(getattr(a, "self_url", None))
     if not me:
         return None
-    return me, MCPClient(me["url"], getattr(a, "timeout", 30), token=me.get("token") or "")
+    return me, MCPClient(me["url"], getattr(a, "timeout", 30),
+                         token=me.get("token") or "", insecure=True)
 
 
-def _http_json(url, token="", timeout=10):
+def _http_json(url, token="", timeout=10, insecure=False):
     import urllib.request as _ur
     req = _ur.Request(url)
     if token:
         req.add_header("Authorization", "Bearer " + token)
-    with _opener_for(url).open(req, timeout=timeout) as resp:
+    with _opener_for(url, insecure=insecure).open(req, timeout=timeout) as resp:
         return json.loads(resp.read().decode("utf-8"))
 
 
@@ -2174,8 +2178,10 @@ def cmd_status(a):
     base = me["url"].rstrip("/")
     if base.endswith("/mcp"):
         base = base[:-4]
-    health = _http_json(base + "/fleet/health", me.get("token") or "")
-    ident = _http_json(base + "/fleet/identity", me.get("token") or "")
+    health = _http_json(base + "/fleet/health", me.get("token") or "",
+                        insecure=True)
+    ident = _http_json(base + "/fleet/identity", me.get("token") or "",
+                       insecure=True)
     print("节点      : %s (%s)" % (health.get("name"), health.get("version")))
     print("节点 ID   : %s" % ident.get("node_id"))
     print("指纹      : %s" % ident.get("fingerprint"))
@@ -2200,7 +2206,7 @@ def cmd_metrics(a):
     if me.get("token"):
         req.add_header("Authorization", "Bearer " + me["token"])
     try:
-        with _opener_for(base).open(req, timeout=10) as resp:
+        with _opener_for(base, insecure=True).open(req, timeout=10) as resp:
             sys.stdout.write(resp.read().decode("utf-8"))
     except Exception as e:
         return die("读取指标失败：%s" % e)
@@ -2414,7 +2420,7 @@ def _fetch_remote_installer():
 
 
 def cmd_update(a):
-    """v5.2.6: 升级本机节点（默认从远端拉最新发布包；--offline 用本地）。"""
+    """v5.2.7: 升级本机节点（默认从远端拉最新发布包；--offline 用本地）。"""
     installer = _installer_path()
     if not installer:
         return die("找不到 fleet_install.py；请重新下载安装包，或手工执行 "
@@ -2648,7 +2654,8 @@ def cmd_ask(a):
         return 0
     print("")
     print("执行结果：")
-    client = MCPClient(me["url"], getattr(a, "timeout", 30), token=me.get("token") or "")
+    client = MCPClient(me["url"], getattr(a, "timeout", 30),
+                       token=me.get("token") or "", insecure=True)
     failed = 0
     safe_exec = ("df ", "df", "uptime", "free", "ip route", "ip addr", "netstat",
                  "cat /proc/loadavg", "nproc", "uname")
