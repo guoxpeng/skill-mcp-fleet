@@ -3118,7 +3118,7 @@ def show_fleet_status():
     else:
         peers = 0
         try:
-            peers = len(load_peers().get("nodes", {}))
+            peers = len(load_registry().get("nodes", {}))
         except Exception:
             pass
         print("    节点: %-16s 指纹: %s" % (me.get("name"), me.get("fingerprint") or "-"))
