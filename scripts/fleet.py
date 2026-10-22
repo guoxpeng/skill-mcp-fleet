@@ -140,11 +140,13 @@ def _opener_for(url):
     if direct:
         handlers.append(urllib.request.ProxyHandler({}))
     if urllib.parse.urlsplit(url).scheme == "https":
-        # 局域网节点常为自签证书：只在本机客户端接受（不降低对公网证书的校验）
-        ctx = ssl.create_default_context()
-        ctx.check_hostname = False
-        ctx.verify_mode = ssl.CERT_NONE
-        handlers.append(urllib.request.HTTPSHandler(context=ctx))
+        if direct:
+            # 局域网节点常为自签证书：仅私网/回环豁免校验
+            ctx = ssl.create_default_context()
+            ctx.check_hostname = False
+            ctx.verify_mode = ssl.CERT_NONE
+            handlers.append(urllib.request.HTTPSHandler(context=ctx))
+        # 公网 HTTPS（GitHub 等）保持系统默认证书校验，防中间人
     return urllib.request.build_opener(*handlers)
 
 
@@ -2351,8 +2353,36 @@ def _local_node_install_info(me):
             "dir": d, "port": port, "data_dir": data_dir, "service": service}
 
 
+REMOTE_INSTALL_SH = ("https://raw.githubusercontent.com/guoxpeng/"
+                     "skill-mcp-fleet/main/scripts/install.sh")
+
+
+def _fetch_remote_installer():
+    """下载最新 install.sh 到临时文件（后续它自己下载并校验 release 包）。
+
+    返回路径或空串；不打印 URL 内容。失败时调用方回退到本地安装器。
+    """
+    try:
+        req = urllib.request.Request(
+            REMOTE_INSTALL_SH, headers={"User-Agent": "mcp-fleet-update"})
+        with _opener_for(REMOTE_INSTALL_SH).open(req, timeout=20) as resp:
+            data = resp.read()
+        if len(data) < 1000 or b"fleet_install.py" not in data:
+            return ""
+        fd, path = tempfile.mkstemp(prefix="fleet-install-", suffix=".sh")
+        with os.fdopen(fd, "wb") as f:
+            f.write(data)
+        try:
+            os.chmod(path, 0o700)
+        except OSError:
+            pass
+        return path
+    except Exception:
+        return ""
+
+
 def cmd_update(a):
-    """v5.2: 升级 / 回滚本机节点（调用统一安装器，显式传目标节点参数）。"""
+    """v5.2.4: 升级本机节点（默认从远端拉最新发布包；--offline 用本地）。"""
     installer = _installer_path()
     if not installer:
         return die("找不到 fleet_install.py；请重新下载安装包，或手工执行 "
@@ -2363,19 +2393,37 @@ def cmd_update(a):
     info = _local_node_install_info(me)
     if not info.get("name") or not info.get("dir"):
         return die("无法确定本机节点信息（name/dir）；请检查安装目录与配置")
-    argv = [sys.executable, installer,
-            "--rollback" if getattr(a, "rollback", False) else "--upgrade",
-            "--name", info["name"], "--port", str(info["port"]),
-            "--dir", info["dir"], "--data-dir", info["data_dir"]]
+    common = ["--name", info["name"], "--port", str(info["port"]),
+              "--dir", info["dir"], "--data-dir", info["data_dir"]]
     if info.get("service"):
-        argv += ["--service", info["service"]]
+        common += ["--service", info["service"]]
     if getattr(a, "json", False):
-        argv.append("--json")
+        common.append("--json")
+
+    remote = ""
+    if (not getattr(a, "rollback", False) and not getattr(a, "offline", False)
+            and os.name != "nt" and shutil.which("sh")):
+        remote = _fetch_remote_installer()
+    if remote:
+        argv = ["sh", remote, "--upgrade"] + common
+    else:
+        argv = [sys.executable, installer,
+                "--rollback" if getattr(a, "rollback", False) else "--upgrade"
+                ] + common
     print(dim("    目标节点: %s (%s, port %s, service %s)"
               % (info["name"], info["dir"], info["port"],
                  info.get("service") or "auto")))
+    print(dim("    方式: %s" % ("远端最新发布包（SHA256 校验）"
+                                if remote else "本地安装器（离线/下载失败回退）")))
     print(dim("    执行: %s" % " ".join(argv)))
-    return subprocess.call(argv)
+    try:
+        return subprocess.call(argv)
+    finally:
+        if remote:
+            try:
+                os.remove(remote)
+            except OSError:
+                pass
 
 
 def cmd_identity(a):
@@ -2783,6 +2831,8 @@ def build_parser():
     sp.set_defaults(func=cmd_ask)
     sp = local(sub.add_parser("update", help="v5.2: 升级/回滚本机节点"))
     sp.add_argument("--rollback", action="store_true", help="回滚到最近一次升级备份")
+    sp.add_argument("--offline", action="store_true",
+                    help="不联网，使用节点目录里的本地安装器")
     sp.set_defaults(func=cmd_update)
     sp = sub.add_parser("identity", help="v5.2: 身份查看/加密导出/恢复")
     sp.add_argument("action", nargs="?", default="show",

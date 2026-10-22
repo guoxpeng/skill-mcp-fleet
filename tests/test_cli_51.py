@@ -163,11 +163,23 @@ class TestUpdateAndParser:
     def test_update_maps_upgrade(self, monkeypatch):
         seen = []
         self._fake_update_env(monkeypatch, seen)
-        assert fleet.cmd_update(ns(rollback=False, json=True,
+        assert fleet.cmd_update(ns(rollback=False, json=True, offline=True,
                                    self_url=None, timeout=10)) == 0
         assert "--upgrade" in seen[0] and "--json" in seen[0]
         assert "--name" in seen[0] and "/x" in seen[0]
         assert "--service" in seen[0]
+
+    def test_update_uses_remote_latest_by_default(self, monkeypatch, tmp_path):
+        seen = []
+        self._fake_update_env(monkeypatch, seen)
+        remote = tmp_path / "install.sh"
+        remote.write_text("#!/bin/sh\n", encoding="utf-8")
+        monkeypatch.setattr(fleet, "_fetch_remote_installer",
+                            lambda: str(remote))
+        assert fleet.cmd_update(ns(rollback=False, json=False, offline=False,
+                                   self_url=None, timeout=10)) == 0
+        assert seen[0][0] == "sh" and str(remote) in seen[0]
+        assert "--upgrade" in seen[0] and "--name" in seen[0]
 
     def test_update_maps_rollback(self, monkeypatch):
         seen = []

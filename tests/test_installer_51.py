@@ -1545,7 +1545,7 @@ def test_install_sh_no_crlf():
 # 13. 常量与适配器表
 # ===========================================================================
 def test_version_and_adapter_registry():
-    assert fi.VERSION == "5.2.3"
+    assert fi.VERSION == "5.2.4"
     assert set(fi.ADAPTERS) == set(fi.SERVICE_KEYS) - {"auto"}
     for key, cls in fi.ADAPTERS.items():
         assert cls.key == key
@@ -1696,3 +1696,26 @@ def test_termux_start_acquires_wake_lock_and_battery_intent(tmp_path, monkeypatc
     assert any("termux-wake-lock" in " ".join(c) for c in calls)
     assert any("REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" in " ".join(c) for c in calls)
     assert any("电池" in w or "后台" in w for w in result["warnings"])
+
+
+def test_upgrade_skips_port_conflict(monkeypatch, tmp_path):
+    monkeypatch.setattr(fi, "_port_in_use", lambda *a, **k: True)
+    opts = make_opts(tmp_path, upgrade=True)
+    deps = fi.check_dependencies(opts, make_platform())
+    assert deps["ok"] is True, deps["errors"]
+
+
+def test_upgrade_stops_old_service_before_start(tmp_path, monkeypatch):
+    opts = make_opts(tmp_path)
+    assert fi.install(opts)["ok"] is True
+    calls = []
+    monkeypatch.setattr(fi.NohupAdapter, "stop",
+                        lambda self: calls.append("stop") or {"ok": True})
+    monkeypatch.setattr(fi.NohupAdapter, "start",
+                        lambda self: calls.append("start") or {"ok": True})
+    monkeypatch.setattr(fi, "health_check",
+                        lambda *a, **k: {"ok": True, "attempts": 1})
+    up = dict(opts, upgrade=True, no_service=False)
+    result = fi.install(up)
+    assert result["ok"] is True, result["errors"]
+    assert calls[:2] == ["stop", "start"]

@@ -55,7 +55,7 @@ import sys
 import time
 import urllib.request
 
-VERSION = "5.2.3"
+VERSION = "5.2.4"
 
 # 节点程序（安装时必须拷到安装目录，mcp_agent.py 从自己所在目录读配置）
 NODE_FILES = ["mcp_agent.py", "fleet_proto.py", "dashboard_html.py", "fleet.py"]
@@ -654,7 +654,9 @@ def check_dependencies(opts, platform=None):
 
     # 端口占用：真实安装前检查（dry-run 只提示）
     port = int(opts.get("port") or DEFAULT_PORT)
-    if opts.get("check_port", True) and _port_in_use(port):
+    if (opts.get("check_port", True)
+            and not (opts.get("upgrade") or opts.get("rollback"))
+            and _port_in_use(port)):
         msg = "端口 %d 已被占用，请换 --port 或先停掉旧节点" % port
         if opts.get("dry_run"):
             warnings.append(msg)
@@ -1364,6 +1366,9 @@ class TermuxAdapter(ServiceAdapter):
         rc, out = _run(["termux-wake-lock"], timeout=20)
         commands.append({"cmd": "termux-wake-lock", "rc": rc,
                          "output": out.strip()[:120]})
+        if rc != 0:
+            warnings.append("termux-wake-lock 失败：Android 可能冻结后台，"
+                            "请在 Termux 里手动执行 termux-wake-lock")
         # Android 14 后台冻结：尝试拉起「忽略电池优化」授权页（需用户点允许）
         rc2, out2 = _run(["am", "start", "-a",
                           "android.settings.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS",
@@ -2382,7 +2387,7 @@ def install(opts=None):
         "manifest": paths["manifest_path"],
     }
 
-    # v5.2.3: 升级必须指向真实存在的同一节点，避免“升级成另一个默认节点”
+    # v5.2.4: 升级必须指向真实存在的同一节点，避免“升级成另一个默认节点”
     if opts.get("upgrade") and not dry:
         if not _exists(paths["config_path"]):
             result["errors"].append(
@@ -2408,6 +2413,15 @@ def install(opts=None):
             result["warnings"].append("升级前已备份: %s" % upgrade_backup)
         except Exception as exc:
             result["warnings"].append("升级备份失败（继续但请手工备份）: %s" % exc)
+
+    # 0) 升级：先停旧服务，避免“端口占用/旧进程继续跑旧代码”
+    if opts.get("upgrade") and not dry and not opts.get("no_service"):
+        try:
+            stop = adapter.stop()
+            result["upgrade_stop"] = stop
+            _sleep(0.5)
+        except Exception as exc:
+            result["warnings"].append("升级前停止旧服务失败（继续尝试）: %s" % exc)
 
     # 1) 依赖预检（缺失只给安装命令）
     deps = check_dependencies(opts, platform)
@@ -3054,7 +3068,9 @@ def _print_human(result, mode):
         lines.append("  安装目录: %s" % paths.get("install_dir", ""))
         lines.append("  数据目录: %s" % paths.get("data_dir", ""))
         auth = result.get("auth") or {}
-        if auth.get("enabled"):
+        if not result.get("auth"):
+            pass
+        elif auth.get("enabled"):
             lines.append("  鉴权: 已开启%s" % ("（本次自动生成）" if auth.get("created") else ""))
             if auth.get("created"):
                 try:
