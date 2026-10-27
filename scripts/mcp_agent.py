@@ -104,7 +104,7 @@ for _stream in (sys.stdout, sys.stderr):
 DEFAULT_CONFIG = {
     "name": "node",             # 副端标识（显示在状态页与 serverInfo）
     "tool_prefix": "",          # 工具名前缀，如 "nas_"；留空则用裸名（exec/read/...）
-    "version": "5.2.2",
+    "version": "5.2.3",
     "sudo_password": "",        # 留空且非 root 时会尝试免密 sudo
     "work_dir": "/",            # 默认工作目录
     "command_timeout": 120,     # 秒
@@ -610,6 +610,90 @@ def _kill_tree(p):
             pass
 
 
+def _run_capped(p, stdin_bytes, timeout, cap=None, err_cap=65536):
+    """喂 stdin + 收输出，但**输出到上限就丢弃**，返回 (out, err, truncated)。
+
+    为什么不能直接用 `p.communicate(timeout=t)`：它把 stdout/stderr 全收进内存，
+    等返回之后才轮得到截断。也就是说 `yes` / `cat /dev/urandom` 在 timeout
+    （默认 120s）到点之前，早就把设备的内存吃满了——软路由只有几百 MB，
+    事后截断纯属自我安慰。必须在**读的时候**就限流：超了继续读（否则子进程
+    写满管道会卡住，wait 永远不返回），但不再往内存里留。
+    """
+    if cap is None:
+        cap = RUN_BUF_MAX
+    out_chunks, err_chunks = [], []
+    totals = {"out": 0, "err": 0}
+    state = {"truncated": False}
+    lock = threading.Lock()
+
+    def reader(pipe, chunks, key, limit):
+        try:
+            while True:
+                b = pipe.read(65536)
+                if not b:
+                    break
+                with lock:
+                    room = limit - totals[key]
+                    if room > 0:
+                        chunks.append(b[:room])
+                    else:
+                        state["truncated"] = True
+                    totals[key] += len(b)
+        except Exception:
+            pass
+        finally:
+            try:
+                pipe.close()
+            except Exception:
+                pass
+
+    def writer():
+        try:
+            if stdin_bytes:
+                p.stdin.write(stdin_bytes)
+                p.stdin.flush()
+        except Exception:
+            pass
+        finally:
+            try:
+                p.stdin.close()
+            except Exception:
+                pass
+
+    threads = []
+    if p.stdout is not None:
+        t = threading.Thread(target=reader, args=(p.stdout, out_chunks, "out", cap))
+        t.daemon = True
+        t.start()
+        threads.append(t)
+    if p.stderr is not None:
+        t = threading.Thread(target=reader, args=(p.stderr, err_chunks, "err", err_cap))
+        t.daemon = True
+        t.start()
+        threads.append(t)
+    if p.stdin is not None:
+        t = threading.Thread(target=writer)
+        t.daemon = True
+        t.start()
+        threads.append(t)
+
+    timed_out = False
+    try:
+        p.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        timed_out = True
+        _kill_tree(p)
+        try:
+            p.wait(timeout=5)
+        except Exception:
+            pass
+    # 子进程已退出/被杀，管道会 EOF，读线程自然收尾；给它们一点时间把残留读完
+    for t in threads:
+        t.join(timeout=5)
+    return (b"".join(out_chunks), b"".join(err_chunks),
+            state["truncated"], timed_out, totals)
+
+
 def run_local(command, sudo=False, timeout=None, work_dir=None, stdin=None):
     """在设备本机执行命令，返回 (exit_code, stdout, stderr)。"""
     t = timeout or CFG.get("command_timeout", 120)
@@ -637,24 +721,18 @@ def run_local(command, sudo=False, timeout=None, work_dir=None, stdin=None):
             stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             start_new_session=not _is_windows(),
         )
-        out, err = p.communicate(
-            input=stdin_bytes or None,
-            timeout=t)
+        out, err, truncated, timed_out, totals = _run_capped(p, stdin_bytes, t)
+        if timed_out:
+            return (-1, _decode_output(out),
+                    (_decode_output(err) + "\n[超时 %ss 被终止]" % t).lstrip())
         code, so, se = p.returncode, _decode_output(out), _decode_output(err)
-        # 单次同步 exec 输出上限：一个 `cat /dev/urandom` 或 `yes` 就能让
-        # agent 吃满内存、把整台设备拖死。截断而不是丢弃，并明确告诉调用方。
-        if len(so) > RUN_BUF_MAX:
-            so = so[:RUN_BUF_MAX]
-            se += "\n[输出超 1MB 已截断；大输出请用 exec_async + exec_poll 分页取]"
+        # 输出上限在**读取时**就已经生效（见 _run_capped）：超出的部分被丢弃，
+        # 这里只负责把「被截断了」这件事明确告诉调用方。
+        if truncated:
+            se += ("\n[输出超 1MB 已截断（实际 %d 字节 stdout / %d 字节 stderr）；"
+                   "大输出请用 exec_async + exec_poll 分页取]"
+                   % (totals.get("out", 0), totals.get("err", 0)))
         return (code, so, se)
-    except subprocess.TimeoutExpired:
-        _kill_tree(p)
-        try:
-            out, err = p.communicate(timeout=5)
-        except Exception:
-            out, err = b"", b""
-        return (-1, _decode_output(out or b""),
-                (_decode_output(err or b"") + "\n[超时 %ss 被终止]" % t).lstrip())
     except FileNotFoundError:
         return -1, "", "[执行失败] 找不到 shell（Windows 需 cmd，POSIX 需 bash）"
     except Exception as e:
@@ -691,41 +769,31 @@ def _job_sweep():
 def _job_reader(job):
     """后台线程：持续读子进程输出，结束时记录 exit code。
 
-    用非阻塞读 + 短轮询，保证输出增量可见（read(65536) 在管道上会
-    一直阻塞到攒够 64KB 或 EOF，不适合做增量）。
+    直接 `os.read` 裸 fd，**不用** `BufferedReader.read(n)`：后者会凑满 n 字节
+    才返回，配合非阻塞模式就变成「读一块 → BlockingIOError → sleep(50ms)」，
+    吞吐被死死钉在 64KB/50ms ≈ 1.3MB/s（实测 20MB 要 13.8 秒）。
+    裸 `os.read` 有数据就立刻返回，天然增量，又不丢吞吐。
     """
-    import os as _os
     fd = job["proc"].stdout.fileno()
-    try:
-        _os.set_blocking(fd, False)
-    except Exception:
-        pass
     try:
         while True:
             try:
-                chunk = job["proc"].stdout.read(65536)
-            except (BlockingIOError, InterruptedError):
-                chunk = None
-            except Exception:
-                chunk = b""
-            if chunk:
-                with job["lock"]:
-                    job["buf"] += chunk
-                    if len(job["buf"]) > JOB_BUF_MAX:
-                        job["buf"] = job["buf"][-JOB_BUF_MAX:]
-                        job["dropped"] = True
+                chunk = os.read(fd, 65536)
+            except InterruptedError:
                 continue
-            if chunk == b"" or job["proc"].poll() is not None:
-                # EOF 或进程已结束：把剩余的一次读完
-                try:
-                    rest = job["proc"].stdout.read()
-                    if rest:
-                        with job["lock"]:
-                            job["buf"] += rest
-                except Exception:
-                    pass
+            except OSError:
                 break
-            time.sleep(0.05)
+            if not chunk:
+                break                      # EOF
+            with job["lock"]:
+                job["buf"] += chunk
+                # 到 2 倍上限才裁剪，而不是每来一块就切一次：
+                # `buf[-1MB:]` 是整段拷贝，满仓之后每读 64KB 就 memcpy 1MB，
+                # 等于 16 倍写放大，还全程持着锁——软路由上这是实打实的 CPU。
+                # 攒到 2MB 再一次性裁回 1MB，摊薄成 O(1)。
+                if len(job["buf"]) > JOB_BUF_MAX * 2:
+                    job["buf"] = job["buf"][-JOB_BUF_MAX:]
+                    job["dropped"] = True
     except Exception:
         pass
     finally:
@@ -734,6 +802,10 @@ def _job_reader(job):
         except Exception:
             pass
         with job["lock"]:
+            # 收尾再裁一次：循环里是攒到 2 倍才裁，最后可能停在 1~2MB 之间
+            if len(job["buf"]) > JOB_BUF_MAX:
+                job["buf"] = job["buf"][-JOB_BUF_MAX:]
+                job["dropped"] = True
             job["exit"] = job["proc"].returncode
             job["end"] = time.time()
 

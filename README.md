@@ -1,4 +1,4 @@
-# MCP Fleet v5.2.2 · 让所有设备成为一支 AI 团队
+# MCP Fleet v5.2.3 · 让所有设备成为一支 AI 团队
 
 > **2026 华为开发者大赛 · 小红书 Skill 创新赛** ｜ 通用赛道 · 开发工具
 > 作者：guoxpeng ｜ 开源仓库：https://github.com/guoxpeng/skill-mcp-fleet ｜ 许可：MIT
@@ -180,18 +180,18 @@ bash scripts/demo.sh                        # 本机双节点 30 秒演示
 双向 SHA256 全一致、远端无残留分块。600KB 那档抓到过一个致命 bug：执行策略把
 `upload` 的 base64 正文当成命令行去匹配，`ufw`（3 个字符）在几十万字符里几乎必然
 命中，导致**大文件上传基本都会被判成「防火墙变更」**。修复后策略改为「命令字段」
-与「数据载荷」分流，详见 `CHANGELOG.md` 5.2.2「修复」。
+与「数据载荷」分流，详见 `CHANGELOG.md` 5.2.3「修复」。
 
 ## 七、提交包与合规
 
 ```bash
 python3 scripts/build_package.py
-# → dist/mcp-fleet-v5.2.2.zip + SHA256SUMS + MANIFEST.json
+# → dist/mcp-fleet-v5.2.3.zip + SHA256SUMS + MANIFEST.json
 ```
 
 - 提交包文件数 **≤ 30**、大小 **≤ 40 MB**，由脚本自动裁剪并以清单/SHA256 固化。
 - 纯标准库、零第三方运行时依赖、MIT 许可、可离线部署。
-- 版本：代码 `SERVER_VERSION=5.2.2` ＝ git tag `v5.2.2` ＝ GitHub Release。
+- 版本：代码 `SERVER_VERSION=5.2.3` ＝ git tag `v5.2.3` ＝ GitHub Release。
   完整演进见 `CHANGELOG.md`。
 - **版本号一律三段式 `X.Y.Z`**：默认只动补丁位（修 bug、稳定性、性能），
   新增能力才动次版本位，破坏性变更才动主版本位。构建脚本会做三段式校验与

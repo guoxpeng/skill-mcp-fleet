@@ -24,7 +24,7 @@
 # ============================================================================
 set -eu
 
-VERSION="5.2.2"
+VERSION="5.2.3"
 REPO="guoxpeng/skill-mcp-fleet"
 OFFLINE=""
 NO_VERIFY=0

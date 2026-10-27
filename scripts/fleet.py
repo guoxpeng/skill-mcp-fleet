@@ -76,7 +76,7 @@ import uuid
 
 # ---------------------------------------------------------------- 基础
 
-VERSION = "5.2.2"
+VERSION = "5.2.3"
 PROTOCOL = "2024-11-05"
 HERE = os.path.dirname(os.path.abspath(__file__))
 
@@ -377,12 +377,33 @@ class _PooledHTTP(object):
             hdrs.setdefault("Host", "%s:%d" % (self.host, self.port))
             if self.proxy and self.proxy[2]:
                 hdrs["Proxy-Authorization"] = self.proxy[2]
+            # **per-call 超时必须显式落到 socket 上**。只写 `conn.timeout = t`
+            # 是空操作：http.client 只在 connect() 时用 self.timeout 建 socket，
+            # 之后 send/getresponse 都不会再应用它。结果所有请求实际都用建连时
+            # 那个超时——`fleet cp --timeout 600`、长轮询的长超时全部静默失效，
+            # 慢链路上表现为「莫名其妙超时」，且报错完全指不到这里。
+            t = timeout or self.timeout
+            conn.timeout = t
             try:
-                conn.timeout = timeout or self.timeout
+                if conn.sock is not None:
+                    conn.sock.settimeout(t)
+                    # 对端回过 `Connection: close` 时 http.client 会在内部重连，
+                    # 新 socket 上就没有 NODELAY 了（只有 _connect 里设过）。
+                    # setsockopt 只要 1µs 级别，每次补一下比漏掉划算。
+                    conn.sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            except Exception:
+                pass
+            try:
                 conn.request("POST", self._target_path(), body=body, headers=hdrs)
                 resp = conn.getresponse()
                 data = _read_capped(resp)
                 return resp.status, resp.getheaders(), data
+            except socket.timeout:
+                # 超时**不重试**：重试只会把等待时间翻倍，而超时本身是一个
+                # 明确的语义结果（长轮询没数据 / 对端确实慢）。
+                # 注意必须排在下面 OSError 之前——socket.timeout 就是 OSError 子类。
+                self.close()
+                raise
             except (ConnectionError, OSError) as e:
                 # 空闲连接被对端/中间设备回收是最常见的情况：
                 # 重连一次即可，不能让用户看到「连不上」。
@@ -475,10 +496,13 @@ class MCPClient:
                                          proxy=proxy if mode == "proxy" else None)
             try:
                 status, hdrs, raw = self._pool.post(data, headers, timeout=timeout)
+            except socket.timeout:
+                # **必须排在 OSError 之前**：socket.timeout 就是 OSError 的子类，
+                # 顺序反了这条分支永远进不来，所有超时都会被报成「连不上」，
+                # 把人引去查网络/DNS，而真实原因只是「这一步花的时间比预期长」。
+                raise MCPError("超时（%ss）" % (timeout or self.timeout))
             except (ConnectionError, OSError) as e:
                 raise MCPError("连不上 %s（%s）" % (self.url, e))
-            except socket.timeout:
-                raise MCPError("超时（%ss）" % (timeout or self.timeout))
             hmap = dict((k.lower(), v) for k, v in hdrs)
             if hmap.get("mcp-session-id"):
                 self.sid = hmap["mcp-session-id"]
@@ -1326,6 +1350,29 @@ def cmd_shell(a):
     try:
         reader.start()
         tty.setraw(stdin_fd)
+        # 被 SIGTERM / SIGHUP 杀掉时 `finally` 不会执行（默认处置是直接终止），
+        # 终端就永久停在 raw 模式——用户会看到「回车不换行、Ctrl-C 打印 ^C」，
+        # 得自己敲 reset 才能恢复。ssh 也会处理这一档。这里接管信号：先恢复
+        # 终端属性，再把信号按默认处置重发一遍，不吞掉退出码。
+        def _term_restore(signum, _frame):
+            # 必须用 TCSANOW：TCSADRAIN 要等输出缓冲排空，而临死时终端那头
+            # 很可能已经没人读了（对端 pty 满了），等下去就是永久挂死——
+            # 信号处理器里挂死比不恢复更糟。
+            try:
+                termios.tcsetattr(stdin_fd, termios.TCSANOW, old_attrs)
+            except Exception:
+                pass
+            try:
+                signal.signal(signum, signal.SIG_DFL)
+                os.kill(os.getpid(), signum)
+            except Exception:
+                os._exit(128 + signum)
+
+        for _sig in (signal.SIGTERM, signal.SIGHUP):
+            try:
+                signal.signal(_sig, _term_restore)
+            except Exception:
+                pass
         import select as _select
         while state["alive"]:
             # 不能直接阻塞在 os.read(stdin)：远端 `exit` 之后本地没人按键盘，
