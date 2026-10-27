@@ -45,8 +45,9 @@ trycloudflare 就给一个新域名。主端 mcp.json 里写死的地址立刻�
 * 只用标准库（http.server + json + threading），和副端 mcp_agent.py 一个路子，
   任何有 python3 的机器都能跑，不需要 pip install。
 * 落盘到 ~/.mcp-fleet/directory.json，重启不丢；原子写（先写 .tmp 再 replace）。
-* 不做过期删除：地址旧了也留着，主端自己看 ts 判断新鲜度；
-  隧道重建后副端会立刻再上报，所以目录里永远是「最近一次上报」。
+* 陈旧标记与淘汰分离：ttl（默认 600 秒）只标记 stale，不删数据；
+  S7：7 天无上报的条目在读写路径惰性淘汰并记日志（淘汰后节点下次
+  上报可重新注册，避免死节点永久占位）。
 * 注册接口默认允许任何来源（因为副端可能在任意 NAT 后面），
   但只要设了 --token，就必须带 X-Fleet-Token，否则 401。
 """
@@ -96,6 +97,9 @@ MAX_NODES = 200
 RATE = {}            # {ip: [次数, 窗口起点]}
 RATE_LIMIT = 30      # 每窗口最多注册次数
 RATE_WINDOW = 60     # 窗口秒数
+
+# S7：惰性淘汰阈值——7 天无上报才删（保守值；ttl 只标记 stale，不删）。
+PRUNE_AGE = 7 * 24 * 3600
 
 _lock = threading.Lock()
 _state = {"nodes": {}}
@@ -206,9 +210,11 @@ def register(payload):
             "remote": payload.get("_remote", ""),
             "domain_changed": domain_changed,
         }
+        # S7：惰性淘汰死节点（调用方已持 _lock），淘汰后落盘。
+        gone = _prune_stale_locked(int(time.time()))
         # 只在地址变化或每 10 次上报时落盘：原实现每次注册都写盘，
         # 无 token 时可被刷爆磁盘 IO。
-        if changed or hits % 10 == 1:
+        if changed or hits % 10 == 1 or gone:
             save_store()
     print("[+] %s -> %s%s%s" % (name, url, "  (地址变更)" if changed else "",
                                 "  [域名变更]" if domain_changed else ""))
@@ -216,11 +222,28 @@ def register(payload):
                  "domain_changed": domain_changed}
 
 
+def _prune_stale_locked(now):
+    """调用方须已持 _lock：删掉 PRUNE_AGE 内无动静的条目，记日志，返回删掉的名字。"""
+    gone = []
+    for name, v in list(_state["nodes"].items()):
+        last = int(v.get("seen") or v.get("ts") or now)
+        if now - last > PRUNE_AGE:
+            _state["nodes"].pop(name, None)
+            gone.append(name)
+    for name in gone:
+        print("[prune] %s 已 %d 天无上报，从目录淘汰（下次上报可重新注册）"
+              % (name, PRUNE_AGE // 86400))
+    return gone
+
+
 def nodes_view():
     now = int(time.time())
     out = {}
     with _lock:
+        gone = _prune_stale_locked(now)
         items = list(_state["nodes"].items())
+        if gone:
+            save_store()  # 读路径淘汰也要落盘，否则重启后死节点又回来（save_store 不抢锁）
     for name, v in items:
         age = now - int(v.get("seen") or v.get("ts") or now)
         out[name] = dict(v, age=age, stale=age > ARGS.ttl)
