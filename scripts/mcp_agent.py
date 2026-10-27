@@ -104,7 +104,7 @@ for _stream in (sys.stdout, sys.stderr):
 DEFAULT_CONFIG = {
     "name": "node",             # 副端标识（显示在状态页与 serverInfo）
     "tool_prefix": "",          # 工具名前缀，如 "nas_"；留空则用裸名（exec/read/...）
-    "version": "5.4.0",
+    "version": "5.2.2",
     "sudo_password": "",        # 留空且非 root 时会尝试免密 sudo
     "work_dir": "/",            # 默认工作目录
     "command_timeout": 120,     # 秒
@@ -1169,6 +1169,9 @@ def _tun_reader(sess):
                 break
             sess["buf"] += chunk
             sess["total"] += len(chunk)
+            # last_data 只在**真有字节流动**时更新。不能用 last：客户端即使
+            # 没数据也在持续长轮询，last 一直是新的，列表里就会永远显示「空闲 0s」。
+            sess["last_data"] = time.time()
     with sess["lock"]:
         sess["end"] = time.time()
     try:
@@ -1208,7 +1211,8 @@ def _tun_new_conn(so, peer):
     sess = {"id": tid, "kind": "conn", "sock": so, "peer": peer,
             "buf": b"", "base": 0, "total": 0, "lock": threading.Lock(),
             "cond": threading.Condition(), "dead": False,
-            "start": time.time(), "last": time.time(), "end": None}
+            "start": time.time(), "last": time.time(),
+            "last_data": time.time(), "end": None}
     with TUNNELS_LOCK:
         TUNNELS[tid] = sess
     threading.Thread(target=_tun_reader, args=(sess,), daemon=True).start()
@@ -1392,6 +1396,7 @@ def t_tunnel_write(a):
         return "写入失败：%r（连接可能已断开）" % (e,), True
     with sess["lock"]:
         sess["last"] = time.time()
+        sess["last_data"] = time.time()
     return "ok", False
 
 
@@ -1431,9 +1436,9 @@ def t_tunnel_list(a):
         else:
             with s["lock"]:
                 total = s["total"]
-            lines.append("%s  连接  %-22s %d字节  空闲%ds  %s"
-                         % (s["id"], s.get("peer", "?"), total,
-                            int(now - s.get("last", now)),
+                quiet = now - s.get("last_data", s.get("start", now))
+            lines.append("%s  连接  %-22s %d字节  静默%ds  %s"
+                         % (s["id"], s.get("peer", "?"), total, int(quiet),
                             "已断开" if s.get("end") else "运行中"))
     return "\n".join(lines), False
 

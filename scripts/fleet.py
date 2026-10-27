@@ -76,7 +76,7 @@ import uuid
 
 # ---------------------------------------------------------------- 基础
 
-VERSION = "5.4.0"
+VERSION = "5.2.2"
 PROTOCOL = "2024-11-05"
 HERE = os.path.dirname(os.path.abspath(__file__))
 
@@ -1509,11 +1509,64 @@ def cmd_forward(a):
     stop = threading.Event()
     listeners = []        # 本地监听 socket（-L）
     remote_ls = []        # 副端 listener 的 tunnel_id（-R）
-    clients = []          # 需要收尾关闭的客户端
-    threads = []
+    clients = set()       # 活着的客户端；关掉就摘掉，不然长跑必然涨内存
     lock = threading.Lock()
     stats = {"conn": 0, "tx": 0, "rx": 0}
-    local_ports = []      # 实际绑定的端口（port=0 时有用）
+
+    def _mk_clients():
+        """一条转发连接配两条 HTTP 通道（读/写各一）。"""
+        rc = MCPClient(url, timeout=30, token=token, insecure=insecure)
+        wc = MCPClient(url, timeout=30, token=token, insecure=insecure)
+        with lock:
+            clients.add(rc)
+            clients.add(wc)
+        return rc, wc
+
+    def _drop_clients(rc, wc):
+        """关掉并**从清单里摘掉**。
+
+        只在退出时统一关是不够的：连接被拒/开隧道失败也要还回去，
+        否则每失败一次就漏两条 HTTP 连接，转发器跑一天就废了。
+        """
+        with lock:
+            clients.discard(rc)
+            clients.discard(wc)
+        for c in (rc, wc):
+            try:
+                c.close()
+            except Exception:
+                pass
+
+    def _pipe(tid, sock, rc, wc, label):
+        """一条连接的双向泵：跑完就收尾。"""
+        st = {"tx": 0, "rx": 0}
+        lst = threading.Event()
+        t1 = threading.Thread(target=_pump_remote_to_sock,
+                              args=(rc, tid, sock, stop, lst, st), daemon=True)
+        t2 = threading.Thread(target=_pump_sock_to_remote,
+                              args=(wc, tid, sock, stop, lst, st), daemon=True)
+        t1.start()
+        t2.start()
+        t1.join()
+        # 远端先结束：叫醒可能还卡在 recv 上的另一半，别把线程留在那
+        try:
+            sock.shutdown(socket.SHUT_RD)
+        except Exception:
+            pass
+        t2.join(timeout=3)
+        try:
+            wc.call("tunnel_close", {"tunnel_id": tid}, timeout=10)
+        except Exception:
+            pass
+        try:
+            sock.close()
+        except Exception:
+            pass
+        _drop_clients(rc, wc)
+        with lock:
+            stats["tx"] += st["tx"]
+            stats["rx"] += st["rx"]
+        print(dim("  - %s 关闭（↑%d ↓%d 字节）" % (label, st["tx"], st["rx"])))
 
     # ---- -L：本地监听，每条进来的连接开一条隧道 ----
     def serve_local(f):
@@ -1527,9 +1580,41 @@ def cmd_forward(a):
             print(err("[x] ") + "绑定 %s:%d 失败：%s" % (f["bind"], f["port"], e))
             return None
         real = ls.getsockname()[1]
-        local_ports.append(real)
         print(ok("[L] ") + "%s:%d → %s（经 %s）:%d"
               % (f["bind"], real, f["host"], a.target, f["hport"]))
+
+        def handle_local(conn, peer, f):
+            label = "%s:%d" % (peer[0], peer[1])
+            rc, wc = _mk_clients()
+            with lock:
+                stats["conn"] += 1
+            try:
+                text, is_err = rc.call("tunnel_open",
+                                       {"host": f["host"], "port": f["hport"]},
+                                       timeout=40)
+            except MCPError as e:
+                text, is_err = str(e), True
+            if is_err:
+                print(err("[x] ") + "%s 连不上 %s:%d：%s"
+                      % (label, f["host"], f["hport"], text))
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+                _drop_clients(rc, wc)
+                return
+            try:
+                tid = json.loads(text)["tunnel_id"]
+            except Exception:
+                print(err("[x] ") + "副端返回异常：%s" % str(text)[:120])
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+                _drop_clients(rc, wc)
+                return
+            print(dim("  + %s ↔ %s" % (label, tid)))
+            _pipe(tid, conn, rc, wc, label)
 
         def accept_loop():
             while not stop.is_set():
@@ -1540,60 +1625,6 @@ def cmd_forward(a):
                 threading.Thread(target=handle_local, args=(conn, peer, f),
                                  daemon=True).start()
 
-        def handle_local(conn, peer, f):
-            # 每条连接两条 HTTP 通道：读线程会卡在长轮询上，共用一个的话
-            # 写方向要排队等 200ms，回显类协议立刻变卡。
-            rc = MCPClient(url, timeout=30, token=token, insecure=insecure)
-            wc = MCPClient(url, timeout=30, token=token, insecure=insecure)
-            with lock:
-                clients.extend([rc, wc])
-                stats["conn"] += 1
-            try:
-                text, is_err = rc.call("tunnel_open",
-                                       {"host": f["host"], "port": f["hport"]},
-                                       timeout=40)
-                if is_err:
-                    print(err("[x] ") + "%s:%d 连不上 %s:%d：%s"
-                          % (peer[0], peer[1], f["host"], f["hport"], text))
-                    conn.close()
-                    return
-                tid = json.loads(text)["tunnel_id"]
-            except Exception as e:
-                print(err("[x] ") + "开隧道失败：%s" % e)
-                conn.close()
-                return
-            print(dim("  + %s:%d ↔ %s" % (peer[0], peer[1], tid)))
-            st = {"tx": 0, "rx": 0}
-            lst = threading.Event()
-            t1 = threading.Thread(target=_pump_remote_to_sock,
-                                  args=(rc, tid, conn, stop, lst, st), daemon=True)
-            t2 = threading.Thread(target=_pump_sock_to_remote,
-                                  args=(wc, tid, conn, stop, lst, st), daemon=True)
-            t1.start()
-            t2.start()
-            t1.join()
-            # 远端先结束：叫醒可能还卡在 recv 上的另一半，别把线程留在那
-            try:
-                conn.shutdown(socket.SHUT_RD)
-            except Exception:
-                pass
-            t2.join(timeout=3)
-            try:
-                wc.call("tunnel_close", {"tunnel_id": tid}, timeout=10)
-            except Exception:
-                pass
-            try:
-                conn.close()
-            except Exception:
-                pass
-            rc.close()
-            wc.close()
-            with lock:
-                stats["tx"] += st["tx"]
-                stats["rx"] += st["rx"]
-            print(dim("  - %s:%d 关闭（↑%d ↓%d 字节）"
-                      % (peer[0], peer[1], st["tx"], st["rx"])))
-
         threading.Thread(target=accept_loop, daemon=True).start()
         return ls
 
@@ -1601,40 +1632,81 @@ def cmd_forward(a):
     def serve_remote(f):
         ctl = MCPClient(url, timeout=30, token=token, insecure=insecure)
         with lock:
-            clients.append(ctl)
-        try:
-            text, is_err = ctl.call(
-                "tunnel_listen", {"host": f["bind"], "port": f["port"]}, timeout=40)
-        except MCPError as e:
-            print(err("[x] ") + "副端监听失败：%s" % e)
+            clients.add(ctl)
+
+        def open_listener():
+            """在副端建 listener。失败返回 (None, 原因)。"""
+            try:
+                text, is_err = ctl.call(
+                    "tunnel_listen", {"host": f["bind"], "port": f["port"]},
+                    timeout=40)
+            except MCPError as e:
+                return None, str(e)
+            if is_err:
+                return None, text
+            try:
+                return json.loads(text)["tunnel_id"], ""
+            except Exception:
+                return None, "副端返回异常：%s" % str(text)[:120]
+
+        lid, why = open_listener()
+        if not lid:
+            print(err("[x] ") + "副端监听 %s:%d 失败：%s" % (f["bind"], f["port"], why))
+            with lock:
+                clients.discard(ctl)
+            try:
+                ctl.close()
+            except Exception:
+                pass
             return None
-        if is_err:
-            print(err("[x] ") + "副端监听 %s:%d 失败：%s"
-                  % (f["bind"], f["port"], text))
-            return None
-        d = json.loads(text)
-        lid = d["tunnel_id"]
         remote_ls.append(lid)
-        print(ok("[R] ") + "副端 %s → 本地 %s:%d"
-              % (d.get("bound", "?"), f["host"], f["hport"]))
+        print(ok("[R] ") + "副端 %s:%d → 本地 %s:%d"
+              % (f["bind"], f["port"], f["host"], f["hport"]))
 
         def accept_loop():
+            """取新连接。
+
+            这里**不能一遇错就退出**：网络抖一下、副端重启一次，整个 -R 就
+            静默死掉，用户只会觉得「转发莫名其妙不工作了」。所以分两种错处理：
+              * 副端不认识这个 listener（重启后内存态没了）→ 重新建一个
+              * 网络类错误 → 退避重试，连续失败才提示
+            """
+            cur = [lid]
+            fails = 0
             while not stop.is_set():
                 try:
                     text, is_err = ctl.call(
-                        "tunnel_accept", {"tunnel_id": lid, "wait": 0.2}, timeout=30)
-                except MCPError:
-                    break
+                        "tunnel_accept", {"tunnel_id": cur[0], "wait": 0.2},
+                        timeout=30)
+                except MCPError as e:
+                    fails += 1
+                    if fails == 3:
+                        print(warn("[!] ") + "取连接连续失败（%s），继续重试…" % e)
+                    stop.wait(min(5.0, 0.3 * fails))
+                    continue
                 if is_err:
-                    break
+                    if "未知" in str(text):
+                        # 副端重启/被清理：listener 没了，重建一个
+                        new, why = open_listener()
+                        if new:
+                            cur[0] = new
+                            remote_ls[:] = [new]
+                            print(ok("[R] ") + "副端 listener 已重建（%s）" % new)
+                            fails = 0
+                            continue
+                        print(err("[x] ") + "副端 listener 重建失败：%s" % why)
+                    fails += 1
+                    stop.wait(min(5.0, 0.3 * fails))
+                    continue
+                fails = 0
                 try:
-                    ids = json.loads(text).get("tunnels") or []
+                    d = json.loads(text)
                 except Exception:
                     break
-                for tid in ids:
+                for tid in (d.get("tunnels") or []):
                     threading.Thread(target=handle_remote, args=(tid, f),
                                      daemon=True).start()
-                if not json.loads(text).get("alive", True):
+                if not d.get("alive", True):
                     break
 
         def handle_remote(tid, f):
@@ -1648,40 +1720,11 @@ def cmd_forward(a):
                 except Exception:
                     pass
                 return
-            rc = MCPClient(url, timeout=30, token=token, insecure=insecure)
-            wc = MCPClient(url, timeout=30, token=token, insecure=insecure)
+            rc, wc = _mk_clients()
             with lock:
-                clients.extend([rc, wc])
                 stats["conn"] += 1
             print(dim("  + %s ↔ 本地 %s:%d" % (tid, f["host"], f["hport"])))
-            st = {"tx": 0, "rx": 0}
-            lst = threading.Event()
-            t1 = threading.Thread(target=_pump_remote_to_sock,
-                                  args=(rc, tid, conn, stop, lst, st), daemon=True)
-            t2 = threading.Thread(target=_pump_sock_to_remote,
-                                  args=(wc, tid, conn, stop, lst, st), daemon=True)
-            t1.start()
-            t2.start()
-            t1.join()
-            try:
-                conn.shutdown(socket.SHUT_RD)
-            except Exception:
-                pass
-            t2.join(timeout=3)
-            try:
-                wc.call("tunnel_close", {"tunnel_id": tid}, timeout=10)
-            except Exception:
-                pass
-            try:
-                conn.close()
-            except Exception:
-                pass
-            rc.close()
-            wc.close()
-            with lock:
-                stats["tx"] += st["tx"]
-                stats["rx"] += st["rx"]
-            print(dim("  - %s 关闭（↑%d ↓%d 字节）" % (tid, st["tx"], st["rx"])))
+            _pipe(tid, conn, rc, wc, tid)
 
         threading.Thread(target=accept_loop, daemon=True).start()
         return ctl
@@ -1691,9 +1734,7 @@ def cmd_forward(a):
         if ls:
             listeners.append(ls)
     for f in remotes:
-        c = serve_remote(f)
-        if c:
-            pass          # 已在 clients 里，统一收尾
+        serve_remote(f)          # 成功时 ctl 已进 clients，统一收尾
 
     if not listeners and not remote_ls:
         return die("所有转发都没起来")
@@ -1719,11 +1760,13 @@ def cmd_forward(a):
                                                   {"tunnel_id": lid}, timeout=10)
             except Exception:
                 pass
-        for c in clients:
+        for c in list(clients):
             try:
                 c.close()
             except Exception:
                 pass
+        with lock:
+            clients.clear()
         print()
         print(dim("已断开全部转发（累计 %d 条连接，↑%d ↓%d 字节）"
                   % (stats["conn"], stats["tx"], stats["rx"])))

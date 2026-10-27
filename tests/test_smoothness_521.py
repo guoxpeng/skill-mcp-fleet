@@ -296,6 +296,36 @@ class VersionPolicyTest(unittest.TestCase):
         self.assertIsNotNone(m, "SKILL.md frontmatter 缺少 version")
         self.assertEqual(m.group(1), fleet.VERSION)
 
+    def test_patch_digit_within_99(self):
+        """末位是「日常迭代位」，0-99；满 100 才进位成 Y+1。
+
+        没有上限的话，「只动末位」就等于没有约束——5.2.100、5.2.1000 一路加下去，
+        中间位永远不会动，版本号反而更没法读。
+        """
+        z = int(fleet.VERSION.split(".")[2])
+        self.assertLessEqual(z, 99,
+                             "末位 %d 超过 99，应当进位成 %d.%d.0"
+                             % (z, int(fleet.VERSION.split(".")[0]),
+                                int(fleet.VERSION.split(".")[1]) + 1))
+
+    def test_build_package_rejects_patch_over_99(self):
+        sys.path.insert(0, os.path.join(self.ROOT, "scripts"))
+        import build_package
+        old = build_package.DEFAULT_VERSION
+        try:
+            build_package.DEFAULT_VERSION = "5.2.100"
+            errs = build_package.check_version_sync()
+            self.assertTrue(any("超过 99" in e for e in errs), errs)
+            self.assertTrue(any("5.3.0" in e for e in errs), errs)
+        finally:
+            build_package.DEFAULT_VERSION = old
+
+    def test_carry_example(self):
+        sys.path.insert(0, os.path.join(self.ROOT, "scripts"))
+        import build_package
+        self.assertEqual(build_package._carry("5.2.99"), "5.3.0")
+        self.assertEqual(build_package._carry("5.9.99"), "5.10.0")
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -3,123 +3,110 @@
 所有版本的更新说明。版本号与 `scripts/mcp_agent.py` 内 `DEFAULT_CONFIG["version"]` 对齐，
 每个里程碑版本对应一个 git tag 与一次技能市场提交。
 
----
-
-## [5.4.0] — 2026-10-27 · 端口转发：补齐 ssh 的最后一块
-
-5.3 给了终端，但 ssh 还有一半用处是 `-L` / `-R`：远端内网里只有那台机器能碰的
-数据库、面板、私有 API，全靠端口转发接出来。没有它，「完全替代 ssh」仍然不成立。
-
-### 新增：`fleet forward`（等价 ssh -L / -R）
-```bash
-fleet forward -L 8080:db.internal:3306 nas     # 本地 8080 → 副端视角的 db:3306
-fleet forward -R 9000:127.0.0.1:3000 nas       # 副端 9000 → 本地 3000
-fleet forward -L 0.0.0.0:5432:127.0.0.1:5432 --bind 0.0.0.0 nas
-fleet forward --list nas                        # 看副端当前隧道
-```
-- 一条命令可叠加多个 `-L` / `-R`；`-L` 默认只绑 `127.0.0.1`，要对局域网暴露必须显式 `--bind`。
-- 规格支持 `[绑定地址:]端口:目标主机:目标端口` 两种写法，写错会直接给出两种正确格式。
-- 副端新增 7 个工具：`tunnel_open / listen / accept / read / write / close / list`，
-  工具总数 62 → **69**。
-- 传输沿用「服务端持有 socket + 客户端长轮询拉增量」，不需要任何新协议、不需要端口映射。
-
-### 数据完整性（这一版最关键的实现细节）
-- **背压而非丢数据**：缓冲区满时读线程挂起等主端来取。终端丢的是滚屏历史，
-  TCP 丢的是字节流——按环形缓冲丢旧数据会让下载文件悄悄损坏。
-- **消费即回收**：取走的字节立刻从缓冲区丢掉。原先按 256KB 阈值回收，
-  缓冲区小于阈值时永远不满足条件，表现为「传到 512KB 就不动了」。
-- 用 1MB / 5MB 随机二进制 + SHA256 比对钉住；上行、下行、`-L`、`-R` 四个方向都测。
-- 实测（本机回环）：`-L` 5MB ≈ 0.5s，`-R` 5MB ≈ 3s。
-
-### 新增：长在线可见性（`fleet health`）
-- 每台节点多两列信息：副端自报的**进程在线时长**，以及主端**观测到它多久了**。
-  两个一起看才有意义——只看当次 UP，一台每 5 分钟重启的服务也是「全部在线」。
-- 本地记账 `~/.mcp-fleet/seen.json`：`first_seen` / `last_ok` / `up_count` / `down_count`，
-  掉线不清零。掉线时显示「最后可达 X 前」，而不是只说一句 DOWN。
-- `--json` 输出同步带上 `uptime_s` / `first_seen` / `last_ok` / `up_count`，便于外部监控取数。
-- 拿不到 `/fleet/health` 时按「不知道」处理（不显示、不算故障），
-  不会因为老版本副端没有这个端点就把体检结果判成异常。
-
-### 修复
-- 单条转发连接正常关闭会把整个转发器一起关掉（全局 stop 事件被 pump 置位）。
-  改为每条连接独立开关，全局开关只由 Ctrl-C 触发。
-- 远端先结束时，另一半线程可能还卡在 `recv` 上；补 `shutdown(SHUT_RD)` 叫醒。
-- `--list` 报错提示里写的还是 `fleet tunnel`（那是 cloudflared 的命令），改成 `forward`。
-- 运行期配置 `scripts/mcp_agent_config.json`（含 token）加入 `.gitignore`。
+> **编号规则**：版本号三段式 `X.Y.Z`，日常迭代**只动末位 Z**，范围 0–99。
+> 末位满 100 才进位：`5.2.99 → 5.3.0`（`5.2.100` 非法）。首位 X 仅用于破坏性变更。
+> 一个发布只对应一个条目，功能再多也压在同一个末位号里——版本涨得比内容快，
+> 评审和回滚都没法对账。
 
 ---
 
-## [5.3.0] — 2026-10-27 · 替代 ssh：交互式 shell + 自升级 + macOS 深度适配
+## [5.2.2] — 2026-10-27 · 替代 ssh：交互式 shell + 端口转发 + 自升级 + macOS 适配
 
-这一版对准一个具体目标：**普通公网设备上，fleet 能替代 ssh；内网配合
-Tailscale 达到同样的手感**。此前 fleet 只有一次性 `exec`，跑不了 vim/top，
-所以「替代 ssh」一直名不副实。
+这一版对准一个具体目标：**普通公网设备上，fleet 能替代 ssh；内网配合 Tailscale
+达到同样的手感；连进来的设备能长期在线，agent 可以借它的网络环境干活。**
+
+替代 ssh 需要三件事，缺一不可：一个真终端、能转发端口、以及出事之后能自己恢复。
+这一版把三件都做了。
 
 ### 新增：`fleet shell`（PTY 交互式会话）
 - 远端用 `pty.fork()` 起**真终端**里的登录 shell，本地把 stdin 设 raw 模式，
-  按键原样送、输出原样刷。`tty` 会返回 `/dev/ttysNNN`，vim / top / less 正常工作。
-- 传输仍是请求/响应，所以拆成 `shell_open / write / read / resize / close / list`
-  六个工具；`read` 支持**长轮询**（`wait` 最长 5s），有数据立刻返回，
-  不用客户端 50ms 空转一次。
-- 输出走 base64：PTY 吐的是原始字节流，可能在多字节字符中间截断，
-  按文本传会乱码。
-- 输出缓冲 512KB 滚动 + **绝对 offset**，客户端落后太多时明确回 `truncated`
-  而不是悄悄丢数据；同时最多 8 个会话，防反复 open 撑爆内存。
+  按键原样送、输出原样刷。`tty` 返回 `/dev/ttysNNN`，vim / top / less 正常工作。
+- 传输仍是请求/响应，拆成 `shell_open / write / read / resize / close / list`
+  六个工具；`read` 支持**长轮询**（`wait` 最长 5s），有数据立刻返回。
+- 输出走 base64：PTY 吐的是原始字节流，可能在多字节字符中间截断，按文本传会乱码。
+- 输出缓冲 512KB 滚动 + **绝对 offset**，客户端落后太多时明确回 `truncated`；
+  同时最多 8 个会话，防反复 open 撑爆内存。
 - `SIGWINCH` 自动同步窗口大小；远端 `exit` 后客户端立即返回（不卡在阻塞读）。
-- 工具总数 56 → **62**。
+
+### 新增：`fleet forward`（端口转发，等价 ssh -L / -R）
+```bash
+fleet forward -L 8080:db.internal:3306 nas   # 本地 8080 → 副端视角的 db:3306
+fleet forward -R 9000:127.0.0.1:3000 nas     # 副端 9000 → 本地 3000
+fleet forward --list nas
+```
+- 副端新增 7 个工具 `tunnel_open/listen/accept/read/write/close/list`。
+- 一条命令可叠加多个 `-L` / `-R`；`-L` 默认只绑 `127.0.0.1`，要暴露到局域网
+  必须显式 `--bind 0.0.0.0`。
+- 命令名用 `forward` 而不是 `tunnel`——后者已被 cloudflared 公网隧道占用。
+- **不丢字节**是这一块最关键的实现细节：缓冲区满时读线程挂起等主端来取（背压），
+  而不是像终端那样丢弃旧数据。终端丢的是滚屏历史，TCP 丢的是字节流——
+  丢一个字节，下载的文件就是坏的。
+- 取走即回收：每次 `tunnel_read` 后立刻丢掉已消费前缀。按阈值回收会让
+  小缓冲区永远不满足条件，表现为「传到 512KB 就不动了」。
+- 每条转发连接配两条 HTTP 通道（读/写各一）：共用一条会让写方向排队等 200ms 长轮询。
 
 ### 新增：`fleet up`（本地脚本自升级）
-- `fleet up` 检查远端版本，**有新版才动**；`--check` 只看不升，
-  `--ref` 指定分支/标签，`--force` 同版本重装，`--no-restart` 不重启节点。
-- 两条路线：git 仓库走 `fetch` + `merge --ff-only`（可回滚到指定提交）；
-  非 git 安装走源码包（GitHub + jsdelivr + 三个镜像依次回退）。
-- **只升代码，不碰数据**：`CODE_FILES` 白名单，配置/身份/登记表/审计/邮箱
-  一律不覆盖。
-- 升级前整目录备份到 `~/.mcp-fleet/up-backups/`（**不在仓库内**——放旁边会
-  立刻变成未提交改动，把下一次升级永久挡住）；升级后跑一次 `--version` 自检，
-  不过就自动回滚。
-- 远端版本坏了会记录到 `up-state.json`，下次自动跳过，不再反复「升一遍回滚一遍」。
+- 检查远端版本，**有新版才动**；`--check` 只看不升，`--ref` 指定分支/标签，
+  `--force` 同版本重装，`--no-restart` 不重启节点。
+- 两条路线：git 仓库走 `fetch` + `merge --ff-only`；非 git 安装走源码包
+  （GitHub + jsdelivr + 三个镜像依次回退）。
+- **只升代码，不碰数据**：`CODE_FILES` 白名单，配置/身份/登记表/审计/邮箱一律不覆盖。
+- 升级前整目录备份到 `~/.mcp-fleet/up-backups/`（**不在仓库内**——放旁边会立刻
+  变成未提交改动，把下一次升级永久挡住）；升级后跑一次 `--version` 自检，
+  不过就自动回滚。远端版本坏了记进 `up-state.json`，下次自动跳过。
 - 工作区有未提交改动时拒绝升级（不替你 stash/reset），`--force` 才强推。
 - 版本比较按**数字三元组**：字符串比较会认为 `5.10.0 < 5.9.0`，升级功能直接失效。
 
-### macOS 适配（本次重点）
+### 新增：长在线可见性（`fleet health`）
+- 每台节点多两列：副端自报的**进程在线时长**，和主端**观测到它多久了**。
+  只看当次 UP 看不出稳定性——一台每 5 分钟重启一次的服务，每次探活都是 UP。
+- 本地记账 `~/.mcp-fleet/seen.json`：`first_seen` / `last_ok` / `up_count` /
+  `down_count`，掉线不清零；掉线时显示「最后可达 X 前」。
+- 拿不到 `/fleet/health` 时按「不知道」处理，不把老版本副端误判成异常。
+
+### macOS 适配
 - **launchd 的 PATH**：launchd 起的进程只有 `/usr/bin:/bin:/usr/sbin:/sbin`，
   Homebrew 的 git/node/ffmpeg 全在 `/opt/homebrew/bin`——不补 PATH，
   `fleet exec` 里跑这些命令一律 command not found。plist 现在显式写
-  `EnvironmentVariables`（PATH/HOME/LANG/LC_ALL）。PATH 只取固定白名单 +
+  `EnvironmentVariables`（PATH/HOME/LANG/LC_ALL），PATH 只取固定白名单 +
   存在性检查，**不继承安装者当时的临时环境**。
-- **`fleet stop` 真的能停了**：装了 launchd 服务后只 kill pid，KeepAlive 会在
-  10 秒内把进程拉回来。现在走 `bootout` + `disable`（并 enable 反向恢复）。
+- **`fleet stop` 真的能停了**：只 kill pid 的话 KeepAlive 会在 10 秒内把进程拉回来。
+  现在走 `bootout` + `disable`（并 enable 反向恢复）。
 - **`fleet start` 不再绕过 launchd**：发现 plist 就用 `bootstrap` + `kickstart`，
   开机自启与崩溃重拉才真正生效；launchctl 失败才退回直接 spawn。
 - **`_lan_ip` 按 en0/en1 取址**：开了 Tailscale 出口节点时默认路由走 utun，
-  原实现会把隧道地址当成局域网地址广播出去，局域网里谁都连不上。
-- `fleet` 控制台在 macOS 上直接提示：没装 git（`xcode-select --install`）、
-  python 来自 Homebrew（升级大版本后路径会变）、节点没被 launchd 托管
-  （重启不会自启）。
+  原实现会把隧道地址当局域网地址广播出去，局域网里谁都连不上。
+- 控制台直接提示：没装 git（`xcode-select --install`）、python 来自 Homebrew
+  （升级大版本后路径会变）、节点没被 launchd 托管（重启不会自启）。
 
 ### 修复
-- **`MCPClient` 的连接不是线程安全的**：读线程和写线程共用一个
-  `http.client` 连接会抛 `CannotSendRequest: Request-sent`，交互式 shell 直接崩。
-  现在 `_post_once` 加锁串行化；`fleet shell` 另开一条写连接，避免长轮询把
-  按键延迟拖到 200ms。
-- **`fleet menu` 从来没绑定处理函数**：`menu` 子命令缺 `set_defaults(func=...)`，
-  执行直接 `AttributeError`。
+- **`-R` 转发在网络抖动/副端重启后静默失效**：原来 `tunnel_accept` 一抛错就退出，
+  用户只看到「转发莫名其妙不工作了」。现在区分两类错误：副端不认识 listener
+  （重启后内存态没了）→ 自动重建；网络类错误 → 退避重试，连续失败才提示。
+  实测 kill 掉副端再拉起，`-R` 端口 10 秒内自动恢复。
+- **`fleet forward` 的连接泄漏**：`tunnel_open` 失败时两个客户端没关，
+  每被拒一次漏两条 HTTP 连接；`clients` 清单只增不减。改为集合，关闭即摘除。
+- **单条连接关闭会关掉整个转发器**：全局 stop 事件被单条连接的 pump 置位。
+  改为每条连接独立开关，全局开关只由 Ctrl-C 触发。
+- **`tunnel_list` 的「空闲」永远显示 0s**：客户端即使没数据也在持续长轮询，
+  `last` 一直是新的。改用 `last_data`（只在真有字节流动时更新）。
+- **`MCPClient` 的连接不是线程安全的**：读线程和写线程共用一个 `http.client`
+  连接会抛 `CannotSendRequest: Request-sent`，交互式 shell 直接崩。
+  现在 `_post_once` 加锁串行化；`fleet shell` 另开一条写连接。
+- **`fleet menu` 从来没绑定处理函数**：缺 `set_defaults(func=...)`，执行直接
+  `AttributeError`。
 - `fleet shell` 在非终端 stdin（管道 / CI）下会抛 `termios.error` 并**泄漏远端会话**；
   现在给出可读提示并主动关闭会话。
-
-### 版本号
-- 版本同源校验扩展到 **7 处**：新增 `scripts/install.sh` 与
-  `scripts/mcp_agent_config.example.json`。这两处是**功能性**的（前者拼 release
-  下载地址、后者是新装节点的初始 version），漂了不会报错，只会「装出来是旧版」。
-- 本版新增能力，按规则动次版本位：5.2.1 → 5.3.0。
+- `show_fleet_status` 里 `st, err = ...` 遮蔽了模块级 `err()`，有对端就崩。
+- `_first_run_guide` 的 `%` 占位符与参数个数不匹配，新用户第一次运行就崩。
+- 运行期配置 `scripts/mcp_agent_config.json`（含 token）与 `scripts/mailbox.key`
+  加入 `.gitignore`。
 
 ### 测试
-- 新增 `tests/test_upgrade_macos_521.py`（29 项）：版本数字比较、目录布局识别、
-  备份/替换/自检、坏版本状态、launchd 标签与域、plist 渲染与内置兜底一致性。
-- 新增 `tests/test_shell_530.py`（13 项）：真 tty、TERM、增量 offset、
-  resize、会话上限、幂等关闭、远端 exit 后标记结束。
-- 全量 **732 passed, 1 skipped**。
+- 端到端用例起真进程 + 真 socket：验证 `-L` 往返，以及 **`-R` 在副端重启后自动恢复**
+  （这条只能靠端到端证明，单测证明不了）。
+- 数据完整性用 1MB / 5MB 随机二进制 + SHA256 比对，覆盖上行/下行/`-L`/`-R` 四方向。
+- 本机回环实测：`-L` 5MB ≈ 0.5s、`-R` 5MB ≈ 3s。
 
 ---
 

@@ -1,4 +1,4 @@
-# MCP Fleet v5.4 · 让所有设备成为一支 AI 团队
+# MCP Fleet v5.2.2 · 让所有设备成为一支 AI 团队
 
 > **2026 华为开发者大赛 · 小红书 Skill 创新赛** ｜ 通用赛道 · 开发工具
 > 作者：guoxpeng ｜ 开源仓库：https://github.com/guoxpeng/skill-mcp-fleet ｜ 许可：MIT
@@ -25,7 +25,7 @@
 - 整套系统**零第三方依赖、不依赖任何中心服务、一条命令安装**。
 
 v5.2 把这件事从"能连"推进到**"敢连、好连、会自己想、坏了能自修"**；
-v5.3 用 `fleet shell` 给了终端，v5.4 用 `fleet forward` 给了端口转发——
+这一版用 `fleet shell` 给了终端，用 `fleet forward` 给了端口转发——
 **公网设备上 fleet 至此可以完全替代 ssh，内网靠 Tailscale 达到同样手感**。
 
 ## 二、v5.2 六大升级
@@ -117,7 +117,7 @@ fleet nodes
 - 普通用户文档：[5 分钟上手](references/quickstart.md)、[一页排障](references/troubleshooting.md)、
   [自修复](references/self-repair.md)、[真机测试结果](references/test-results.md)。
 
-### 6.5 v5.3：替代 ssh 与自升级
+### 6.5 替代 ssh：交互式 shell 与自升级
 
 目标很具体：**普通公网设备上，fleet 能替代 ssh；内网配合 Tailscale 达到同样的手感。**
 
@@ -135,7 +135,7 @@ fleet nodes
   `start` 走 `bootstrap + kickstart`（否则不受 launchd 管、重启不自启）、
   `_lan_ip` 按 en0 取址（否则开 Tailscale 出口节点后广播的是隧道地址）。
 
-### 6.6 v5.4：端口转发（`ssh -L / -R` 的等价物）
+### 6.6 端口转发（`ssh -L / -R` 的等价物）
 
 5.3 给了终端，但 ssh 还有一半用处是端口转发：远端内网里只有那台机器能碰的数据库、
 面板、私有 API，全靠它接出来。
@@ -159,7 +159,7 @@ fleet forward --list nas                      # 看副端当前隧道
 ### 6.7 可复现的验证证据
 
 ```bash
-.venv/bin/python -m pytest tests/ -q        # 775 passed, 1 skipped
+.venv/bin/python -m pytest tests/ -q        # 780 passed, 1 skipped
 sh scripts/install.sh --dry-run --json --name demo   # 安装器零副作用预演
 bash scripts/demo.sh                        # 本机双节点 30 秒演示
 ```

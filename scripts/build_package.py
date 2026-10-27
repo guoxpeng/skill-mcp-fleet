@@ -26,7 +26,7 @@ import zipfile
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
-DEFAULT_VERSION = "5.4.0"
+DEFAULT_VERSION = "5.2.2"
 MAX_FILES = 30
 MAX_BYTES = 40 * 1024 * 1024
 SKILL_NAME = "mcp-fleet"
@@ -34,6 +34,9 @@ SKILL_NAME = "mcp-fleet"
 # 版本号必须是三段式 X.Y.Z。两段式（5.2 / 4.6）会让「每改一次就得进位」
 # 变成习惯，版本涨得比内容快，评审和回滚都没法对账。
 VERSION_RE = re.compile(r"^\d+\.\d+\.\d+$")
+# 末位是「日常迭代位」，取值范围 0-99；满 100 才进位成 Y+1（5.2.99 → 5.3.0）。
+# 允许 5.2.100 的话，末位就没有上限，「只动末位」等于没有约束。
+VERSION_Z_MAX = 99
 
 # 版本号散落在多处，必须同源。任何一处漂移都算校验失败。
 # 注意 install.sh 与 example json 里的版本是**功能性**的：前者拼 release 下载地址，
@@ -119,6 +122,15 @@ def parse_frontmatter(path):
     raise ValueError("SKILL.md frontmatter 未闭合")
 
 
+def _carry(version):
+    """末位满 100 时的正确写法：5.2.99 → 5.3.0。"""
+    try:
+        x, y, _z = version.split(".")
+        return "%s.%d.0" % (x, int(y) + 1)
+    except Exception:
+        return "X.Y+1.0"
+
+
 def check_version_sync():
     """校验版本号：三段式，且所有落点一致。
 
@@ -128,6 +140,12 @@ def check_version_sync():
     errors = []
     if not VERSION_RE.match(DEFAULT_VERSION):
         errors.append("构建版本 %r 不是三段式 X.Y.Z（例：5.2.1）" % DEFAULT_VERSION)
+    else:
+        z = int(DEFAULT_VERSION.split(".")[2])
+        if z > VERSION_Z_MAX:
+            errors.append(
+                "构建版本 %s 的末位 %d 超过 %d；末位满 100 应当进位成 %s"
+                % (DEFAULT_VERSION, z, VERSION_Z_MAX, _carry(DEFAULT_VERSION)))
     for rel, pat in VERSION_SOURCES:
         path = os.path.join(ROOT, rel)
         if not os.path.exists(path):
