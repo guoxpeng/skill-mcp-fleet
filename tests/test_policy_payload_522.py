@@ -98,7 +98,7 @@ class SmallPayloadStillScannedTest(unittest.TestCase):
 
 
 class ExecStdinStillScannedTest(unittest.TestCase):
-    """exec 的 content 是 stdin，会被进程吃掉，不享受体积豁免。"""
+    """exec 的 content 是 stdin：**只有命令是解释器时**它才是命令。"""
 
     def setUp(self):
         self.policy = core.ExecPolicy.default()
@@ -112,6 +112,49 @@ class ExecStdinStillScannedTest(unittest.TestCase):
     def test_exec_cmd_still_denied(self):
         decision = self.policy.check("exec", {"cmd": "iptables -F"})
         self.assertEqual(decision[0], "ask", decision)
+
+    def test_python_stdin_scanned(self):
+        decision = self.policy.check("exec", {
+            "command": "python3",
+            "content": "import os\nos.system('nft flush ruleset')\n" * 100})
+        self.assertEqual(decision[0], "ask", decision)
+
+    def test_sudo_bash_stdin_scanned(self):
+        decision = self.policy.check("exec", {
+            "command": "sudo bash", "content": "ufw disable\n" * 500})
+        self.assertEqual(decision[0], "ask", decision)
+
+    def test_data_command_stdin_not_scanned(self):
+        """`base64 -d > f` 的 stdin 是数据，不能因为里面有 /nft/ 就拦。
+
+        旧实现全量扫描：512KB 随机 base64 有 5% 会命中 `/nft/` 之类
+        （`/` 不是单词字符，正好构成 \\b 边界），等于随机 5% 的传输失败。
+        """
+        blob = _blob(512 * 1024)
+        decision = self.policy.check(
+            "exec", {"command": "base64 -d > /tmp/o.bin", "content": blob})
+        self.assertEqual(decision[0], "allow", decision)
+
+    def test_tar_stdin_not_scanned(self):
+        decision = self.policy.check(
+            "exec", {"command": "tar xzf - -C /tmp", "content": _blob(512 * 1024)})
+        self.assertEqual(decision[0], "allow", decision)
+
+
+class PayloadScanCostTest(unittest.TestCase):
+    """策略检查在每个工具调用前都要跑一次，不能有 O(载荷) 的代价。"""
+
+    def setUp(self):
+        self.policy = core.ExecPolicy.default()
+
+    def test_large_stdin_is_cheap(self):
+        import time
+        blob = "A" * (1024 * 1024)
+        t = time.time()
+        self.policy.check("exec", {"command": "base64 -d > /tmp/x", "content": blob})
+        cost = time.time() - t
+        # 旧实现全量扫描 1MB × 25 条规则 ≈ 150ms；这里只要求「不是线性代价」
+        self.assertLess(cost, 0.05, "1MB 数据载荷的策略检查耗时 %.0fms" % (cost * 1000))
 
 
 class BypassStillBlockedTest(unittest.TestCase):

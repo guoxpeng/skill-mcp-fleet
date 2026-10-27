@@ -3931,6 +3931,40 @@ def _save_up_state(state):
         pass
 
 
+#: 升级备份保留份数。每次升级整目录复制（约 1MB），不清理会一直涨——
+#: 真机上一台设备升了 9 次就占了 9.1MB，软路由的 overlay 经不起这么堆。
+UP_BACKUP_KEEP = 5
+
+
+def _prune_backups(base, keep=None):
+    """只保留最近 ``keep`` 份备份，其余删掉（按 mtime 排序）。
+
+    ``keep`` 默认值在**运行时**取 :data:`UP_BACKUP_KEEP`——写成默认参数
+    ``keep=UP_BACKUP_KEEP`` 会在函数定义时就把值绑死，之后改模块变量不生效。
+    """
+    if keep is None:
+        keep = UP_BACKUP_KEEP
+    try:
+        items = []
+        for name in os.listdir(base):
+            path = os.path.join(base, name)
+            if os.path.isdir(path):
+                try:
+                    items.append((os.path.getmtime(path), path))
+                except OSError:
+                    continue
+        if len(items) <= keep:
+            return 0
+        items.sort(reverse=True)
+        removed = 0
+        for _, path in items[keep:]:
+            shutil.rmtree(path, ignore_errors=True)
+            removed += 1
+        return removed
+    except Exception:
+        return 0
+
+
 def _backup_code_dir(cdir, stamp, tag=""):
     """把当前代码目录整份复制到仓库**外面**的备份区，返回备份路径。
 
@@ -3948,6 +3982,7 @@ def _backup_code_dir(cdir, stamp, tag=""):
         os.makedirs(base, exist_ok=True)
         shutil.copytree(cdir, dst, symlinks=True,
                         ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
+        _prune_backups(base)
         return dst
     except Exception:
         return ""

@@ -536,22 +536,50 @@ def _decode_output(b):
 RUN_BUF_MAX = 1048576      # 单次同步 exec 输出上限 1MB（超出截断并提示）
 
 
+_SHELL_BIN = []
+
+
+def _shell_bin():
+    """挑一个真能用的 shell。
+
+    不能硬编码 bash：OpenWrt / iStoreOS / Alpine 默认只有 busybox 的 ash，
+    写死 bash 的话这些设备上**每一个 exec 都会失败**，报「找不到 shell」——
+    而它们恰恰是「软路由当节点」的主要目标。
+    """
+    if _SHELL_BIN:
+        return _SHELL_BIN[0]
+    import shutil
+    for cand in ("/bin/bash", "/usr/bin/bash", "/bin/sh", "/usr/bin/sh",
+                 "/bin/ash", "/usr/bin/ash"):
+        if os.path.isfile(cand) and os.access(cand, os.X_OK):
+            _SHELL_BIN.append(cand)
+            return cand
+    for name in ("bash", "sh", "ash"):
+        found = shutil.which(name)
+        if found:
+            _SHELL_BIN.append(found)
+            return found
+    _SHELL_BIN.append("sh")           # 最后兜底：POSIX 保证有 sh
+    return "sh"
+
+
 def _wrap(cmd, sudo=False):
-    """把命令包成最终交给 bash 执行的字符串。全部用字符串拼接，避免 % 吃掉花括号。
+    """把命令包成最终交给 shell 执行的字符串。全部用字符串拼接，避免 % 吃掉花括号。
 
     SEC-05：密码**绝不**出现在命令行字符串里。命令行对同机所有用户可见
     （`ps aux` 一行就看完），把密码 echo 进去等于把 sudo 密码写在公告板上。
-    这里只生成 `sudo -S bash -c <cmd>`，密码由调用方经 stdin 第一行喂进去
+    这里只生成 `sudo -S <shell> -c <cmd>`，密码由调用方经 stdin 第一行喂进去
     （见 _sudo_stdin_prefix）——`sudo -S` 只读第一行当密码，剩下的 stdin
     仍然流向命令本身，所以带 stdin 的命令不受影响。
     """
+    sh = _shell_bin()
     flag = "-lc" if CFG.get("login_shell", True) else "-c"
     if not sudo or _is_root():
-        return "bash " + flag + " " + shlex.quote(cmd)
+        return sh + " " + flag + " " + shlex.quote(cmd)
     if CFG.get("sudo_password"):
-        return "sudo -S bash " + flag + " " + shlex.quote(cmd)
+        return "sudo -S " + sh + " " + flag + " " + shlex.quote(cmd)
     # 没配密码：尝试免密 sudo（-n），失败会明确报错，不会卡住
-    return "sudo -n bash " + flag + " " + shlex.quote(cmd)
+    return "sudo -n " + sh + " " + flag + " " + shlex.quote(cmd)
 
 
 def _sudo_stdin_prefix():
@@ -591,7 +619,7 @@ def run_local(command, sudo=False, timeout=None, work_dir=None, stdin=None):
         # 直接走 cmd /c；sudo 在 Windows 下无意义，忽略。
         argv = ["cmd", "/c", command]
     else:
-        argv = ["bash", "-c", _wrap(command, sudo=sudo)]
+        argv = [_shell_bin(), "-c", _wrap(command, sudo=sudo)]
     p = None
     try:
         # SEC-05：sudo 密码经 stdin 第一行喂给 `sudo -S`，不进命令行字符串。
@@ -717,7 +745,7 @@ def t_exec_async(a):
     if _is_windows():
         argv = ["cmd", "/c", cmd]
     else:
-        argv = ["bash", "-c", _wrap(cmd, sudo=bool(a.get("sudo")))]
+        argv = [_shell_bin(), "-c", _wrap(cmd, sudo=bool(a.get("sudo")))]
     try:
         proc = subprocess.Popen(
             argv,
@@ -840,18 +868,54 @@ SHELLS_LOCK = threading.Lock()
 SHELL_BUF_MAX = 512 * 1024     # 单会话保留最近 512KB 输出
 SHELL_TTL = 8 * 3600           # 已结束会话保留 8 小时
 SHELL_MAX = 8                  # 同时最多 8 个会话，防内存被撑爆
+# 客户端崩溃/断网时来不及 shell_close，会话会一直「活着」占槽位。客户端正常
+# 使用时每 5s 一次长轮询，last_read 一直在刷新；只有它真的不在了才不动。
+SHELL_IDLE = 30 * 60           # 30 分钟没人读 -> 认定客户端已消失，回收
+SHELL_IDLE_MIN = 120           # 槽位紧张时，空闲超过 2 分钟就挤掉（挤最久的）
+
+
+def _kill_shell(sess):
+    """关掉 PTY、杀掉子进程、回收僵尸。
+
+    顺序有讲究：先杀进程再关 fd。反过来的话 fd 号可能被别的连接复用，
+    读线程会读到别人的数据。
+    """
+    pid = sess.get("pid")
+    if pid:
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except Exception:
+            pass
+    try:
+        os.close(sess["fd"])
+    except Exception:
+        pass
+    if pid:
+        try:
+            os.waitpid(pid, os.WNOHANG)
+        except Exception:
+            pass
+    try:
+        sess["end"] = sess.get("end") or time.time()
+    except Exception:
+        pass
 
 
 def _shell_sweep():
+    """回收过期会话：已结束的按 TTL，**活着但没人读的按空闲时间**。"""
     now = time.time()
+    doomed = []
     with SHELLS_LOCK:
-        for sid in [k for k, s in SHELLS.items()
-                    if s.get("end") and now - s["end"] > SHELL_TTL]:
-            s = SHELLS.pop(sid)
-            try:
-                os.close(s["fd"])
-            except Exception:
-                pass
+        for sid, s in SHELLS.items():
+            if s.get("end"):
+                if now - s["end"] > SHELL_TTL:
+                    doomed.append(sid)
+            elif now - s.get("last_read", s.get("start", now)) > SHELL_IDLE:
+                doomed.append(sid)
+        victims = [SHELLS.pop(sid, None) for sid in doomed]
+    for sess in victims:
+        if sess:
+            _kill_shell(sess)
 
 
 def _shell_reader(sess):
@@ -894,21 +958,48 @@ def _b64e(b):
     return base64.b64encode(b).decode("ascii")
 
 
+def _pick_evictable(entries, now):
+    """槽位满时挑一个「明显没人管」的会话挤掉；挑不出来返回 None。
+
+    :param entries: ``[(last_read, sid), ...]``，只含仍活着的会话
+    :return: 可以回收的 sid，或 None（都在活跃使用中）
+
+    判据用 :data:`SHELL_IDLE_MIN`（2 分钟）而不是 :data:`SHELL_IDLE`（30 分钟）：
+    客户端正常时每 5s 长轮询一次，2 分钟没动静基本可以断定它已经不在了。
+    这样即使 8 个槽位都被断线会话占满，新连接也能立刻拿回一个。
+    """
+    if not entries:
+        return None
+    oldest_ts, oldest_sid = sorted(entries)[0]
+    if now - oldest_ts > SHELL_IDLE_MIN:
+        return oldest_sid
+    return None
+
+
 def t_shell_open(a):
     if _is_windows():
         return "Windows 端暂不支持交互式 shell（PTY），请用 exec / exec_async", True
     _shell_sweep()
+    evicted = None
     with SHELLS_LOCK:
-        alive = [k for k, s in SHELLS.items() if not s.get("end")]
+        alive = [(s.get("last_read", s.get("start", 0)), k)
+                 for k, s in SHELLS.items() if not s.get("end")]
         if len(alive) >= SHELL_MAX:
-            return ("会话数已达上限 %d；先 shell_close 掉不用的：%s"
-                    % (SHELL_MAX, ", ".join(sorted(alive)))), True
+            victim = _pick_evictable(alive, time.time())
+            if victim:
+                evicted = SHELLS.pop(victim, None)
+            else:
+                return ("会话数已达上限 %d，且都在活跃使用中；"
+                        "先 shell_close 掉不用的：%s"
+                        % (SHELL_MAX, ", ".join(sorted(k for _, k in alive)))), True
+    if evicted:
+        _kill_shell(evicted)
     import pty
     import fcntl
     import termios
     import struct
 
-    shell = a.get("shell") or os.environ.get("SHELL") or "/bin/bash"
+    shell = a.get("shell") or os.environ.get("SHELL") or _shell_bin()
     if not os.path.isfile(shell):
         shell = "/bin/sh"
     cols = max(20, min(500, int(a.get("cols") or 80)))
@@ -933,8 +1024,9 @@ def t_shell_open(a):
     except Exception:
         pass
     sid = "sh-" + uuid.uuid4().hex[:8]
+    now = time.time()
     sess = {"id": sid, "fd": fd, "pid": pid, "buf": b"", "base": 0, "total": 0,
-            "lock": threading.Lock(), "start": time.time(), "end": None,
+            "lock": threading.Lock(), "start": now, "last_read": now, "end": None,
             "exit": None, "shell": shell, "cols": cols, "rows": rows}
     with SHELLS_LOCK:
         SHELLS[sid] = sess
@@ -961,6 +1053,7 @@ def t_shell_write(a):
         return "没有数据", True
     if sess.get("end"):
         return "会话已结束，不能再写入", True
+    sess["last_read"] = time.time()      # 有交互就算「客户端还在」
     try:
         os.write(sess["fd"], data)
     except OSError as e:
@@ -977,6 +1070,7 @@ def t_shell_read(a):
     sess, err = _get_shell(a)
     if not sess:
         return err, True
+    sess["last_read"] = time.time()      # 空闲回收靠它区分「在用」和「没人管了」
     try:
         offset = int(a.get("offset") or 0)
     except Exception:
@@ -1042,25 +1136,19 @@ def t_shell_close(a):
     if not sess:
         return err, False          # 关闭不存在的会话不算错误（幂等）
     try:
-        os.kill(sess["pid"], signal.SIGHUP)
+        os.kill(sess["pid"], signal.SIGHUP)   # 先礼后兵：让 shell 有机会写历史
     except Exception:
         pass
     time.sleep(0.05)
-    try:
-        os.kill(sess["pid"], signal.SIGKILL)
-    except Exception:
-        pass
-    try:
-        os.close(sess["fd"])
-    except Exception:
-        pass
     with SHELLS_LOCK:
         SHELLS.pop(sess["id"], None)
+    _kill_shell(sess)
     return "已关闭 %s" % sess["id"], False
 
 
 def t_shell_list(a):
     _shell_sweep()
+    now = time.time()
     with SHELLS_LOCK:
         items = list(SHELLS.values())
     if not items:
@@ -1069,10 +1157,12 @@ def t_shell_list(a):
     for s in sorted(items, key=lambda x: x["start"]):
         with s["lock"]:
             total = s["total"]
-        age = int(time.time() - s["start"])
-        lines.append("%s  %-12s %dx%d  %ds  %d字节  %s"
+        age = int(now - s["start"])
+        idle = int(now - s.get("last_read", s["start"]))
+        # 空闲时间比总时长更能说明问题：客户端断线后它只涨不停
+        lines.append("%s  %-12s %dx%d  %ds  空闲%ds  %d字节  %s"
                      % (s["id"], os.path.basename(s["shell"]), s["cols"],
-                        s["rows"], age, total,
+                        s["rows"], age, idle, total,
                         "已结束" if s.get("end") else "运行中"))
     return "\n".join(lines), False
 
@@ -4082,6 +4172,25 @@ for _t in V51_TOOLS:
 # ---------------------------------------------------------------------------
 AUDIT_LOG_PATH = os.path.join(HERE, "audit.log")
 AUDIT_LOCK = threading.Lock()
+#: 审计日志上限。超了就轮转成 `.1`（只留一份），旧的自然被覆盖。
+#: 设备要「长时间在线」，日志就不能无限涨：软路由的 overlay 常常只有几百 MB，
+#: 写满之后设备直接起不来，而且故障现场看不出是日志撑爆的。
+AUDIT_MAX_BYTES = 5 * 1024 * 1024
+_AUDIT_WRITES = [0]
+
+
+def _audit_rotate():
+    """超过上限就把当前日志挪成 `.1`，从头开始写。"""
+    try:
+        if os.path.getsize(AUDIT_LOG_PATH) < AUDIT_MAX_BYTES:
+            return
+    except OSError:
+        return
+    try:
+        os.replace(AUDIT_LOG_PATH, AUDIT_LOG_PATH + ".1")
+    except OSError:
+        pass
+
 
 def _audit_log(tool_name, args_dict, client_ip=""):
     """记录每次危险工具调用到审计日志。"""
@@ -4097,6 +4206,10 @@ def _audit_log(tool_name, args_dict, client_ip=""):
         line = "%s | ip=%s | tool=%s | args=%s\n" % (
             ts, client_ip or "-", tool_name, json.dumps(summary, ensure_ascii=False))
         with AUDIT_LOCK:
+            # 每 100 行才 stat 一次，别让轮转检查本身变成每行的开销
+            _AUDIT_WRITES[0] += 1
+            if _AUDIT_WRITES[0] % 100 == 1:
+                _audit_rotate()
             with open(AUDIT_LOG_PATH, "a") as f:
                 f.write(line)
     except Exception:

@@ -1233,10 +1233,20 @@ _BULK_ARG_KEYS = frozenset([
 #: 数据载荷参与命令匹配的体积上限（字节）。超过即视为大块数据跳过扫描。
 _BULK_SCAN_LIMIT = 4096
 
-#: 参数会被真正交给 shell/进程执行的工具：其载荷不受体积上限保护。
+#: 参数会被真正交给 shell/进程执行的工具。
 _EXEC_TOOLS = frozenset([
     "exec", "shell", "shell_exec", "sh", "bash", "run", "run_command",
 ])
+
+#: 会把 stdin 当**命令**读的解释器。
+#:
+#: 只有这几种情况下 stdin 才可能变成"被执行的命令"，必须全量扫描；其余
+#: （`base64 -d > f`、`tar xz`、`cat > f`）stdin 只是数据，全量扫描等于让
+#: 随机 base64 里的 `/nft/` 把上传拦下来——实测 512KB 块有 5% 的命中率。
+_INTERPRETER_RE = re.compile(
+    r"(?:^|[|;&(]\s*|\bsudo\s+)(?:ba|z|da|k)?sh\b"
+    r"|\bpython[0-9.]*\b|\bperl\b|\bruby\b|\bnode\b|\bphp\b|\bosascript\b",
+    re.IGNORECASE)
 
 
 def _compile_rules(items, prefix):
@@ -1318,16 +1328,21 @@ def _split_args(value, cmds, payloads, depth=0):
             _split_args(item, cmds, payloads, depth + 1)
 
 
-def _payload_texts(tool, payloads):
+def _payload_texts(tool, payloads, cmd_text):
     """筛出仍需参与命令匹配的数据载荷。
 
     小体量文本载荷照样扫描——``write_file`` 写一段含 ``rm -rf /`` 的脚本值得
     拦一下；但超过 :data:`_BULK_SCAN_LIMIT` 的大块数据（大文件正文、base64
-    分块）一律跳过：它们不是命令行，全量匹配既慢（O(载荷 × 规则数)）又必然误判。
-    例外是真正把参数交给进程执行的工具（``exec`` 等），其 stdin 可能被 shell
-    解释，因此不设体积上限。
+    分块）一律跳过：它们不是命令行，全量匹配既慢（O(载荷 × 规则数)，1MB stdin
+    实测 150ms）又必然误判。
+
+    唯一例外是「stdin 会被当命令读」的场景：``exec`` 的 command 是
+    ``bash`` / ``python3`` 这类解释器时，stdin 就是命令本身，必须全量扫描。
+    判断依据是**命令文本**而不是工具名——``exec {"command": "base64 -d > f"}``
+    的 stdin 是数据，不该受连累。
     """
-    if str(tool).lower() in _EXEC_TOOLS:
+    if (str(tool).lower() in _EXEC_TOOLS
+            and _INTERPRETER_RE.search(cmd_text or "")):
         return list(payloads)
     return [p for p in payloads if len(p) <= _BULK_SCAN_LIMIT]
 
@@ -1340,14 +1355,18 @@ def _command_text(tool, args):
     （见 :data:`_BULK_ARG_KEYS`）按数据对待，只在小体量时参与匹配。
     """
     parts = [str(tool)]
+    cmd_fields = []
     for key in ("cmd", "command", "script", "argv", "shell", "exec"):
-        if isinstance(args.get(key), str):
-            parts.append(args[key])
+        value = args.get(key)
+        if isinstance(value, str):
+            parts.append(value)
+            cmd_fields.append(value)
     cmds = []
     payloads = []
     _split_args(args, cmds, payloads)
     parts.extend(cmds)
-    parts.extend(_payload_texts(tool, payloads))
+    # 判断「stdin 会不会被当命令读」只看命令字段本身，不看键名/路径
+    parts.extend(_payload_texts(tool, payloads, " ; ".join(cmd_fields)))
     return " ".join(parts)
 
 
