@@ -1219,6 +1219,25 @@ _PATH_ARG_KEYS = frozenset([
     "destination", "src", "source", "out", "output", "root",
 ])
 
+#: 承载「文件正文 / 二进制分块」的参数名（小写）——是数据，不是命令。
+#: 覆盖 write_file/upload 的 content、edit 的 oldText/newText、
+#: shell_write/tunnel_write 的 data_b64 等。
+_BULK_ARG_KEYS = frozenset([
+    "content", "data", "data_b64", "b64", "base64", "text", "body",
+    "payload", "blob", "chunk", "stdin",
+    "oldtext", "newtext", "oldtext_b64", "newtext_b64",
+    "old_string", "new_string", "old_str", "new_str",
+    "patch", "diff",
+])
+
+#: 数据载荷参与命令匹配的体积上限（字节）。超过即视为大块数据跳过扫描。
+_BULK_SCAN_LIMIT = 4096
+
+#: 参数会被真正交给 shell/进程执行的工具：其载荷不受体积上限保护。
+_EXEC_TOOLS = frozenset([
+    "exec", "shell", "shell_exec", "sh", "bash", "run", "run_command",
+])
+
 
 def _compile_rules(items, prefix):
     """把配置中的规则列表编译为 ``(rule_id, regex, reason)``。
@@ -1253,38 +1272,82 @@ def _compile_rules(items, prefix):
     return compiled
 
 
-def _collect_text(value, out, depth=0):
-    """递归收集 args 中的所有文本（用于命令匹配）。"""
+def _collect_strings(value, out, depth=0):
+    """递归收集值里的所有字符串（用于数据载荷提取）。"""
     if depth > 6:
         return
     if isinstance(value, str):
-        out.append(value)
-    elif isinstance(value, bool):
-        out.append("true" if value else "false")
-    elif isinstance(value, (int, float)):
-        out.append(str(value))
+        if value:
+            out.append(value)
     elif isinstance(value, dict):
         for key in value:
-            out.append(str(key))
-            _collect_text(value[key], out, depth + 1)
+            _collect_strings(value[key], out, depth + 1)
     elif isinstance(value, (list, tuple, set, frozenset)):
         for item in value:
-            _collect_text(item, out, depth + 1)
+            _collect_strings(item, out, depth + 1)
+
+
+def _split_args(value, cmds, payloads, depth=0):
+    """把 args 拆成「命令文本」与「数据载荷」两类。
+
+    - ``cmds``：会被当作命令解析的文本（含非典型字段名，防止藏命令绕过策略）
+    - ``payloads``：文件正文 / 二进制分块，属于数据而非命令
+
+    必须分流：``upload`` 的 ``content`` 是 base64 文件内容，若参与危险命令正则，
+    载荷里随机出现的 ``ufw``（仅 3 个字符）几乎必然命中，导致**每个大文件上传
+    都被误判为「防火墙变更」**。
+    """
+    if depth > 6:
+        return
+    if isinstance(value, str):
+        cmds.append(value)
+    elif isinstance(value, bool):
+        cmds.append("true" if value else "false")
+    elif isinstance(value, (int, float)):
+        cmds.append(str(value))
+    elif isinstance(value, dict):
+        for key in value:
+            child = value[key]
+            if str(key).lower() in _BULK_ARG_KEYS:
+                _collect_strings(child, payloads, depth + 1)
+            else:
+                cmds.append(str(key))
+                _split_args(child, cmds, payloads, depth + 1)
+    elif isinstance(value, (list, tuple, set, frozenset)):
+        for item in value:
+            _split_args(item, cmds, payloads, depth + 1)
+
+
+def _payload_texts(tool, payloads):
+    """筛出仍需参与命令匹配的数据载荷。
+
+    小体量文本载荷照样扫描——``write_file`` 写一段含 ``rm -rf /`` 的脚本值得
+    拦一下；但超过 :data:`_BULK_SCAN_LIMIT` 的大块数据（大文件正文、base64
+    分块）一律跳过：它们不是命令行，全量匹配既慢（O(载荷 × 规则数)）又必然误判。
+    例外是真正把参数交给进程执行的工具（``exec`` 等），其 stdin 可能被 shell
+    解释，因此不设体积上限。
+    """
+    if str(tool).lower() in _EXEC_TOOLS:
+        return list(payloads)
+    return [p for p in payloads if len(p) <= _BULK_SCAN_LIMIT]
 
 
 def _command_text(tool, args):
     """把 (tool, args) 归一化为可匹配的命令文本。
 
     优先使用常见的命令字段（cmd/command/script/argv），同时保留其他参数文本，
-    避免攻击者把危险命令藏在非典型字段里绕过策略。
+    避免攻击者把危险命令藏在非典型字段里绕过策略；但**文件正文类字段**
+    （见 :data:`_BULK_ARG_KEYS`）按数据对待，只在小体量时参与匹配。
     """
     parts = [str(tool)]
     for key in ("cmd", "command", "script", "argv", "shell", "exec"):
         if isinstance(args.get(key), str):
             parts.append(args[key])
-    collected = []
-    _collect_text(args, collected)
-    parts.extend(collected)
+    cmds = []
+    payloads = []
+    _split_args(args, cmds, payloads)
+    parts.extend(cmds)
+    parts.extend(_payload_texts(tool, payloads))
     return " ".join(parts)
 
 

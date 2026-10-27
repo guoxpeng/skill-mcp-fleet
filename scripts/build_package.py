@@ -134,8 +134,10 @@ def _carry(version):
 def check_version_sync():
     """校验版本号：三段式，且所有落点一致。
 
-    版本号在 5 个脚本 + SKILL frontmatter 里各有一份，靠人工同步必然漂移。
-    构建时统一对账，比发布后收到「节点报 5.2.0、技能市场写 5.2.1」的反馈便宜。
+    版本号在 7 个落点（6 个脚本/配置 + SKILL frontmatter）里各有一份，靠人工
+    同步必然漂移——fleet_agent.py 就漏过一次，节点对外报的版本和手册里写的
+    对不上。构建时统一对账，比发布后收到「节点报 5.2.0、技能市场写 5.2.1」
+    的反馈便宜。
     """
     errors = []
     if not VERSION_RE.match(DEFAULT_VERSION):

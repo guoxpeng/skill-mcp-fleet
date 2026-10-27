@@ -159,7 +159,7 @@ fleet forward --list nas                      # 看副端当前隧道
 ### 6.7 可复现的验证证据
 
 ```bash
-.venv/bin/python -m pytest tests/ -q        # 780 passed, 1 skipped
+.venv/bin/python -m pytest tests/ -q        # 815 passed, 1 skipped
 sh scripts/install.sh --dry-run --json --name demo   # 安装器零副作用预演
 bash scripts/demo.sh                        # 本机双节点 30 秒演示
 ```
@@ -175,20 +175,28 @@ bash scripts/demo.sh                        # 本机双节点 30 秒演示
 
 详情见 `references/platform-matrix.md` 第 15 节。
 
+**`fleet cp` 真机推拉（2026-10-27）**：起真 agent 进程（真 socket、真文件系统）后，
+推/拉 0 / 1 / 1000 / 4096 / 64K / 600K / 3MB 七档随机二进制 + 一个非 ASCII 路径，
+双向 SHA256 全一致、远端无残留分块。600KB 那档抓到过一个致命 bug：执行策略把
+`upload` 的 base64 正文当成命令行去匹配，`ufw`（3 个字符）在几十万字符里几乎必然
+命中，导致**大文件上传基本都会被判成「防火墙变更」**。修复后策略改为「命令字段」
+与「数据载荷」分流，详见 `CHANGELOG.md` 5.2.2「修复」。
+
 ## 七、提交包与合规
 
 ```bash
 python3 scripts/build_package.py
-# → dist/mcp-fleet-v5.2.1.zip + SHA256SUMS + MANIFEST.json
+# → dist/mcp-fleet-v5.2.2.zip + SHA256SUMS + MANIFEST.json
 ```
 
 - 提交包文件数 **≤ 30**、大小 **≤ 40 MB**，由脚本自动裁剪并以清单/SHA256 固化。
 - 纯标准库、零第三方运行时依赖、MIT 许可、可离线部署。
-- 版本：代码 `SERVER_VERSION=5.2.1` ＝ git tag `v5.2.1` ＝ GitHub Release。
+- 版本：代码 `SERVER_VERSION=5.2.2` ＝ git tag `v5.2.2` ＝ GitHub Release。
   完整演进见 `CHANGELOG.md`。
 - **版本号一律三段式 `X.Y.Z`**：默认只动补丁位（修 bug、稳定性、性能），
   新增能力才动次版本位，破坏性变更才动主版本位。构建脚本会做三段式校验与
-  同源对账（5 个脚本 + `SKILL.md` frontmatter），任何一处漂移直接判失败。
+  同源对账（6 个脚本/配置 + `SKILL.md` frontmatter，共 7 个落点），
+  任何一处漂移直接判失败。
   规则详见 `AGENTS.md` 4.1 节。
 
 ## 八、仓库结构

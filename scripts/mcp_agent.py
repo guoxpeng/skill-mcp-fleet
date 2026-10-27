@@ -4313,10 +4313,29 @@ def _enable_tcp_keepalive(sock):
         pass
 
 
+def _enable_tcp_nodelay(sock):
+    """关掉 Nagle：MCP 是「一问一答」，攒包只会等延迟 ACK。
+
+    HTTP 响应头是分几次小 write 发出去的，开着 Nagle 时后一段要等前一段的 ACK；
+    对端若走延迟 ACK（40ms 一拍），一个 174KB 的响应能被拖到 250ms——实测
+    `fleet cp` 拉 3MB 比推同样大小慢 4 倍就是这么来的。
+    """
+    try:
+        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+    except Exception:
+        pass
+
+
 class FleetHTTPServer(ThreadingHTTPServer):
     daemon_threads = True
     allow_reuse_address = True
     request_queue_size = 128
+
+    def get_request(self):
+        sock, addr = ThreadingHTTPServer.get_request(self)
+        # 每个连接一接进来就关 Nagle：响应体越大越吃亏（见 _enable_tcp_nodelay）
+        _enable_tcp_nodelay(sock)
+        return sock, addr
 
     def handle_error(self, request, client_address):
         # 单个连接出错不影响整体服务；只记一行，不打整段 traceback
@@ -4346,6 +4365,7 @@ class Handler(BaseHTTPRequestHandler):
         self.timeout = float(CFG.get("socket_timeout", 300) or 300)
         super().setup()
         _enable_tcp_keepalive(self.connection)
+        _enable_tcp_nodelay(self.connection)
 
     def handle(self):
         # v5.0.7: 连接级并发限流 —— 抢不到槽直接回 503，不进入业务处理。

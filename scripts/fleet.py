@@ -329,6 +329,15 @@ class _PooledHTTP(object):
             self._conn = http.client.HTTPConnection(phost, pport, timeout=self.timeout)
         else:
             self._conn = http.client.HTTPConnection(self.host, self.port, timeout=self.timeout)
+        # 立刻建连并关掉 Nagle：http.client 是「写头 → 写体 → 读响应」的
+        # 小包序列，攒包会让每请求多等一拍延迟 ACK（实测 174KB 响应
+        # 从 50ms 变 250ms）。延迟建连的话第一次 request 已经发出去了，
+        # 来不及设，所以这里主动 connect()。
+        try:
+            self._conn.connect()
+            self._conn.sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        except Exception:
+            pass
         return self._conn
 
     def close(self):
@@ -2745,28 +2754,65 @@ def cmd_directory(a):
 
 # ---------------------------------------------------------------- 对等配对（v3.5）
 
+def _is_cgnat(ip):
+    """100.64.0.0/10：Tailscale/CGNAT 用的地址段，局域网里不可路由。"""
+    try:
+        a, b = [int(x) for x in ip.split(".")[:2]]
+    except Exception:
+        return False
+    return a == 100 and 64 <= b <= 127
+
+
+def _iface_ipv4_fallback():
+    """从系统接口表里挑一个**局域网可路由**的 IPv4。
+
+    只在路由探测拿到 CGNAT/tailnet 地址时才用得上：那种地址对 tailnet 内
+    可达，但同一个局域网里的设备连不上，广播出去等于给了个错地址。
+    """
+    cmds = [["ifconfig"], ["ip", "-4", "-o", "addr"]]
+    for cmd in cmds:
+        rc, out = _sh(cmd, timeout=5)
+        if rc != 0 or not out:
+            continue
+        for ip in re.findall(r"inet (?:addr:)?(\d+\.\d+\.\d+\.\d+)", out):
+            if (ip.startswith("127.") or ip.startswith("169.254.")
+                    or _is_cgnat(ip)):
+                continue
+            return ip
+    return ""
+
+
 def _lan_ip():
     """本机局域网 IPv4。
 
     macOS 上不能只用「连 10.255.255.255 看源地址」这一招：开了 Tailscale
     出口节点（exit node）或全局 VPN 时，默认路由会走 utun*，拿到的是隧道
     地址，于是节点对外广播一个局域网里谁都连不上的 URL。
-    所以 darwin 先问 en0/en1（Wi-Fi / 有线），拿不到再退回路由探测。
+    所以 darwin 先问 en0/en1（Wi-Fi / 有线），拿不到再退回路由探测；
+    探测结果落在 100.64/10（tailnet）时，再从接口表里挑一个真实局域网地址。
     """
     if sys.platform == "darwin":
         for iface in ("en0", "en1", "en2"):
             rc, out = _sh(["ipconfig", "getifaddr", iface], timeout=5)
             ip = (out or "").strip()
-            if rc == 0 and re.match(r"^\d+\.\d+\.\d+\.\d+$", ip) and not ip.startswith("127."):
+            if (rc == 0 and re.match(r"^\d+\.\d+\.\d+\.\d+$", ip)
+                    and not ip.startswith("127.")
+                    # 169.254.x.x 是 DHCP 失败后的自配地址，广播出去谁也连不上
+                    and not ip.startswith("169.254.")):
                 return ip
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
         s.connect(("10.255.255.255", 1))
-        return s.getsockname()[0]
+        ip = s.getsockname()[0]
     except Exception:
-        return "127.0.0.1"
+        ip = "127.0.0.1"
     finally:
         s.close()
+    if _is_cgnat(ip):
+        real = _iface_ipv4_fallback()
+        if real:
+            return real
+    return ip
 
 
 def local_node(self_url=None):
@@ -4431,45 +4477,87 @@ def _cp_pull_file(client, remote, local, timeout, quiet=False):
 
 
 def _cp_push_file(client, local, remote, timeout, sudo=False, quiet=False):
-    """分块推送：每块 base64 后走 upload 落成 .fleetpart.N，最后 cat 拼回。"""
-    with open(local, "rb") as f:
-        data = f.read()
-    n = len(data)
-    if n == 0:
-        _cp_exec(client, ": > " + shlex.quote(remote), timeout=timeout)
-        return 0
+    """分块推送：每块 base64 后走 upload 落成 .fleetpart.N，最后分批 cat 拼回。
+
+    这里有三处不能省，都是踩过或必然会踩的：
+      * **流式读**，不整个 `f.read()`：几个 G 的文件会先把客户端撑爆
+      * **分批拼装**，不拼成一条超长命令：512KB 一块，1GB 就是 2048 个参数，
+        一条 cat 下去撞 ARG_MAX，远端报 "argument list too long"
+      * **拼完核对大小**：少一个字节就是坏文件，不能靠「命令没报错」当成功
+    """
     parts = []
-    for i in range(0, n, CP_PUSH_CHUNK):
-        chunk = data[i:i + CP_PUSH_CHUNK]
-        part = "%s.fleetpart.%d" % (remote, i // CP_PUSH_CHUNK)
-        args = {"filePath": part,
-                "content": base64.b64encode(chunk).decode("ascii")}
-        if sudo:
-            # 只在真的要提权时才带 sudo 键：执行策略会把参数文本里的 "sudo"
-            # 当成提权操作，带上 sudo:false 反而会触发「需要确认」。
-            # 命令行显式给了 --sudo，即视为用户已确认（confirm=true）。
-            args["sudo"] = True
-            args["confirm"] = True
-        text, iserr = client.call("upload", args, timeout=timeout)
-        if iserr:
-            raise MCPError("上传分块失败：%s" % (text or "")[:300])
-        parts.append(part)
-        if not quiet and n > CP_PUSH_CHUNK:
-            sys.stderr.write("\r  推送 %d%%（%d/%d 字节）" % (min(i + CP_PUSH_CHUNK, n) * 100 // n,
-                                                          min(i + CP_PUSH_CHUNK, n), n))
-            sys.stderr.flush()
-    if not quiet and n > CP_PUSH_CHUNK:
+    total = 0
+    try:
+        with open(local, "rb") as f:
+            idx = 0
+            while True:
+                chunk = f.read(CP_PUSH_CHUNK)
+                if not chunk:
+                    break
+                part = "%s.fleetpart.%d" % (remote, idx)
+                args = {"filePath": part,
+                        "content": base64.b64encode(chunk).decode("ascii")}
+                if sudo:
+                    # 只在真的要提权时才带 sudo 键：执行策略会把参数文本里的
+                    # "sudo" 当成提权操作，带上 sudo:false 反而会触发「需要确认」。
+                    # 命令行显式给了 --sudo，即视为用户已确认（confirm=true）。
+                    args["sudo"] = True
+                    args["confirm"] = True
+                text, iserr = client.call("upload", args, timeout=timeout)
+                if iserr:
+                    raise MCPError("上传分块失败：%s" % (text or "")[:300])
+                parts.append(part)
+                total += len(chunk)
+                idx += 1
+                if not quiet and total > CP_PUSH_CHUNK:
+                    sys.stderr.write("\r  推送 %d 字节（%d 块）" % (total, idx))
+                    sys.stderr.flush()
+    except Exception:
+        # 半路失败要把已经传上去的分块清掉，别在别人的目录里留一堆垃圾
+        _cp_clean_parts(client, remote, timeout)
+        raise
+    if not quiet and total > CP_PUSH_CHUNK:
         sys.stderr.write("\n")
-    quoted = " ".join(shlex.quote(p) for p in parts)
-    _cp_exec(client, "cat " + quoted + " > " + shlex.quote(remote)
-             + " && rm -f " + quoted, timeout=timeout)
+
+    if total == 0:
+        # 空文件走 upload 没有内容可传，只能 shell 里截断；但目标目录未必存在，
+        # 不先 mkdir 的话「推空文件」会比「推非空文件」更容易失败——很反直觉。
+        _cp_exec(client, "mkdir -p " + shlex.quote(os.path.dirname(remote) or ".")
+                 + " && : > " + shlex.quote(remote), timeout=timeout)
+        return 0
+
+    batch = 128
+    first = True
+    for i in range(0, len(parts), batch):
+        q = " ".join(shlex.quote(p) for p in parts[i:i + batch])
+        _cp_exec(client, "cat " + q + (" > " if first else " >> ")
+                 + shlex.quote(remote), timeout=timeout)
+        first = False
+    _cp_clean_parts(client, remote, timeout)
+
+    got = _remote_size(client, remote)
+    if got != total:
+        raise MCPError(
+            "推送后大小不符：本地 %d 字节，远端 %d 字节。\n"
+            "    文件很可能被截断（副端磁盘满 / upload 被限流），不要当成成功。"
+            % (total, got))
     # 保留本地权限位：推上去的可执行脚本不该变成 0644
     try:
         mode = os.stat(local).st_mode & 0o777
         _cp_exec(client, "chmod %o %s" % (mode, shlex.quote(remote)), timeout=timeout)
     except Exception:
         pass
-    return n
+    return total
+
+
+def _cp_clean_parts(client, remote, timeout):
+    """删掉 `<remote>.fleetpart.*`。用通配而不是逐个列名——上千个分块逐个
+    列出来同样会撞 ARG_MAX。"""
+    try:
+        _cp_exec(client, "rm -f " + shlex.quote(remote) + ".fleetpart.*",
+                 timeout=timeout)
+    except Exception:
+        pass                    # 清理失败不该盖住真正的错因
 
 
 def _remote_tar(client, path, timeout):
@@ -4594,16 +4682,44 @@ def _split_cp_spec(spec, known):
 # 所以这里只做四件事：看状态、自动纠正地址漂移、保活、把 tailnet 对端
 # 直接纳管成 fleet 节点。
 
+def _ts_probe(exe, timeout=4):
+    """这个二进制到底能不能当 CLI 用？
+
+    macOS 的 App 包里同时有 `Tailscale`（GUI 主程序）和 `tailscale`（真 CLI）。
+    只判断「文件存在」会先撞上 GUI 那个：它收到 `status --json` 既不输出也不报错，
+    于是 fleet 判定「未登录」，而实际上 Tailscale 好好跑着。
+    所以这里实际敲一下 `version`，有输出才算数。
+    """
+    try:
+        r = subprocess.run([exe, "version"], capture_output=True, text=True,
+                           timeout=timeout)
+    except Exception:
+        return False
+    return bool((r.stdout or "").strip())
+
+
 def _tailscale_bin():
-    """找 tailscale CLI。macOS 装了 App 但没加 PATH 的情况很常见。"""
-    cand = ["tailscale", "/usr/local/bin/tailscale", "/opt/homebrew/bin/tailscale",
+    """找可用的 tailscale CLI。
+
+    顺序有意义：先 PATH，再 Homebrew 的两个前缀，最后才进 App 包——
+    且 App 包里**小写** `tailscale` 优先（那是 CLI），大写 `Tailscale` 是 GUI。
+    每个候选都实测一次，都不响应时返回第一个找到的，让上层给出具体错误。
+    """
+    cand = ["tailscale",
+            "/opt/homebrew/bin/tailscale", "/usr/local/bin/tailscale",
+            "/Applications/Tailscale.app/Contents/MacOS/tailscale",
             "/Applications/Tailscale.app/Contents/MacOS/Tailscale",
             "/opt/bin/tailscale", "/usr/sbin/tailscale"]
+    first_found = None
     for c in cand:
         p = shutil.which(c) if os.path.sep not in c else (c if os.path.isfile(c) else None)
-        if p:
+        if not p:
+            continue
+        if first_found is None:
+            first_found = p
+        if _ts_probe(p):
             return p
-    return None
+    return first_found
 
 
 def _tailscale_status(timeout=8):
@@ -4620,7 +4736,13 @@ def _tailscale_status(timeout=8):
         return None, "调用 tailscale 失败：%s" % e
     out = (r.stdout or "").strip()
     if not out:
-        return None, "tailscale 无输出（多半是未登录：tailscale up）"
+        # 三种情况都长这样，得分开说，否则用户会去反复 tailscale up
+        return None, ("tailscale 没有输出。常见原因：\n"
+                      "      1) 未登录：tailscale up\n"
+                      "      2) 用的是 GUI 主程序而非 CLI（macOS App 包里小写的\n"
+                      "         tailscale 才是 CLI）：%s\n"
+                      "      3) 当前进程被沙盒/权限挡住，读不到 tailscaled（换到终端里跑一次对比）"
+                      % exe)
     try:
         data = json.loads(out)
     except ValueError:
@@ -6214,6 +6336,9 @@ def main():
         # str(KeyError) 返回的是 repr，会把 \n 显示成字面量，取 args[0] 才对
         msg = e.args[0] if e.args else e
         return die(str(msg).strip("'\""))
+    except MCPError as e:
+        # 远端/协议错误本身就是给人看的，别再套一层 "MCPError:"
+        return die(str(e))
     except KeyboardInterrupt:
         return 130
     except Exception as e:
