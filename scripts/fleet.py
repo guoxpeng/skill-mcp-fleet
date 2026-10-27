@@ -62,6 +62,7 @@ import shutil
 import socket
 import subprocess
 import sys
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -209,6 +210,53 @@ class MCPError(Exception):
     pass
 
 
+READ_CAP = 2 * 1024 * 1024  # S6：主控侧响应读取上限 2MB，防失控副端把内存撑爆
+
+
+def _read_capped(resp, limit=READ_CAP):
+    """限长读响应体：超限抛错，不全量进内存。"""
+    chunks = []
+    remaining = limit + 1
+    while True:
+        chunk = resp.read(min(65536, remaining))
+        if not chunk:
+            break
+        chunks.append(chunk)
+        remaining -= len(chunk)
+        if remaining <= 0:
+            raise MCPError("响应体超过 %d 字节上限，已拒绝（副端可能失控）" % limit)
+    return b"".join(chunks)
+
+
+def mask_token(tok):
+    """list --json 默认掩码：只留首尾各 4 字符，短令牌全掩。"""
+    t = tok or ""
+    if len(t) <= 8:
+        return "***" if t else ""
+    return t[:4] + "…" + t[-4:]
+
+
+class _Heartbeat:
+    """stderr 心跳：长调用超过 10 秒未返回时每 10 秒打一行，不污染 stdout。"""
+    def __init__(self, interval=10, msg="仍在等待副端返回…"):
+        self.interval = interval
+        self.msg = msg
+        self._stop = threading.Event()
+        self._th = None
+
+    def __enter__(self):
+        def _beat():
+            while not self._stop.wait(self.interval):
+                print(dim("[~] " + self.msg), file=sys.stderr)
+        self._th = threading.Thread(target=_beat, daemon=True)
+        self._th.start()
+        return self
+
+    def __exit__(self, *exc):
+        self._stop.set()
+        return False
+
+
 class MCPClient:
     """Streamable HTTP 客户端：initialize → notifications/initialized → tools/*"""
 
@@ -234,7 +282,7 @@ class MCPClient:
             with _opener_for(self.url).open(req, timeout=timeout or self.timeout) as r:
                 if r.headers.get("Mcp-Session-Id"):
                     self.sid = r.headers["Mcp-Session-Id"]
-                body = r.read().decode("utf-8", "ignore")
+                body = _read_capped(r).decode("utf-8", "ignore")
         except urllib.error.HTTPError as e:
             if e.code in (401, 403):
                 hint = ("副端开了鉴权，但本地没有它的 token。\n"
@@ -309,10 +357,12 @@ def http_probe(base_url, timeout=8, token="", retries=3):
     for attempt in range(max(1, retries + 1)):
         try:
             with _opener_for(req.full_url).open(req, timeout=timeout) as r:
-                return json.loads(r.read().decode("utf-8", "ignore") or "{}")
+                return json.loads(_read_capped(r).decode("utf-8", "ignore") or "{}")
         except Exception as e:
             if isinstance(e, urllib.error.HTTPError) and e.code in (401, 403):
                 raise
+            if isinstance(e, MCPError):
+                raise  # S6：响应超限不是 transient，不重试
             last_err = e
             if attempt < retries:
                 time.sleep(2 ** attempt)  # 1s, 2s, 4s ...
@@ -324,6 +374,12 @@ def normalize_url(host_or_url, port=3100):
     if not s:
         raise ValueError("空的地址")
     if not s.startswith(("http://", "https://")):
+        # S9：裸 IPv6 字面量必须加方括号，否则拼出的 URL 非法（冒号歧义）。
+        try:
+            if isinstance(ipaddress.ip_address(s), ipaddress.IPv6Address):
+                s = "[%s]" % s
+        except ValueError:
+            pass
         s = "http://%s:%d" % (s, port)
     s = s.rstrip("/")
     if not s.endswith("/mcp"):
@@ -457,28 +513,92 @@ def agent_config_paths():
     return out
 
 
+class RegistryCorruptError(Exception):
+    pass
+
+
+def _read_registry_file(path):
+    with open(path, encoding="utf-8") as f:
+        return json.load(f)
+
+
+def registry_corrupt():
+    """登记表文件存在但解析失败？（供写路径拒绝覆盖）"""
+    if not os.path.isfile(REGISTRY):
+        return False
+    try:
+        _read_registry_file(REGISTRY)
+        return False
+    except Exception:
+        return True
+
+
 def load_registry():
-    """本地登记表：即使 agent 不支持 MCP，也能用本脚本操控副端。"""
+    """本地登记表：即使 agent 不支持 MCP，也能用本脚本操控副端。
+
+    S1：损坏不再静默回退为空——若有 .bak 则回退 .bak 并大声警告；
+    无 .bak 才返回空表（调用方看到的是“没有节点”，不是“节点被清空”）。
+    """
     if os.path.isfile(REGISTRY):
         try:
-            with open(REGISTRY, encoding="utf-8") as f:
-                return json.load(f)
+            return _read_registry_file(REGISTRY)
         except Exception:
             pass
+        bak = REGISTRY + ".bak"
+        if os.path.isfile(bak):
+            try:
+                reg = _read_registry_file(bak)
+                print(warn("[!] 登记表 %s 已损坏，已回退到 .bak；请检查原文件，确认后手工恢复。"
+                           % REGISTRY), file=sys.stderr)
+                return reg
+            except Exception:
+                pass
     return {"nodes": {}}
 
 
 def save_registry(reg):
+    """S1：原子写 + .bak 轮转 + 损坏拒绝覆盖。
+
+    流程：当前文件若已损坏 → 直接拒绝（绝不拿空状态/新状态覆盖原文件，
+    避免一次坏写冲掉全部登记）；当前文件能解析 → 先拷一份 .bak（上一好
+    版本）；再写临时文件 + fsync + os.replace + 目录 fsync。
+    """
     d = os.path.dirname(REGISTRY)
     if d and not os.path.isdir(d):
         os.makedirs(d, exist_ok=True)
-    with open(REGISTRY, "w", encoding="utf-8") as f:
+    if registry_corrupt():
+        raise RegistryCorruptError(
+            "登记表 %s 已损坏，拒绝写入（避免覆盖原数据）。"
+            "请先从 %s.bak 恢复（确认内容无误后拷回），再重试。" % (REGISTRY, REGISTRY))
+    if os.path.isfile(REGISTRY):
+        try:
+            _read_registry_file(REGISTRY)
+            shutil.copyfile(REGISTRY, REGISTRY + ".bak")
+            try:
+                os.chmod(REGISTRY + ".bak", 0o600)
+            except Exception:
+                pass
+        except Exception:
+            pass
+    tmp = REGISTRY + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
         json.dump(reg, f, ensure_ascii=False, indent=2)
         f.write("\n")
+        f.flush()
+        os.fsync(f.fileno())
     # 登记表里有各副端的明文 Bearer 令牌，必须收紧权限；
     # 原来既不 chmod 也不设 umask，Linux 上默认 0644 = 同机任何用户可读。
     try:
-        os.chmod(REGISTRY, 0o600)
+        os.chmod(tmp, 0o600)
+    except Exception:
+        pass
+    os.replace(tmp, REGISTRY)
+    try:
+        dfd = os.open(d or ".", os.O_DIRECTORY)
+        try:
+            os.fsync(dfd)
+        finally:
+            os.close(dfd)
     except Exception:
         pass
 
@@ -648,7 +768,7 @@ def fetch_directory(url=None, token=None, timeout=6):
     if token:
         req.add_header("X-Fleet-Token", token)
     with _opener_for(req.full_url).open(req, timeout=timeout) as r:
-        data = json.loads(r.read().decode("utf-8", "ignore") or "{}")
+        data = json.loads(_read_capped(r).decode("utf-8", "ignore") or "{}")
     return data.get("nodes") or {}
 
 
@@ -663,10 +783,13 @@ def sync_from_directory(name, cur_url=None, timeout=8, quiet=False, verbose=True
         return None
     if cur_url:
         try:
-            if http_probe(cur_url, timeout=min(timeout, 5), token=token):
+            # L-01：存活预检不重试（重试层已够多：本层再重试会把单次同步拖长数倍）。
+            if http_probe(cur_url, timeout=min(timeout, 5), token=token, retries=0):
                 return None         # 还通着就别折腾
         except Exception:
             pass                    # 不通 → 继续去问目录
+    if not quiet:
+        print(dim("[sync] 正在查地址目录…"), file=sys.stderr)
     try:
         nodes = fetch_directory(durl, dtok, timeout)
     except Exception as e:
@@ -705,8 +828,11 @@ def sync_from_directory(name, cur_url=None, timeout=8, quiet=False, verbose=True
     # 拿不到身份一律拒绝（fail closed），避免把真令牌发给冒名地址。
     # 注意：这要求副端上报的 server 名与登记名一致（v4.5+ 均如此）；老
     # 副端若不报 server，会被拒绝，届时走手工 add（见闸门 1 的提示）。
+    # L-01：各阶段打进度（stderr，不污染 stdout）；鉴权探活不重试。
+    if not quiet:
+        print(dim("[sync] 正在验新地址（匿名探活 + 身份比对）…"), file=sys.stderr)
     try:
-        anon = http_probe(new_mcp, timeout=min(timeout, 6), token="")
+        anon = http_probe(new_mcp, timeout=min(timeout, 6), token="", retries=0)
     except Exception:
         anon = {}
     if (anon or {}).get("server") != name:
@@ -715,8 +841,10 @@ def sync_from_directory(name, cur_url=None, timeout=8, quiet=False, verbose=True
                        % (new_mcp, name, (anon or {}).get("server") or "(无)")),
                   file=sys.stderr)
         return None
+    if not quiet:
+        print(dim("[sync] 正在带鉴权确认新地址…"), file=sys.stderr)
     try:
-        if not http_probe(new_mcp, timeout=min(timeout, 6), token=token):
+        if not http_probe(new_mcp, timeout=min(timeout, 6), token=token, retries=0):
             raise RuntimeError("无响应")
     except Exception:
         if not quiet:
@@ -772,7 +900,15 @@ def client_for(target, agent=None, port=3100, timeout=30, sync=None):
 def cmd_list(a):
     nodes = discover_nodes(a.agent)
     if a.json:
-        print(json.dumps(nodes, ensure_ascii=False, indent=2))
+        # SEC-07：--json 默认掩码令牌，只留首尾；--show-tokens 才全量。
+        # 看门只读名字/地址/agent 字段，不受掩码影响。
+        out = {}
+        for name, m in nodes.items():
+            mm = dict(m)
+            if not getattr(a, "show_tokens", False) and mm.get("token"):
+                mm["token"] = mask_token(mm["token"])
+            out[name] = mm
+        print(json.dumps(out, ensure_ascii=False, indent=2))
         return 0
     if not nodes:
         print(warn("没有发现任何副端。"))
@@ -792,8 +928,8 @@ def cmd_list(a):
     print(dim("提示：agent 侧的 MCP 配置改完必须重启 agent 才生效；"
               "本脚本（exec/call）改完立即可用。"))
     if any(not n.get("token") for n in nodes.values()):
-        print(dim("      🔒 = 已配访问令牌；缺令牌的副端若开了鉴权会 401，"
-                  "用 add --token 补上。"))
+        print(dim("      🔒 = 已配访问令牌（L-13：只表示已配，不代表令牌有效）；"
+                  "缺令牌的副端若开了鉴权会 401，用 add --token 补上。"))
     return 0
 
 
@@ -854,14 +990,20 @@ def cmd_probe(a):
         return die("MCP 握手/列工具失败：%s" % e)
     print(ok("[+] ") + "MCP 握手成功，tools/list 返回 %d 个：%s"
           % (len(tools), ", ".join(t["name"] for t in tools[:6]) + (" ..." if len(tools) > 6 else "")))
+    # L-03：exec 试调失败时 probe 返回非 0（行为变更：以前恒 0，脚本无法
+    # 区分“可用”与“HTTP 通但工具坏”；帮助里已写明 probe 成功 = 可用）。
+    exec_ok = True
     try:
         text, iserr = c.call("exec", {"command": "hostname; uname -srm"}, timeout=a.timeout)
         code, out, _ = parse_exec(text)
         print((err if (iserr or code) else ok)("[%s] " % ("!" if (iserr or code) else "+"))
               + "exec 试调：exit=%d  %s" % (code, out.replace("\n", " / ")[:150]))
+        if iserr or code:
+            exec_ok = False
     except MCPError as e:
         print(warn("[!] ") + "exec 试调失败：%s" % e)
-    return 0
+        exec_ok = False
+    return 0 if exec_ok else 1
 
 
 def cmd_doctor(a):
@@ -1009,11 +1151,13 @@ def cmd_exec(a):
     if timeout_ms:
         args["timeoutMs"] = timeout_ms
     c = MCPClient(url, max(a.timeout, 120), token=meta.get("token", ""))
-    c.handshake()
-    try:
-        text, iserr = c.call("exec", args, timeout=max(a.timeout, 120))
-    except MCPError as e:
-        return die("调用失败：%s" % e)
+    # L-08：exec 超过 10 秒未返回时向 stderr 打心跳（不污染 stdout）；Ctrl-C 行为不变。
+    with _Heartbeat():
+        c.handshake()
+        try:
+            text, iserr = c.call("exec", args, timeout=max(a.timeout, 120))
+        except MCPError as e:
+            return die("调用失败：%s" % e)
     sys.stdout.write(text if text.endswith("\n") else text + "\n")
     return 1 if iserr else 0
 
@@ -1078,6 +1222,8 @@ def cmd_exec_async(a):
 def cmd_exec_poll(a):
     c = _mcp_client(a)
     args = {"job_id": a.job_id, "offset": a.offset}
+    if getattr(a, "limit", None):
+        args["limit"] = a.limit  # L-02：单次最多取多少字节，防全量输出撑内存
     try:
         text, iserr = c.call("exec_poll", args, timeout=max(a.timeout, 30))
     except MCPError as e:
@@ -1087,14 +1233,50 @@ def cmd_exec_poll(a):
 
 
 def cmd_exec_result(a):
+    """L-02：自动分页循环、流式写 stdout，不全量攒内存。
+
+    每轮取 64KB 分页（exec_poll limit），按 "--- offset X -> Y ---" 推进；
+    头行出现“已结束”即停，按 exit 码返回；--wait 是整轮最长等待秒数。
+    """
     c = _mcp_client(a)
-    args = {"job_id": a.job_id, "timeoutMs": int(a.wait * 1000)}
-    try:
-        text, iserr = c.call("exec_result", args, timeout=max(a.timeout, int(a.wait) + 30))
-    except MCPError as e:
-        return die("调用失败：%s" % e)
-    sys.stdout.write(text if text.endswith("\n") else text + "\n")
-    return 1 if iserr else 0
+    offset = 0
+    deadline = time.time() + max(1, a.wait)
+    with _Heartbeat(msg="仍在等待后台任务完成…"):
+        while True:
+            try:
+                text, iserr = c.call("exec_poll",
+                                     {"job_id": a.job_id, "offset": offset, "limit": 65536},
+                                     timeout=max(a.timeout, 30))
+            except MCPError as e:
+                return die("调用失败：%s" % e)
+            if iserr:
+                sys.stdout.write(text if text.endswith("\n") else text + "\n")
+                return 1
+            lines = text.split("\n")
+            head = lines[0] if lines else ""
+            body, nxt = "", None
+            for i, ln in enumerate(lines):
+                m = re.match(r"--- offset (\d+) -> (\d+) ---", ln.strip())
+                if m:
+                    nxt = int(m.group(2))
+                    body = "\n".join(lines[i + 1:])
+                    break
+            if nxt is None:
+                body = text  # 非预期格式：先把拿到的打出来，再按 deadline 决定
+            if body:
+                sys.stdout.write(body if body.endswith("\n") else body + "\n")
+                sys.stdout.flush()
+            if "已结束" in head:
+                m2 = re.search(r"exit=(-?\d+)", head)
+                code = int(m2.group(1)) if m2 else 0
+                return 0 if code == 0 else 1
+            if nxt is not None:
+                offset = nxt
+            if time.time() > deadline:
+                print(warn("等待超时（%ds），任务仍在运行；用 exec-poll %s 继续取"
+                           % (a.wait, a.job_id)), file=sys.stderr)
+                return 1
+            time.sleep(1)
 
 
 def cmd_exec_kill(a):
@@ -1117,51 +1299,84 @@ def cmd_exec_jobs(a):
     return 1 if iserr else 0
 
 
+def _health_one(name, url, ntok, timeout, deep):
+    """单节点体检（L-04：探活 retries 降为 1，单节点失败不再拖 40 秒以上）。"""
+    row = {"name": name, "url": url}
+    t0 = time.time()
+    try:
+        info = http_probe(url, timeout=timeout, token=ntok, retries=1)
+        row.update(status="up", version=info.get("version"),
+                   tools=info.get("tools"), ms=int((time.time() - t0) * 1000))
+        if deep:
+            c = MCPClient(url, timeout, token=ntok)
+            c.handshake()
+            text, iserr = c.call("exec", {"command": "echo OK"}, timeout=timeout)
+            code, out, _ = parse_exec(text)
+            row["deep"] = "OK" if (not iserr and not code and "OK" in out) else "FAIL"
+            if row["deep"] == "FAIL":
+                row["status"] = "degraded"
+    except Exception as e:
+        row.update(status="down", error=str(e)[:80], ms=int((time.time() - t0) * 1000))
+    return row
+
+
+def _health_line(r, w):
+    if r["status"] == "up":
+        extra = ("  deep=%s" % r["deep"]) if "deep" in r else ""
+        return ("  %s %-*s  v%-6s %3s 工具  %5d ms%s"
+                % (ok("UP  "), w, r["name"], r.get("version") or "?", r.get("tools") or 0,
+                   r["ms"], extra))
+    if r["status"] == "degraded":
+        return "  %s %-*s  HTTP 通但工具调用失败" % (warn("DEGR"), w, r["name"])
+    return ("  %s %-*s  %s%s" % (err("DOWN"), w, r["name"], r.get("error", ""),
+                                 dim("  登记地址可能过期，exec 会自动纠正")))
+
+
 def cmd_health(a):
     nodes = discover_nodes(a.agent)
     if not nodes:
         print(warn("没有发现任何副端。"))
         return 1
-    rows, bad = [], 0
-    for name in sorted(nodes):
-        url = nodes[name]["url"]
-        ntok = nodes[name].get("token", "")
-        row = {"name": name, "url": url}
-        t0 = time.time()
-        try:
-            info = http_probe(url, timeout=a.timeout, token=ntok)
-            row.update(status="up", version=info.get("version"),
-                       tools=info.get("tools"), ms=int((time.time() - t0) * 1000))
-            if a.deep:
-                c = MCPClient(url, a.timeout, token=ntok)
-                c.handshake()
-                text, iserr = c.call("exec", {"command": "echo OK"}, timeout=a.timeout)
-                code, out, _ = parse_exec(text)
-                row["deep"] = "OK" if (not iserr and not code and "OK" in out) else "FAIL"
-                if row["deep"] == "FAIL":
-                    row["status"] = "degraded"
-        except Exception as e:
-            row.update(status="down", error=str(e)[:80], ms=int((time.time() - t0) * 1000))
-        if row["status"] != "up":
-            bad += 1
-        rows.append(row)
+    names = sorted(nodes)
+    rows = []
+
+    def _run(n):
+        info = nodes[n]
+        return _health_one(n, info["url"], info.get("token", ""), a.timeout, a.deep)
 
     if a.json:
+        # JSON 必须一次成文，不逐行打印。
+        if getattr(a, "parallel", False):
+            from concurrent.futures import ThreadPoolExecutor
+            with ThreadPoolExecutor(max_workers=4) as ex:
+                rows = list(ex.map(_run, names))
+        else:
+            rows = [_run(n) for n in names]
+        bad = sum(1 for r in rows if r["status"] != "up")
         print(json.dumps(rows, ensure_ascii=False, indent=2))
         return 1 if bad else 0
 
-    w = max(len(r["name"]) for r in rows)
-    print("副端体检（%d 台，%s）\n" % (len(rows), time.strftime("%Y-%m-%d %H:%M:%S")))
-    for r in rows:
-        if r["status"] == "up":
-            extra = ("  deep=%s" % r["deep"]) if "deep" in r else ""
-            print("  %s %-*s  v%-6s %3s 工具  %5d ms%s"
-                  % (ok("UP  "), w, r["name"], r.get("version") or "?", r.get("tools") or 0,
-                     r["ms"], extra))
-        elif r["status"] == "degraded":
-            print("  %s %-*s  HTTP 通但工具调用失败" % (warn("DEGR"), w, r["name"]))
-        else:
-            print("  %s %-*s  %s" % (err("DOWN"), w, r["name"], r.get("error", "")))
+    # L-04：文本模式逐节点即时打印，不再等全部跑完才出结果。
+    w = max(len(n) for n in names)
+    print("副端体检（%d 台，%s）\n" % (len(names), time.strftime("%Y-%m-%d %H:%M:%S")), flush=True)
+    bad = 0
+    if getattr(a, "parallel", False):
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        with ThreadPoolExecutor(max_workers=4) as ex:
+            futs = {ex.submit(_run, n): n for n in names}
+            for fut in as_completed(futs):
+                r = fut.result()
+                rows.append(r)
+                if r["status"] != "up":
+                    bad += 1
+                print(_health_line(r, w), flush=True)  # 并行时按完成顺序出
+    else:
+        for n in names:
+            r = _run(n)
+            rows.append(r)
+            if r["status"] != "up":
+                bad += 1
+            print(_health_line(r, w), flush=True)
     print()
     print(ok("全部在线。") if not bad else warn("%d 台异常。" % bad))
     if bad:
@@ -1207,6 +1422,11 @@ def cmd_install_cmd(a):
         opts += " --require-auth"
     if a.uninstall:
         opts += " --uninstall"
+
+    # SEC-06：命令里含明文令牌/密码时先警告（会进 shell 历史与日志）。
+    if a.sudo_pass or getattr(a, "auth_token", None) or getattr(a, "directory_token", None):
+        print(warn("[!] 以下安装命令含明文令牌/密码，会进 shell 历史与日志；"), file=sys.stderr)
+        print(warn("    优先用 --generate-token 让副端现场生成，命令里不出现令牌。"), file=sys.stderr)
 
     local = os.path.join(HERE, "install.sh")
     if a.offline:
@@ -1604,6 +1824,17 @@ def cmd_sync(a):
             if not probe_anonymous(new, timeout=min(a.timeout, 6)):
                 print("  %-16s %s" % (name, warn("跳过：%s 不像 MCP 副端" % new)))
                 continue
+            # SEC-03：把 F7 的闸门 2.5 原样搬进 cmd_sync——匿名探活取 server 名
+            # 必须等于期望节点名，否则拒绝；拿不到身份也拒绝（令牌不发出）。
+            anon = {}
+            try:
+                anon = http_probe(new, timeout=min(a.timeout, 6), token="", retries=0)
+            except Exception:
+                anon = {}
+            if (anon or {}).get("server") != name:
+                print("  %-16s %s" % (name, warn("跳过：节点身份不符（期望 %s，实测 %s），拒绝采信"
+                                                % (name, (anon or {}).get("server") or "(无)"))))
+                continue
         flag = ok("NEW ") if cur and cur != new else dim("ok  ")
         if cur != new:
             changed += 1
@@ -1955,6 +2186,7 @@ def cmd_mesh(a):
     print(ok("=" * 60))
     print(ok("  Fleet Mesh 拓扑"))
     print(ok("=" * 60))
+    failed = 0  # L-12：任一节点失败则最终返回 1（以前恒 0，脚本无法判断）
     for name, info in sorted(nodes.items()):
         url = info.get("url", "")
         token = info.get("token", "")
@@ -1965,6 +2197,7 @@ def cmd_mesh(a):
             text, is_err = c.call("mesh", {})
             if is_err:
                 print(err("  [X] %-16s %s" % (name, url)))
+                failed += 1
                 continue
             mesh = json.loads(text)
             self_info = mesh.get("self", {})
@@ -1993,7 +2226,12 @@ def cmd_mesh(a):
                     print("      " + err("|- ") + "%-14s 离线 %s" % (pname, ts))
         except Exception as e:
             print(err("  [X] %-16s %s  (%s)" % (name, url, e)))
+            failed += 1
     print(ok("=" * 60))
+    if failed:
+        print(warn("  %d 台异常（见上方 [X]）" % failed))
+        return 1
+    print(ok("  全部在线"))
     return 0
 
 def cmd_msg(a):
@@ -2005,7 +2243,12 @@ def cmd_msg(a):
     # 改走统一的 resolve_target（与 list/probe/exec 一致，令牌走统一读路径）。
     url, meta = resolve_target(target, agent=a.agent, port=a.port)
     token = meta.get("token", "")
-    c = MCPClient(url, a.timeout, token=token)
+    # L-11：recv 分支的调用超时按 max(客户端超时, wait+30) 算，否则 wait
+    # 一长（如 300 秒）客户端先 120 秒超时，recv 永远等不到消息。
+    timeout = a.timeout
+    if a.msg_cmd == "recv":
+        timeout = max(a.timeout, (a.wait or 0) + 30)
+    c = MCPClient(url, timeout, token=token)
     c.handshake()
     if a.msg_cmd == "send":
         text, is_err = c.call("msg_send", {
@@ -2030,6 +2273,22 @@ def cmd_msg(a):
     if is_err:
         return die(text)
     print(text)
+    return 0
+
+
+def cmd_ping(a):
+    """L-18：GET-only 轻探活——只做 http_probe，不握手不 exec。
+
+    看门 probe 腿用：退出码 0 = 可达，1 = 不可达；单次尝试（retries=0），
+    不把轻探活拖成 30 秒以上的重试链。
+    """
+    url, meta = resolve_target(a.target, a.agent, a.port)
+    try:
+        http_probe(url, timeout=a.timeout, token=meta.get("token", ""), retries=0)
+    except Exception as e:
+        print(err("[X] %s 不可达：%s" % (a.target, e)))
+        return 1
+    print(ok("[+] %s 可达" % a.target))
     return 0
 
 
@@ -2094,12 +2353,14 @@ def build_parser():
         sp.add_argument("--timeout", type=int, default=30, help="超时秒数（默认 30）")
         sp.add_argument("--json", action="store_true", help="输出 JSON")
         sp.add_argument("--no-sync", action="store_true",
-                        help="不查地址目录、不自动跟随隧道新地址")
+                        help="不查地址目录、不自动跟随隧道新地址（同步卡住时的逃生口）")
         return sp
 
     sp = sub.add_parser("list", help="列出已注册的副端")
     sp.add_argument("--agent", default="auto")
     sp.add_argument("--json", action="store_true")
+    sp.add_argument("--show-tokens", action="store_true",
+                    help="--json 时输出完整令牌（默认只留首尾掩码）")
     sp.set_defaults(func=cmd_list)
 
     sp = sub.add_parser("targets", help="只输出副端名字（供脚本消费）")
@@ -2107,21 +2368,22 @@ def build_parser():
     sp.set_defaults(func=cmd_targets)
 
     common(sub.add_parser("tools", help="列副端工具清单")).set_defaults(func=cmd_tools)
-    common(sub.add_parser("probe", help="连通性 + 握手 + 试调（只读）")).set_defaults(func=cmd_probe)
+    common(sub.add_parser("probe", help="连通性 + 握手 + 试调（只读；试调失败返回非 0，probe 成功 = 可用）")).set_defaults(func=cmd_probe)
+    common(sub.add_parser("ping", help="轻探活：只 GET /，不握手不 exec（看门 probe 腿用）")).set_defaults(func=cmd_ping)
     sp = common(sub.add_parser("doctor", help="完整链路体检"))
     sp.add_argument("--check-banner", action="store_true",
                     help="额外检测登录 shell 是否往每次返回里塞欢迎横幅")
     sp.add_argument("--dir", help="副端安装目录（默认 /opt/<name>_mcp）")
     sp.set_defaults(func=cmd_doctor)
 
-    sp = common(sub.add_parser("exec", help="在副端执行 shell 命令"))
+    sp = common(sub.add_parser("exec", help="在副端执行 shell 命令（客户端超时下限 120 秒，缩短单命令请用 --timeout-ms）"))
     sp.add_argument("command", nargs=argparse.REMAINDER, help="要执行的命令")
     sp.add_argument("--sudo", action="store_true", help="用 sudo 执行")
     sp.add_argument("--workdir", help="工作目录")
     sp.add_argument("--timeout-ms", type=int, help="命令超时（毫秒）")
     sp.set_defaults(func=cmd_exec)
 
-    sp = common(sub.add_parser("call", help="调任意工具"))
+    sp = common(sub.add_parser("call", help="调任意工具（客户端超时下限 120 秒）"))
     sp.add_argument("--tool", required=True, help="工具名（list 表示列工具）")
     sp.add_argument("--args", help="参数 JSON")
     sp.add_argument("--arg", action="append", metavar="k=v",
@@ -2137,6 +2399,7 @@ def build_parser():
     sp = common(sub.add_parser("exec-poll", help="取后台任务的增量输出"))
     sp.add_argument("job_id", help="exec-async 返回的 job_id")
     sp.add_argument("--offset", type=int, default=0, help="从第几个字节开始取（默认 0）")
+    sp.add_argument("--limit", type=int, default=None, help="单次最多取多少字节（默认全量）")
     sp.set_defaults(func=cmd_exec_poll)
 
     sp = common(sub.add_parser("exec-result", help="等待后台任务完成并取全量输出"))
@@ -2156,6 +2419,8 @@ def build_parser():
     sp.add_argument("--deep", action="store_true", help="额外真实调用一次 exec")
     sp.add_argument("--timeout", type=int, default=10)
     sp.add_argument("--json", action="store_true")
+    sp.add_argument("--parallel", action="store_true",
+                    help="线程池（4 并发）并行体检（默认串行；并行时输出按完成顺序）")
     sp.set_defaults(func=cmd_health)
 
     sp = sub.add_parser("install-cmd", help="打印副端安装命令")
@@ -2165,7 +2430,7 @@ def build_parser():
     sp.add_argument("--sudo-pass", help="副端 sudo 密码（会明文写进配置）")
     sp.add_argument("--mode", default="auto", choices=["auto", "systemd", "nohup"])
     sp.add_argument("--tunnel", action="store_true", help="装完顺带起公网隧道")
-    sp.add_argument("--auth-token", help="副端访问令牌（开了隧道务必设；不设则由隧道脚本自动生成）")
+    sp.add_argument("--auth-token", help="副端访问令牌（优先用 --generate-token 让副端现场生成，避免令牌进 shell 历史；开了隧道务必设）")
     sp.add_argument("--allow-ips", help="副端 IP 白名单，逗号分隔 CIDR，如 '10.0.0.0/8,203.0.113.7'")
     sp.add_argument("--directory", help="地址目录地址，副端保活守护会把隧道地址上报到这里")
     sp.add_argument("--directory-token", help="地址目录的令牌（目录开了鉴权时填）")
@@ -2314,6 +2579,14 @@ def main():
         AUTO_SYNC = False
     try:
         return a.func(a)
+    except BrokenPipeError:
+        # L-14：管道给 head 掐断时静默退出 0，不再把 BrokenPipeError 当报错刷屏。
+        try:
+            devnull = os.open(os.devnull, os.O_WRONLY)
+            os.dup2(devnull, sys.stdout.fileno())
+        except Exception:
+            pass
+        return 0
     except KeyError as e:
         # str(KeyError) 返回的是 repr，会把 \n 显示成字面量，取 args[0] 才对
         msg = e.args[0] if e.args else e
