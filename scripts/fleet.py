@@ -298,6 +298,8 @@ def http_probe(base_url, timeout=8, token="", retries=3):
 
     隧道刚起来 / 网络抖动时首次请求可能超时，默认重试 3 次（指数退避
     1s / 2s / 4s），都失败才抛异常。retries=0 可关闭重试。
+    F3：401/403 是鉴权失败、不是 transient，立即重抛，不重试、不把令牌
+    连发 4 次，也不在失败一次上拖 7 秒以上。
     """
     base = base_url[:-4] if base_url.endswith("/mcp") else base_url.rstrip("/")
     req = urllib.request.Request(base + "/", headers={"Accept": "application/json"})
@@ -309,6 +311,8 @@ def http_probe(base_url, timeout=8, token="", retries=3):
             with _opener_for(req.full_url).open(req, timeout=timeout) as r:
                 return json.loads(r.read().decode("utf-8", "ignore") or "{}")
         except Exception as e:
+            if isinstance(e, urllib.error.HTTPError) and e.code in (401, 403):
+                raise
             last_err = e
             if attempt < retries:
                 time.sleep(2 ** attempt)  # 1s, 2s, 4s ...
@@ -694,6 +698,21 @@ def sync_from_directory(name, cur_url=None, timeout=8, quiet=False, verbose=True
     if not probe_anonymous(new_mcp, timeout=min(timeout, 6)):
         if not quiet:
             print(warn("目录给的 %s 看起来不是 MCP 副端（无凭据探活未通过）" % new),
+                  file=sys.stderr)
+        return None
+    # ---- 防投毒闸门 2.5：匿名探活返回的节点身份必须就是期望节点 ----
+    # GET / 对未认证者也返回 server（节点名），令牌发出前先比对；不符或
+    # 拿不到身份一律拒绝（fail closed），避免把真令牌发给冒名地址。
+    # 注意：这要求副端上报的 server 名与登记名一致（v4.5+ 均如此）；老
+    # 副端若不报 server，会被拒绝，届时走手工 add（见闸门 1 的提示）。
+    try:
+        anon = http_probe(new_mcp, timeout=min(timeout, 6), token="")
+    except Exception:
+        anon = {}
+    if (anon or {}).get("server") != name:
+        if not quiet:
+            print(warn("目录给的 %s 节点身份不符（期望 %s，实测 %s），拒绝采信"
+                       % (new_mcp, name, (anon or {}).get("server") or "(无)")),
                   file=sys.stderr)
         return None
     try:
@@ -1927,8 +1946,9 @@ def cmd_accept(a):
 
 def cmd_mesh(a):
     """打印 mesh 拓扑图：本节点 + 所有 peers 的在线状态和能力摘要。"""
-    reg = load_registry()
-    nodes = reg.get("nodes", {})
+    # F2：原来只读登记表 + 只认裸 token，既漏 workbuddy 条目又重蹈凭据双轨；
+    # 改用 discover_nodes（与 list/probe/exec/health 一致，令牌走统一读路径）。
+    nodes = discover_nodes(a.agent)
     if not nodes:
         print(warn("[!] ") + "没有已注册的节点。用 fleet.py add / pair 添加。")
         return 1
@@ -1978,12 +1998,13 @@ def cmd_mesh(a):
 
 def cmd_msg(a):
     """fleet msg send/recv/history -- 通过 peer_call 调远程节点的 msg 工具。"""
-    reg = load_registry()
-    nodes = reg.get("nodes", {})
     target = getattr(a, "target", None)
     if not target:
         return die("需要指定 target 节点")
-    url, token = _resolve_target(target, a)
+    # F1：原来调不存在的 _resolve_target，任何 msg 调用都 NameError；
+    # 改走统一的 resolve_target（与 list/probe/exec 一致，令牌走统一读路径）。
+    url, meta = resolve_target(target, agent=a.agent, port=a.port)
+    token = meta.get("token", "")
     c = MCPClient(url, a.timeout, token=token)
     c.handshake()
     if a.msg_cmd == "send":
@@ -2251,6 +2272,10 @@ def build_parser():
     sp.set_defaults(func=cmd_directory)
 
     sp = sub.add_parser("mesh", help="打印 mesh 拓扑图（节点在线状态 + 能力 + peer 关系）")
+    # F2 附带：原来 mesh 解析器没有 --agent，cmd_mesh 改用 discover_nodes(a.agent)
+    # 后会 AttributeError；这里补上，与其它命令一致。
+    sp.add_argument("--agent", default="auto",
+                    help="指定 agent 配置（workbuddy/claude/cursor/...，默认 auto 全扫）")
     sp.add_argument("--timeout", type=int, default=15)
     sp.set_defaults(func=cmd_mesh)
 
