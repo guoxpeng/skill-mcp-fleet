@@ -206,15 +206,47 @@ DEFAULT_CONFIG = {
 }
 
 
+_CONFIG_LOAD_ERROR = ""
+
+
 def load_config():
+    """读配置。解析失败时记下原因，由 die_if_config_corrupt 决定是否拒绝启动。
+
+    损坏的配置**不能静默用默认值继续跑**：默认值里没有 auth_token，节点会
+    以「无鉴权」姿态监听，而用户以为自己还开着鉴权——这比直接挂掉危险得多。
+    """
+    global _CONFIG_LOAD_ERROR
+    _CONFIG_LOAD_ERROR = ""
     cfg = dict(DEFAULT_CONFIG)
     if os.path.exists(CONFIG_PATH):
         try:
             with open(CONFIG_PATH, encoding="utf-8") as f:
                 cfg.update(json.load(f))
         except Exception as e:
+            _CONFIG_LOAD_ERROR = str(e)
             print("[warn] 读配置失败，用默认值: %s" % e, file=sys.stderr)
     return cfg
+
+
+def die_if_config_corrupt():
+    """配置损坏则拒绝启动（退出码 2），并打印可操作的修复指引。"""
+    if not _CONFIG_LOAD_ERROR:
+        return
+    print("", file=sys.stderr)
+    print("[FATAL] 配置文件解析失败，拒绝启动：%s" % CONFIG_PATH, file=sys.stderr)
+    print("        原因：%s" % _CONFIG_LOAD_ERROR, file=sys.stderr)
+    print("", file=sys.stderr)
+    print("        用默认值继续跑会让本节点以「无鉴权」姿态监听，", file=sys.stderr)
+    print("        所以这里选择直接停下，而不是带病上岗。", file=sys.stderr)
+    print("", file=sys.stderr)
+    print("        修复：", file=sys.stderr)
+    print("          1) 看文件哪里坏了：  python3 -c \"import json;json.load(open('%s'))\""
+          % CONFIG_PATH, file=sys.stderr)
+    print("          2) 备份后重装节点：  cp %s %s.broken && sh install.sh --name <名字>"
+          % (CONFIG_PATH, CONFIG_PATH), file=sys.stderr)
+    print("          3) 已装好的节点也可先手工补一个合法 JSON（至少保留 auth_token）",
+          file=sys.stderr)
+    sys.exit(2)
 
 
 def save_config(cfg):
@@ -247,6 +279,7 @@ SERVER_NAME = CFG.get("name", "node")
 # 版本以代码为准：配置文件里的 version 是安装当时写的，重装时不覆盖，会显示成旧版本
 AGENT_VERSION = DEFAULT_CONFIG["version"]
 SERVER_VERSION = AGENT_VERSION
+_STARTED_AT = time.time()       # 进程启动时刻：/health 报 uptime，看门可判「刚重启过」
 PREFIX = CFG.get("tool_prefix", "") or ""
 PROCESS_START = time.time()
 
@@ -500,17 +533,37 @@ def _decode_output(b):
         return b.decode("utf-8", "ignore")
 
 
+RUN_BUF_MAX = 1048576      # 单次同步 exec 输出上限 1MB（超出截断并提示）
+
+
 def _wrap(cmd, sudo=False):
-    """把命令包成最终交给 bash 执行的字符串。全部用字符串拼接，避免 % 吃掉花括号。"""
+    """把命令包成最终交给 bash 执行的字符串。全部用字符串拼接，避免 % 吃掉花括号。
+
+    SEC-05：密码**绝不**出现在命令行字符串里。命令行对同机所有用户可见
+    （`ps aux` 一行就看完），把密码 echo 进去等于把 sudo 密码写在公告板上。
+    这里只生成 `sudo -S bash -c <cmd>`，密码由调用方经 stdin 第一行喂进去
+    （见 _sudo_stdin_prefix）——`sudo -S` 只读第一行当密码，剩下的 stdin
+    仍然流向命令本身，所以带 stdin 的命令不受影响。
+    """
     flag = "-lc" if CFG.get("login_shell", True) else "-c"
     if not sudo or _is_root():
         return "bash " + flag + " " + shlex.quote(cmd)
-    pw = CFG.get("sudo_password") or ""
-    if pw:
-        return ("printf '%s\\n' " + shlex.quote(pw)
-                + " | sudo -S bash " + flag + " " + shlex.quote(cmd))
+    if CFG.get("sudo_password"):
+        return "sudo -S bash " + flag + " " + shlex.quote(cmd)
     # 没配密码：尝试免密 sudo（-n），失败会明确报错，不会卡住
     return "sudo -n bash " + flag + " " + shlex.quote(cmd)
+
+
+def _sudo_stdin_prefix():
+    """SEC-05：`sudo -S` 用的 stdin 前缀（密码行）。
+
+    调用方把它拼在原 stdin 之前。`sudo -S` 只消费第一行当密码，余下字节
+    原样转给子命令，所以 `cat > f` 这类吃 stdin 的命令语义不变。
+    """
+    pw = CFG.get("sudo_password") or ""
+    if not pw:
+        return b""
+    return (pw + "\n").encode("utf-8")
 
 
 def _kill_tree(p):
@@ -541,20 +594,31 @@ def run_local(command, sudo=False, timeout=None, work_dir=None, stdin=None):
         argv = ["bash", "-c", _wrap(command, sudo=sudo)]
     p = None
     try:
+        # SEC-05：sudo 密码经 stdin 第一行喂给 `sudo -S`，不进命令行字符串。
+        # 没有密码时 stdin 保持原样（None → DEVNULL，不阻塞读 stdin 的命令）。
+        stdin_bytes = stdin.encode("utf-8") if stdin is not None else b""
+        if sudo and not _is_windows():
+            stdin_bytes = _sudo_stdin_prefix() + stdin_bytes
         # POSIX 下放进独立进程组：超时时整组杀掉。原来只杀 bash，
         # 它拉起的子孙进程（如 `ping`、`tail -f`、后台服务）会成孤儿继续跑，
         # 还可能攥着管道让 communicate 迟迟不返回，请求线程被拖住。
         p = subprocess.Popen(
             argv,
             cwd=wd if os.path.isdir(wd) else None,
-            stdin=subprocess.PIPE if stdin is not None else subprocess.DEVNULL,
+            stdin=subprocess.PIPE if stdin_bytes else subprocess.DEVNULL,
             stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             start_new_session=not _is_windows(),
         )
         out, err = p.communicate(
-            input=stdin.encode("utf-8") if stdin is not None else None,
+            input=stdin_bytes or None,
             timeout=t)
-        return (p.returncode, _decode_output(out), _decode_output(err))
+        code, so, se = p.returncode, _decode_output(out), _decode_output(err)
+        # 单次同步 exec 输出上限：一个 `cat /dev/urandom` 或 `yes` 就能让
+        # agent 吃满内存、把整台设备拖死。截断而不是丢弃，并明确告诉调用方。
+        if len(so) > RUN_BUF_MAX:
+            so = so[:RUN_BUF_MAX]
+            se += "\n[输出超 1MB 已截断；大输出请用 exec_async + exec_poll 分页取]"
+        return (code, so, se)
     except subprocess.TimeoutExpired:
         _kill_tree(p)
         try:
@@ -1323,6 +1387,119 @@ def save_peers(d):
     os.replace(tmp, PEERS_PATH)
 
 
+# ---------------------------------------------------------------------------
+# 邀请码：文件位置 / 原子写 / 并发消费
+# ---------------------------------------------------------------------------
+INVITE_LOCK = threading.Lock()     # 同一邀请码只能被消费一次
+
+
+def _invite_file_path():
+    """invites.json 与配置同目录（动态算，测试会改 CONFIG_PATH）。"""
+    return os.path.join(os.path.dirname(CONFIG_PATH), "invites.json")
+
+
+def _load_invites(path=None):
+    try:
+        with open(path or _invite_file_path(), encoding="utf-8") as f:
+            d = json.load(f)
+        return d if isinstance(d, dict) else {}
+    except Exception:
+        return {}
+
+
+def _save_invites_atomic(invites, path=None):
+    """临时文件 + fsync + os.replace：写一半断电不会留下空 invites 文件。
+
+    原来直接 json.dump 覆盖，进程被 Termux 杀掉时会把「已消费」标记丢掉，
+    同一个邀请码就能被用两次。
+    """
+    p = path or _invite_file_path()
+    tmp = p + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(invites, f, ensure_ascii=False, indent=2)
+        f.flush()
+        os.fsync(f.fileno())
+    try:
+        os.chmod(tmp, 0o600)
+    except Exception:
+        pass
+    os.replace(tmp, p)
+
+
+def _verify_invite(payload):
+    """消费一个邀请码并完成双向配对。返回 (http_code, body_dict)。
+
+    整段在 INVITE_LOCK 内完成「校验 → 标记已用 → 落盘」，
+    并发请求只有一个能拿到 200；标记写失败返回 500（而不是假装成功），
+    否则对端以为配好了、本端其实没记下来。
+    """
+    invite_id = (payload or {}).get("invite_id", "")
+    peer_name = (payload or {}).get("name", "")
+    peer_url = (payload or {}).get("url", "")
+    peer_token = (payload or {}).get("token", "")
+    peer_pub = (payload or {}).get("public_key", "")
+    peer_nid = (payload or {}).get("node_id", "")
+    peer_fp = (payload or {}).get("fingerprint", "")
+    if not invite_id or not peer_name or not peer_url:
+        return 400, {"error": "need invite_id, name, url"}
+    with INVITE_LOCK:
+        invites = _load_invites()
+        inv = invites.get(invite_id)
+        if not inv:
+            return 403, {"error": "邀请码不存在"}
+        if inv.get("used"):
+            return 403, {"error": "邀请码已使用"}
+        if int(time.time()) > inv.get("expires", 0):
+            return 403, {"error": "邀请码已过期"}
+        with PEERS_LOCK:
+            d = load_peers()
+            d.setdefault("nodes", {})[peer_name] = {
+                "url": peer_url, "token": peer_token, "added_by": "invite",
+                "updated": int(time.time()), "public_key": peer_pub,
+                "node_id": peer_nid, "fingerprint": peer_fp}
+            save_peers(d)
+        inv["used"] = True
+        inv["used_by"] = peer_name
+        inv["used_at"] = int(time.time())
+        try:
+            _save_invites_atomic(invites)
+        except Exception as e:
+            # 配对已写入 peers，但「已用」没落盘：明确报错，让对端重试而不是
+            # 以为邀请码还能用一次。
+            return 500, {"error": "已配对，但标记邀请码失败：%s（可重试）" % e}
+    return 200, {
+        "ok": True,
+        "verified": True,
+        "my_name": SERVER_NAME,
+        "my_url": self_url(),
+        "my_token": CFG.get("auth_token", ""),
+        "my_public_key": IDENTITY.public_key_b64 if IDENTITY else "",
+        "my_node_id": IDENTITY.node_id if IDENTITY else "",
+        "my_fingerprint": IDENTITY.fingerprint if IDENTITY else "",
+        "my_version": SERVER_VERSION,
+        "message": "确权通过，已与 %s 建立连接" % peer_name,
+    }
+
+
+def _verify_agent(url, timeout=5):
+    """判断一个地址后面是不是真的 MCP 副端（配对/发现前的验真）。
+
+    只认「GET / 返回 JSON 且带 server 或 status」——一个静态网页、
+    一个报 404 的端口、一个死地址都不算。用于避免把「随便什么 HTTP 服务」
+    当成设备收进登记表。
+    """
+    base = url[:-4] if url.endswith("/mcp") else url.rstrip("/")
+    try:
+        req = urllib.request.Request(base + "/",
+                                     headers={"Accept": "application/json"})
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            raw = r.read(65536).decode("utf-8", "ignore")
+        data = json.loads(raw)
+        return isinstance(data, dict) and bool(data.get("server") or data.get("status"))
+    except Exception:
+        return False
+
+
 def _lan_ip():
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
@@ -1334,9 +1511,46 @@ def _lan_ip():
         s.close()
 
 
+_TS_IP_CACHE = {"at": 0.0, "ip": ""}
+
+
+def _tailscale_ip():
+    """本机 tailnet IP（`tailscale ip -4`），失败返回空串。
+
+    60 秒缓存：self_url() 会在 mesh / info / invite 等热路径上被反复调用，
+    每次都 fork 一个 tailscale 进程在手机/NAS 上是明显的浪费。
+    """
+    now = time.time()
+    if _TS_IP_CACHE["at"] and now - _TS_IP_CACHE["at"] < 60:
+        return _TS_IP_CACHE["ip"]
+    ip = ""
+    try:
+        p = subprocess.Popen(["tailscale", "ip", "-4"],
+                             stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        out, _ = p.communicate(timeout=3)
+        if p.returncode == 0:
+            ip = (out or b"").decode("utf-8", "ignore").strip().splitlines()[0].strip()
+    except Exception:
+        ip = ""
+    _TS_IP_CACHE["at"] = now
+    _TS_IP_CACHE["ip"] = ip
+    return ip
+
+
 def self_url():
-    """别的节点回连本机的地址：配置 self_url > 当前隧道地址 > 内网 IP:端口。"""
+    """别的节点回连本机的地址。
+
+    优先级：配置 self_url > tailnet IP > 当前隧道地址 > 内网 IP。
+
+    tailnet 排在内网 IP 前面，是因为**内网地址对跨网段的对端毫无意义**：
+    主端在云端/沙盒时够不着 192.168.x.x，而 tailnet 地址两边都能走。
+    节点自报一个「只有同网段能连」的地址，是配对后第一次调用就失败的最常见原因。
+    """
     u = (CFG.get("self_url") or "").strip()
+    if not u:
+        ts = _tailscale_ip()
+        if ts:
+            u = "http://%s:%s" % (ts, LISTEN_PORT or 3100)
     if not u:
         try:
             u = open(os.path.join(HERE, "current_url.txt"), encoding="utf-8").read().strip()
@@ -3778,18 +3992,16 @@ class Handler(BaseHTTPRequestHandler):
             ttl = int(payload.get("ttl", 3600))  # 默认 1 小时过期
             invite_id = uuid.uuid4().hex[:12]
             expires = int(time.time()) + ttl
-            # 存储邀请记录（用于验证）
-            _invite_file = os.path.join(os.path.dirname(CONFIG_PATH), "invites.json")
-            try:
-                invites = json.load(open(_invite_file)) if os.path.exists(_invite_file) else {}
-            except Exception:
-                invites = {}
-            invites[invite_id] = {"expires": expires, "used": False,
-                                  "created": int(time.time())}
-            try:
-                json.dump(invites, open(_invite_file, "w"))
-            except Exception:
-                pass
+            # 存储邀请记录（用于验证）——原子写，手机被杀进程也不会留半截文件
+            with INVITE_LOCK:
+                invites = _load_invites()
+                invites[invite_id] = {"expires": expires, "used": False,
+                                      "created": int(time.time())}
+                try:
+                    _save_invites_atomic(invites)
+                except Exception as e:
+                    self._json(500, {"error": "邀请码落盘失败：%s" % e})
+                    return
             # 生成邀请码
             invite_data = {
                 "code": SERVER_NAME,
@@ -3814,66 +4026,14 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         if path == "/fleet/invite/verify":
-            # v4.4: 验证邀请码 + 自动双向配对
+            # v4.4: 验证邀请码 + 自动双向配对（并发安全，见 _verify_invite）
             try:
                 payload = json.loads(raw.decode("utf-8"))
             except Exception:
                 self._json(400, {"error": "bad json"})
                 return
-            invite_id = payload.get("invite_id", "")
-            peer_name = payload.get("name", "")
-            peer_url = payload.get("url", "")
-            peer_token = payload.get("token", "")
-            peer_pub = payload.get("public_key", "")
-            peer_nid = payload.get("node_id", "")
-            peer_fp = payload.get("fingerprint", "")
-            if not invite_id or not peer_name or not peer_url:
-                self._json(400, {"error": "need invite_id, name, url"})
-                return
-            # 验证邀请码
-            _invite_file = os.path.join(os.path.dirname(CONFIG_PATH), "invites.json")
-            try:
-                invites = json.load(open(_invite_file)) if os.path.exists(_invite_file) else {}
-            except Exception:
-                invites = {}
-            inv = invites.get(invite_id)
-            if not inv:
-                self._json(403, {"error": "邀请码不存在"})
-                return
-            if inv.get("used"):
-                self._json(403, {"error": "邀请码已使用"})
-                return
-            if int(time.time()) > inv.get("expires", 0):
-                self._json(403, {"error": "邀请码已过期"})
-                return
-            # 验证通过 → 双向配对
-            with PEERS_LOCK:
-                d = load_peers()
-                d["nodes"][peer_name] = {"url": peer_url, "token": peer_token,
-                                         "added_by": "invite", "updated": int(time.time()),
-                                         "public_key": peer_pub, "node_id": peer_nid,
-                                         "fingerprint": peer_fp}
-                save_peers(d)
-            # 标记邀请码已使用
-            inv["used"] = True
-            inv["used_by"] = peer_name
-            inv["used_at"] = int(time.time())
-            try:
-                json.dump(invites, open(_invite_file, "w"))
-            except Exception:
-                pass
-            self._json(200, {
-                "ok": True,
-                "verified": True,
-                "my_name": SERVER_NAME,
-                "my_url": self_url(),
-                "my_token": CFG.get("auth_token", ""),
-                "my_public_key": IDENTITY.public_key_b64 if IDENTITY else "",
-                "my_node_id": IDENTITY.node_id if IDENTITY else "",
-                "my_fingerprint": IDENTITY.fingerprint if IDENTITY else "",
-                "my_version": SERVER_VERSION,
-                "message": "确权通过，已与 %s 建立连接" % peer_name
-            })
+            code, body = _verify_invite(payload)
+            self._json(code, body)
             return
 
         if path not in ("/mcp", "/rpc", ""):
@@ -3916,6 +4076,11 @@ class Handler(BaseHTTPRequestHandler):
                     "auth": bool(CFG.get("auth_token") or ""),
                     "allow_ips": CFG.get("allow_ips") or [],
                     "transports": ["POST /mcp (streamable-http)", "GET /sse (sse)"],
+                    # 让主端能直接看出「登记地址 vs 实际地址」是否漂移：
+                    # 手机/NAS 换网络后 tailnet IP 会变，没有这个字段就只能靠猜。
+                    "tailscale_ip": _tailscale_ip(),
+                    "self_url": self_url(),
+                    "uptime_secs": int(time.time() - _STARTED_AT),
                 })
             self._json(200, body)
             return
@@ -4089,6 +4254,9 @@ def main():
                     help="只读模式：exec/write/edit/systemctl/docker_restart 等"
                          "变更类工具全部禁用（审计观察节点）")
     args = ap.parse_args()
+
+    # 配置损坏就直接停：带病上岗（无 token 监听）比不启动危险得多。
+    die_if_config_corrupt()
 
     # ---- 鉴权前置校验（v3.1 / v5.2 安全默认）------------------------------
     _loopback = args.host in ("127.0.0.1", "localhost", "::1", "")

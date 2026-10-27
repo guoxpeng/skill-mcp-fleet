@@ -159,8 +159,42 @@ def die(msg, code=1):
 # ---------------------------------------------------------------- MCP 客户端
 
 
+def _is_tailnet_host(host):
+    """判断是否 tailnet 地址：100.64.0.0/10（CGNAT）、fd7a:115c:a1e0::/48、*.ts.net。
+
+    Tailscale 的地址段正好落在「私网」范围里，但它的可达性语义和局域网
+    完全不同——见 _opener_for 的说明。
+    """
+    h = (host or "").lower().strip("[]")
+    if not h:
+        return False
+    if h.endswith(".ts.net"):
+        return True
+    try:
+        import ipaddress
+        ip = ipaddress.ip_address(h)
+        if ip.version == 4:
+            return ip in ipaddress.ip_network("100.64.0.0/10")
+        return ip in ipaddress.ip_network("fd7a:115c:a1e0::/48")
+    except ValueError:
+        return False
+
+
+def _proxy_configured():
+    return bool(os.environ.get("HTTPS_PROXY") or os.environ.get("https_proxy")
+                or os.environ.get("HTTP_PROXY") or os.environ.get("http_proxy")
+                or os.environ.get("ALL_PROXY") or os.environ.get("all_proxy"))
+
+
 def _opener_for(url, insecure=False):
-    """内网/本机地址不走 http_proxy：机器上配了代理时，局域网节点会被代理成 404/超时。"""
+    """内网/本机地址不走 http_proxy：机器上配了代理时，局域网节点会被代理成 404/超时。
+
+    例外（tailnet）：100.64.0.0/10 是 Tailscale 的 CGNAT 段，虽然 ipaddress
+    把它算作私网，但它的可达性来自 tailscaled 而不是本机路由。当机器配了
+    代理、而这条代理正是通往 tailnet 的唯一通路（托管沙盒的受限隧道代理）
+    时，绕过代理等于把 tailnet 节点全部变成「连不上」。所以：
+    配了代理 + tailnet 地址 → 交给代理走。
+    """
     import ipaddress
     import urllib.parse
     host = urllib.parse.urlsplit(url).hostname or ""
@@ -170,6 +204,8 @@ def _opener_for(url, insecure=False):
         direct = direct or ip.is_private or ip.is_loopback or ip.is_link_local
     except ValueError:
         pass
+    if _is_tailnet_host(host) and _proxy_configured():
+        direct = False
     import ssl
     handlers = []
     if direct:
@@ -202,7 +238,31 @@ class MCPClient:
         self.token = (token or "").strip()
 
     # -- 传输层 --------------------------------------------------
-    def _post(self, payload, timeout=None):
+    def _post(self, payload, timeout=None, retry=False):
+        """发一条 JSON-RPC。
+
+        retry=True 只给**幂等**方法用（initialize / tools/list / 只读探测）：
+        连不上或超时重试一次，覆盖 tailnet/隧道抖动的瞬时失败。
+        tools/call 这类会真正执行命令的请求**永不重试**——重试等于把
+        `rm -rf` 跑两遍。401/403 同样不重试（令牌错了重试没用）。
+        """
+        attempts = 2 if retry else 1
+        last = None
+        for i in range(attempts):
+            try:
+                return self._post_once(payload, timeout=timeout)
+            except MCPError as e:
+                msg = str(e)
+                # 鉴权/协议类错误不重试，只重试「连不上 / 超时 / 5xx」
+                if ("HTTP 401" in msg or "HTTP 403" in msg or "HTTP 4" in msg
+                        or "不是合法 JSON" in msg or "超过上限" in msg):
+                    raise
+                last = e
+                if i + 1 < attempts:
+                    time.sleep(1.0)
+        raise last
+
+    def _post_once(self, payload, timeout=None):
         data = json.dumps(payload).encode("utf-8")
         req = urllib.request.Request(
             self.url, data=data, method="POST",
@@ -217,7 +277,7 @@ class MCPClient:
                     req, timeout=timeout or self.timeout) as r:
                 if r.headers.get("Mcp-Session-Id"):
                     self.sid = r.headers["Mcp-Session-Id"]
-                body = r.read().decode("utf-8", "ignore")
+                body = _read_capped(r).decode("utf-8", "ignore")
         except urllib.error.HTTPError as e:
             if e.code in (401, 403):
                 hint = ("副端开了鉴权，但本地没有它的 token。\n"
@@ -248,7 +308,7 @@ class MCPClient:
     def handshake(self):
         r = self._post({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {
             "protocolVersion": PROTOCOL, "capabilities": {},
-            "clientInfo": {"name": "mcp-fleet", "version": VERSION}}})
+            "clientInfo": {"name": "mcp-fleet", "version": VERSION}}}, retry=True)
         self.info = r.get("result", {}).get("serverInfo", {}) or {}
         try:
             self._post({"jsonrpc": "2.0", "method": "notifications/initialized",
@@ -258,7 +318,8 @@ class MCPClient:
         return self.info
 
     def list_tools(self):
-        r = self._post({"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}})
+        r = self._post({"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}},
+                       retry=True)
         if "error" in r:
             raise MCPError(str(r["error"]))
         return r.get("result", {}).get("tools", [])
@@ -276,11 +337,43 @@ class MCPClient:
         return text, bool(res.get("isError"))
 
 
+READ_CAP = 2 * 1024 * 1024      # 单次响应上限 2MB：防对端/中间人灌爆内存
+
+
+def _read_capped(resp, limit=READ_CAP):
+    """有界读取响应体。超过 limit 直接抛 MCPError，而不是把内存吃光。
+
+    一个失控的节点（或隧道里被注入的响应）可以无上限地吐数据；
+    主控侧只做诊断，没有理由接受 2MB 以上的 JSON。
+    """
+    cl = resp.headers.get("Content-Length")
+    if cl:
+        try:
+            if int(cl) > limit:
+                raise MCPError("响应体 %s 字节，超过上限 %d 字节（已拒绝读取）"
+                               % (cl, limit))
+        except ValueError:
+            pass
+    chunks, total = [], 0
+    while True:
+        buf = resp.read(65536)
+        if not buf:
+            break
+        total += len(buf)
+        if total > limit:
+            raise MCPError("响应体超过上限 %d 字节（已中止读取）" % limit)
+        chunks.append(buf)
+    return b"".join(chunks)
+
+
 def http_probe(base_url, timeout=8, token="", retries=3):
     """GET 副端根路径，拿 {status, server, version, tools, ...}。
 
     隧道刚起来 / 网络抖动时首次请求可能超时，默认重试 3 次（指数退避
     1s / 2s / 4s），都失败才抛异常。retries=0 可关闭重试。
+
+    401/403 不重试：令牌错了重试一百次还是错的，只会让 `fleet doctor`
+    白等 7 秒，还会把「鉴权问题」伪装成「网络问题」。
     """
     base = base_url[:-4] if base_url.endswith("/mcp") else base_url.rstrip("/")
     req = urllib.request.Request(base + "/", headers={"Accept": "application/json"})
@@ -289,8 +382,16 @@ def http_probe(base_url, timeout=8, token="", retries=3):
     last_err = None
     for attempt in range(max(1, retries + 1)):
         try:
-            with urllib.request.urlopen(req, timeout=timeout) as r:
-                return json.loads(r.read().decode("utf-8", "ignore") or "{}")
+            with _opener_for(base_url).open(req, timeout=timeout) as r:
+                return json.loads(_read_capped(r).decode("utf-8", "ignore") or "{}")
+        except urllib.error.HTTPError as e:
+            if e.code in (401, 403):
+                raise MCPError("HTTP %d %s（鉴权失败，不重试）" % (e.code, e.reason))
+            last_err = e
+            if attempt < retries:
+                time.sleep(2 ** attempt)  # 1s, 2s, 4s ...
+        except MCPError:
+            raise                     # 超限是确定性的，重试无意义
         except Exception as e:
             last_err = e
             if attempt < retries:
@@ -299,11 +400,31 @@ def http_probe(base_url, timeout=8, token="", retries=3):
 
 
 def normalize_url(host_or_url, port=3100):
+    """把用户输入（裸 IP / 主机名 / 完整 URL）规整成 http(s)://host:port/mcp。
+
+    S9：裸 IPv6 字面量必须加方括号，否则拼出的 URL 非法（冒号歧义）——
+    `fd00::1` 会被解析成 host=fd00、port 解析失败。IPv6 在家庭局域网
+    （ULA fd00::/8）和 tailnet（fd7a:115c:a1e0::/48）里都很常见。
+    """
     s = (host_or_url or "").strip()
     if not s:
         raise ValueError("空的地址")
     if not s.startswith(("http://", "https://")):
-        s = "http://%s:%d" % (s, port)
+        host = s
+        # 已经带端口的 IPv6 写作 [addr]:port，不再补端口
+        if host.startswith("[") and "]:" in host:
+            s = "http://%s" % host
+        elif host.startswith("["):
+            s = "http://%s:%d" % (host, port)
+        else:
+            try:
+                import ipaddress
+                if isinstance(ipaddress.ip_address(host), ipaddress.IPv6Address):
+                    s = "http://[%s]:%d" % (host, port)
+                else:
+                    s = "http://%s:%d" % (host, port)
+            except ValueError:
+                s = "http://%s:%d" % (host, port)
     s = s.rstrip("/")
     if not s.endswith("/mcp"):
         s += "/mcp"
@@ -436,30 +557,94 @@ def agent_config_paths():
     return out
 
 
+class RegistryCorruptError(Exception):
+    """登记表已损坏：拒绝用空表覆盖（否则一次误写就把所有节点抹掉）。"""
+
+
+def _read_registry_file(path):
+    """读一个登记表文件，返回 dict 或抛异常（不吞错，由调用方决定降级）。"""
+    with open(path, encoding="utf-8") as f:
+        data = json.load(f)
+    if not isinstance(data, dict):
+        raise ValueError("登记表根节点不是对象")
+    return data
+
+
 def load_registry():
-    """本地登记表：即使 agent 不支持 MCP，也能用本脚本操控副端。"""
+    """本地登记表：即使 agent 不支持 MCP，也能用本脚本操控副端。
+
+    损坏时先回退到 `.bak`（上一份好数据），再不行才返回空表；
+    空表只用于「读」，写路径由 save_registry 拒绝覆盖损坏文件。
+    """
     if os.path.isfile(REGISTRY):
         try:
-            with open(REGISTRY, encoding="utf-8") as f:
-                return json.load(f)
+            return _read_registry_file(REGISTRY)
+        except Exception:
+            pass
+        try:
+            reg = _read_registry_file(REGISTRY + ".bak")
+            sys.stderr.write(
+                "⚠️  登记表 %s 已损坏，已自动回退到备份 %s.bak\n"
+                "   修复后建议执行：fleet doctor\n" % (REGISTRY, REGISTRY))
+            return reg
         except Exception:
             pass
     return {"nodes": {}}
 
 
 def save_registry(reg):
+    """原子写登记表：临时文件 + fsync + os.replace，并保留一份 .bak。
+
+    写入前先确认现有文件可解析：登记表已损坏时**拒绝覆盖**（抛
+    RegistryCorruptError），否则一次「读到空表→写回」就把所有节点抹掉了。
+    """
     d = os.path.dirname(REGISTRY)
     if d and not os.path.isdir(d):
         os.makedirs(d, exist_ok=True)
-    with open(REGISTRY, "w", encoding="utf-8") as f:
+    if os.path.isfile(REGISTRY):
+        try:
+            _read_registry_file(REGISTRY)
+        except Exception:
+            raise RegistryCorruptError(
+                "登记表 %s 已损坏，拒绝覆盖。\n"
+                "  1) 先备份：cp %s %s.broken\n"
+                "  2) 再修复或删除它，然后重新 add/pair\n"
+                "  3) 也可以试 .bak：%s.bak"
+                % (REGISTRY, REGISTRY, REGISTRY, REGISTRY))
+        try:                          # 轮转上一份好数据
+            with open(REGISTRY, encoding="utf-8") as src:
+                old = src.read()
+            with open(REGISTRY + ".bak", "w", encoding="utf-8") as dst:
+                dst.write(old)
+            os.chmod(REGISTRY + ".bak", 0o600)
+        except Exception:
+            pass
+    tmp = REGISTRY + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
         json.dump(reg, f, ensure_ascii=False, indent=2)
         f.write("\n")
+        f.flush()
+        os.fsync(f.fileno())
     # 登记表里有各副端的明文 Bearer 令牌，必须收紧权限；
     # 原来既不 chmod 也不设 umask，Linux 上默认 0644 = 同机任何用户可读。
     try:
-        os.chmod(REGISTRY, 0o600)
+        os.chmod(tmp, 0o600)
     except Exception:
         pass
+    os.replace(tmp, REGISTRY)
+
+
+def mask_token(tok):
+    """令牌掩码：日志/JSON 输出默认不暴露完整令牌。
+
+    保留前 4 后 4 便于人工核对是哪一个；太短的令牌整段打码。
+    """
+    t = tok or ""
+    if not t:
+        return ""
+    if len(t) <= 8:
+        return "***"
+    return t[:4] + "…" + t[-4:]
 
 
 def load_json_config(path):
@@ -611,6 +796,19 @@ def sync_from_directory(name, cur_url=None, timeout=8, quiet=False, verbose=True
             print(warn("目录给的 %s 看起来不是 MCP 副端（无凭据探活未通过）" % new),
                   file=sys.stderr)
         return None
+    # ---- 防投毒闸门 3：匿名探活返回的节点身份必须就是期望节点 ----
+    # 闸门 2 只证明「对面是个 MCP 服务」，不证明「对面是这台设备」。少了这一道，
+    # 投毒的目录条目就能把真令牌骗到冒名地址。拿不到身份一律拒绝（fail closed）。
+    try:
+        anon = http_probe(new_mcp, timeout=min(timeout, 6), token="", retries=0)
+    except Exception:
+        anon = {}
+    if (anon or {}).get("server") != name:
+        if not quiet:
+            print(warn("目录给的 %s 节点身份不符（期望 %s，实测 %s），拒绝采信"
+                       % (new_mcp, name, (anon or {}).get("server") or "(无)")),
+                  file=sys.stderr)
+        return None
     try:
         if not http_probe(new_mcp, timeout=min(timeout, 6), token=token):
             raise RuntimeError("无响应")
@@ -668,6 +866,11 @@ def client_for(target, agent=None, port=3100, timeout=30, sync=None):
 def cmd_list(a):
     nodes = discover_nodes(a.agent)
     if a.json:
+        # 默认掩码令牌：list --json 的输出经常被贴进 issue / 日志 / 截图。
+        # 需要真值（脚本消费）显式 --show-tokens。
+        if not getattr(a, "show_tokens", False):
+            nodes = dict((k, dict(v, token=mask_token(v.get("token", ""))))
+                         for k, v in nodes.items())
         print(json.dumps(nodes, ensure_ascii=False, indent=2))
         return 0
     if not nodes:
@@ -740,8 +943,48 @@ def cmd_probe(a):
         code, out, _ = parse_exec(text)
         print((err if (iserr or code) else ok)("[%s] " % ("!" if (iserr or code) else "+"))
               + "exec 试调：exit=%d  %s" % (code, out.replace("\n", " / ")[:150]))
+        if iserr or code:
+            print(dim("      probe 判定失败：HTTP 通了但命令没跑通，"
+                      "通常是执行策略拦截或副端权限/工作目录问题。"))
+            return 1
     except MCPError as e:
         print(warn("[!] ") + "exec 试调失败：%s" % e)
+        return 1
+    return 0
+
+
+def cmd_ping(a):
+    """轻探活：只 GET /，不握手、不列工具、不 exec。
+
+    给健康看门/脚本用。握手要三次往返，探活只需要知道「HTTP 层活着」；
+    分清楚这一点，看门才能在 5 分钟一轮的频率下不把节点压垮。
+    退出码：0 可达 / 1 不可达（脚本可直接判）。
+    """
+    sync = False if getattr(a, "no_sync", False) else None
+    try:
+        url, meta = resolve_target(a.target, a.agent, a.port, sync=sync)
+    except Exception as e:
+        print(err("不可达") + "  %s：%s" % (a.target, e))
+        return 1
+    t0 = time.time()
+    try:
+        info = http_probe(url, timeout=a.timeout, token=meta.get("token", ""), retries=0)
+    except Exception as e:
+        msg = str(e)
+        if "鉴权" in msg or "401" in msg or "403" in msg:
+            print(warn("仅可达") + "  %s  HTTP 层有响应但鉴权失败（%s）" % (a.target, msg))
+            print(dim("     令牌不对：fleet add --name %s --url %s --token <令牌>" % (a.target, url)))
+        else:
+            print(err("不可达") + "  %s：%s" % (a.target, msg))
+        return 1
+    ms = (time.time() - t0) * 1000
+    print(ok("可达") + "  %s  %s  %.0f ms  %s v%s"
+          % (a.target, url, ms, info.get("server") or "?", info.get("version") or "?"))
+    if a.json:
+        print(json.dumps({"target": a.target, "url": url, "reachable": True,
+                          "rtt_ms": round(ms, 1), "server": info.get("server"),
+                          "version": info.get("version")},
+                         ensure_ascii=False, indent=2))
     return 0
 
 
@@ -1516,6 +1759,19 @@ def cmd_sync(a):
             if not probe_anonymous(new, timeout=min(a.timeout, 6)):
                 print("  %-16s %s" % (name, warn("跳过：%s 不像 MCP 副端" % new)))
                 continue
+            # SEC-03：匿名探活拿到的 server 名必须等于期望节点名，否则拒绝。
+            # 少了这道闸门，投毒的目录条目能把真令牌骗到冒名地址去——
+            # 上面两道只证明「对面是个 MCP 服务」，不证明「对面是这台设备」。
+            anon = {}
+            try:
+                anon = http_probe(new, timeout=min(a.timeout, 6), token="", retries=0)
+            except Exception:
+                anon = {}
+            if (anon or {}).get("server") != name:
+                print("  %-16s %s" % (name, warn(
+                    "跳过：节点身份不符（期望 %s，实测 %s），拒绝采信"
+                    % (name, (anon or {}).get("server") or "(无)"))))
+                continue
         flag = ok("NEW ") if cur and cur != new else dim("ok  ")
         if cur != new:
             changed += 1
@@ -2003,6 +2259,7 @@ def cmd_mesh(a):
     print(ok("=" * 60))
     print(ok("  Fleet Mesh 拓扑"))
     print(ok("=" * 60))
+    failed = 0
     for name, info in sorted(nodes.items()):
         url = info.get("url", "")
         token = info.get("token", "")
@@ -2013,6 +2270,7 @@ def cmd_mesh(a):
             text, is_err = c.call("mesh", {})
             if is_err:
                 print(err("  [X] %-16s %s" % (name, url)))
+                failed += 1
                 continue
             mesh = json.loads(text)
             self_info = mesh.get("self", {})
@@ -2041,7 +2299,11 @@ def cmd_mesh(a):
                     print("      " + err("|- ") + "%-14s 离线 %s" % (pname, ts))
         except Exception as e:
             print(err("  [X] %-16s %s  (%s)" % (name, url, e)))
+            failed += 1
     print(ok("=" * 60))
+    if failed:
+        print(err("  有 %d 个节点异常（拓扑不完整）" % failed))
+        return 1
     return 0
 
 def cmd_msg(a):
@@ -2735,6 +2997,8 @@ def build_parser():
     sp = sub.add_parser("list", help="列出已注册的副端")
     sp.add_argument("--agent", default="auto")
     sp.add_argument("--json", action="store_true")
+    sp.add_argument("--show-tokens", action="store_true",
+                    help="JSON 里输出完整令牌（默认掩码；贴日志/截图时保持默认）")
     sp.set_defaults(func=cmd_list)
 
     sp = sub.add_parser("targets", help="只输出副端名字（供脚本消费）")
@@ -2743,6 +3007,8 @@ def build_parser():
 
     common(sub.add_parser("tools", help="列副端工具清单")).set_defaults(func=cmd_tools)
     common(sub.add_parser("probe", help="连通性 + 握手 + 试调（只读）")).set_defaults(func=cmd_probe)
+    common(sub.add_parser("ping", help="轻探活：只 GET /，不握手不 exec（看门/脚本用）")
+           ).set_defaults(func=cmd_ping)
     sp = common(sub.add_parser("doctor", help="完整链路体检；不带 target 时做本机自检"),
                 need_target=False)
     sp.add_argument("target", nargs="?", default=None,

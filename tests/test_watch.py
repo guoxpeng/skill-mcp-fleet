@@ -10,7 +10,9 @@ import sys
 import tempfile
 import unittest
 
-GOAL_WATCH = os.path.expanduser("~/workspace/goals/fleet-remote-access/hidden_files/fleet_watch.py")
+# 看门脚本就在仓库里：用相对路径，别指向某台机器上的私有目录。
+GOAL_WATCH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                          "..", "scripts", "fleet_watch.py")
 
 FAKE_FLEET = """#!/usr/bin/env python3
 import json, os, sys
