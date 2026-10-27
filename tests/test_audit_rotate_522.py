@@ -104,5 +104,65 @@ class AuditLogStillWorksTest(unittest.TestCase):
         self.assertFalse(os.path.exists(self.path))
 
 
+class SingleAuditImplementationTest(unittest.TestCase):
+    """两套审计实现合并成一套。
+
+    历史包袱：`audit_log`（peer_call / delegate）和 `_audit_log`（危险工具调用）
+    各写各的锁、各用各的阈值，写的是同一个 audit.log。两个锁互不可见，
+    一边 `os.replace` 把文件挪成 `.1`、另一边还握着旧 fd 往里写，轮转之后的
+    行就落进了 `.1`；调阈值的人也会困惑「改成 5MB 了怎么还涨到 10MB 才转」。
+    """
+
+    def test_same_path(self):
+        self.assertEqual(agent.AUDIT_PATH, agent.AUDIT_LOG_PATH,
+                         "两个入口必须写同一个文件")
+
+    def test_same_lock(self):
+        self.assertIs(agent.AUDIT_LOCK, agent._audit_lock,
+                      "两个入口必须共用一把锁，否则轮转与写入会互相踩")
+
+    def test_same_threshold(self):
+        self.assertEqual(agent.AUDIT_MAX_BYTES, agent.AUDIT_ROTATE_BYTES,
+                         "阈值只能有一个，否则调了不生效")
+
+    def test_both_entries_write_same_file(self):
+        """并发混写：两个入口的行必须都落在同一个文件里，一条不少。"""
+        import threading
+        d = tempfile.mkdtemp(prefix="fleet-audit3-")
+        path = os.path.join(d, "audit.log")
+        orig = (agent.AUDIT_PATH, agent.AUDIT_LOG_PATH,
+                agent.AUDIT_MAX_BYTES, agent.AUDIT_ROTATE_BYTES)
+        orig_cfg = dict(agent.CFG)
+        try:
+            agent.AUDIT_PATH = agent.AUDIT_LOG_PATH = path
+            agent.AUDIT_MAX_BYTES = agent.AUDIT_ROTATE_BYTES = 10 * 1024 * 1024
+            agent.CFG["audit_log"] = True
+            n = 60
+
+            def peer():
+                agent.audit_log("peer_call", "a", "b", "exec", "ok")
+
+            def tool():
+                agent._audit_log("exec", {"command": "ls"})
+
+            ts = [threading.Thread(target=peer if i % 2 else tool)
+                  for i in range(n)]
+            for t in ts:
+                t.start()
+            for t in ts:
+                t.join()
+            with open(path, encoding="utf-8") as f:
+                lines = [ln for ln in f.read().splitlines() if ln.strip()]
+            self.assertEqual(len(lines), n, "并发混写不能丢行（丢行=两套锁在打架）")
+            self.assertIn("peer_call", "".join(lines))
+            self.assertIn("tool=exec", "".join(lines))
+        finally:
+            (agent.AUDIT_PATH, agent.AUDIT_LOG_PATH,
+             agent.AUDIT_MAX_BYTES, agent.AUDIT_ROTATE_BYTES) = orig
+            agent.CFG.clear()
+            agent.CFG.update(orig_cfg)
+            shutil.rmtree(d, ignore_errors=True)
+
+
 if __name__ == "__main__":
     unittest.main()

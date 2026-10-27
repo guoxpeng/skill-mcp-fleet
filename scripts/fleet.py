@@ -80,6 +80,24 @@ VERSION = "5.2.2"
 PROTOCOL = "2024-11-05"
 HERE = os.path.dirname(os.path.abspath(__file__))
 
+#: `fleet forward` 同时存在的转发连接上限。每条连接占一个线程 + 两个 MCPClient，
+#: 而 `--bind 0.0.0.0` 意味着对端可以无限开连接。没有上限时，一次端口扫描
+#: 就能把线程数和副端的 TUN_MAX 槽位一次性耗光，之后正常转发全部失败——
+#: 表现为「转发器还活着，但再也连不上了」。sshd 有 MaxStartups，这里对应给一个。
+def _env_int(name, default, lo=1, hi=100000):
+    """读一个整数环境变量，非法值一律回退默认值（不要因为写错变量就崩）。"""
+    raw = os.environ.get(name)
+    if not raw:
+        return default
+    try:
+        v = int(str(raw).strip())
+    except Exception:
+        return default
+    return v if lo <= v <= hi else default
+
+
+FWD_MAX_CONNS = _env_int("FLEET_FWD_MAX_CONNS", 128, 1, 100000)
+
 # v5.2: CLI 内置提示词。菜单/`fleet prompt` 直接输出，可原样粘给 AI 客户端。
 PROMPT_PACK = {
     "self_repair": (
@@ -1529,6 +1547,29 @@ def cmd_forward(a):
     lock = threading.Lock()
     stats = {"conn": 0, "tx": 0, "rx": 0}
 
+    # 每条转发连接要占一个线程 + 两个 MCPClient。`--bind 0.0.0.0` 时对端
+    # 可以无限开连接，没有上限就是「一个端口扫描把转发器打爆」：线程数、
+    # 内存、以及副端的 TUN_MAX 槽位会被一次性耗光，之后正常的转发全部失败。
+    # sshd 有 MaxStartups，这里对应给一个连接上限，超了立刻关掉并提示。
+    slots = threading.BoundedSemaphore(FWD_MAX_CONNS)
+    refused = [0]
+
+    def _take_slot(conn, label):
+        """拿到并发名额返回 True；拿不到就关掉连接并（限频）提示。"""
+        if slots.acquire(False):
+            return True
+        try:
+            conn.close()
+        except Exception:
+            pass
+        with lock:
+            refused[0] += 1
+            n = refused[0]
+        if n == 1 or n % 50 == 0:
+            print(err("[x] ") + "并发转发连接已达上限 %d，拒绝 %s（累计 %d 次）"
+                  % (FWD_MAX_CONNS, label, n))
+        return False
+
     def _mk_clients():
         """一条转发连接配两条 HTTP 通道（读/写各一）。"""
         rc = MCPClient(url, timeout=30, token=token, insecure=insecure)
@@ -1601,36 +1642,41 @@ def cmd_forward(a):
 
         def handle_local(conn, peer, f):
             label = "%s:%d" % (peer[0], peer[1])
-            rc, wc = _mk_clients()
-            with lock:
-                stats["conn"] += 1
-            try:
-                text, is_err = rc.call("tunnel_open",
-                                       {"host": f["host"], "port": f["hport"]},
-                                       timeout=40)
-            except MCPError as e:
-                text, is_err = str(e), True
-            if is_err:
-                print(err("[x] ") + "%s 连不上 %s:%d：%s"
-                      % (label, f["host"], f["hport"], text))
-                try:
-                    conn.close()
-                except Exception:
-                    pass
-                _drop_clients(rc, wc)
+            if not _take_slot(conn, label):
                 return
             try:
-                tid = json.loads(text)["tunnel_id"]
-            except Exception:
-                print(err("[x] ") + "副端返回异常：%s" % str(text)[:120])
+                rc, wc = _mk_clients()
+                with lock:
+                    stats["conn"] += 1
                 try:
-                    conn.close()
+                    text, is_err = rc.call("tunnel_open",
+                                           {"host": f["host"], "port": f["hport"]},
+                                           timeout=40)
+                except MCPError as e:
+                    text, is_err = str(e), True
+                if is_err:
+                    print(err("[x] ") + "%s 连不上 %s:%d：%s"
+                          % (label, f["host"], f["hport"], text))
+                    try:
+                        conn.close()
+                    except Exception:
+                        pass
+                    _drop_clients(rc, wc)
+                    return
+                try:
+                    tid = json.loads(text)["tunnel_id"]
                 except Exception:
-                    pass
-                _drop_clients(rc, wc)
-                return
-            print(dim("  + %s ↔ %s" % (label, tid)))
-            _pipe(tid, conn, rc, wc, label)
+                    print(err("[x] ") + "副端返回异常：%s" % str(text)[:120])
+                    try:
+                        conn.close()
+                    except Exception:
+                        pass
+                    _drop_clients(rc, wc)
+                    return
+                print(dim("  + %s ↔ %s" % (label, tid)))
+                _pipe(tid, conn, rc, wc, label)
+            finally:
+                slots.release()
 
         def accept_loop():
             while not stop.is_set():
@@ -1736,11 +1782,22 @@ def cmd_forward(a):
                 except Exception:
                     pass
                 return
-            rc, wc = _mk_clients()
-            with lock:
-                stats["conn"] += 1
-            print(dim("  + %s ↔ 本地 %s:%d" % (tid, f["host"], f["hport"])))
-            _pipe(tid, conn, rc, wc, tid)
+            if not _take_slot(conn, tid):
+                # 名额满：这条隧道已经由副端 accept 出来了，必须显式关掉，
+                # 否则副端那边会一直挂着等一个永远不来的读端。
+                try:
+                    ctl.call("tunnel_close", {"tunnel_id": tid}, timeout=10)
+                except Exception:
+                    pass
+                return
+            try:
+                rc, wc = _mk_clients()
+                with lock:
+                    stats["conn"] += 1
+                print(dim("  + %s ↔ 本地 %s:%d" % (tid, f["host"], f["hport"])))
+                _pipe(tid, conn, rc, wc, tid)
+            finally:
+                slots.release()
 
         threading.Thread(target=accept_loop, daemon=True).start()
         return ctl

@@ -2259,23 +2259,57 @@ _TS_IP_CACHE = {"at": 0.0, "ip": ""}
 
 
 def _tailscale_ip():
-    """本机 tailnet IP（`tailscale ip -4`），失败返回空串。
+    """本机 tailnet IP（100.64.0.0/10），拿不到返回空串。
 
-    60 秒缓存：self_url() 会在 mesh / info / invite 等热路径上被反复调用，
-    每次都 fork 一个 tailscale 进程在手机/NAS 上是明显的浪费。
+    **只有这一份实现**。历史上这里有两份同名函数，后者静默覆盖前者：
+    第一份用 `tailscale ip -4` 并带 60 秒缓存、失败返回 `""`；
+    第二份解析 `tailscale status --json`、无缓存、失败返回 `None`。
+    运行时生效的是第二份，于是 `self_url()` 在 mesh / info / invite 这些热路径上
+    每次都 fork 一个重量级的 `status --json`（超时 10s，手机/NAS 上几百毫秒），
+    而第一份的缓存从来没被执行过——纯粹的死代码。
+
+    现在先试便宜的 `tailscale ip -4`，拿不到再退回解析 `status --json`
+    （覆盖「只认 Self/Peer 里 100. 开头地址」的老场景），统一 60 秒缓存，
+    统一失败返回 `""`——调用方一律按假值处理，不必再区分 `None` 与 `""`。
     """
     now = time.time()
     if _TS_IP_CACHE["at"] and now - _TS_IP_CACHE["at"] < 60:
         return _TS_IP_CACHE["ip"]
     ip = ""
+    # 快路径：tailscale ip -4，直接输出地址，开销最小
     try:
         p = subprocess.Popen(["tailscale", "ip", "-4"],
                              stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
         out, _ = p.communicate(timeout=3)
         if p.returncode == 0:
-            ip = (out or b"").decode("utf-8", "ignore").strip().splitlines()[0].strip()
+            lines = (out or b"").decode("utf-8", "ignore").strip().splitlines()
+            if lines:
+                cand = lines[0].strip()
+                if cand.startswith("100."):
+                    ip = cand
     except Exception:
         ip = ""
+    # 慢路径：老版本 tailscale 没有 `ip -4` 子命令时，从 status --json 里找
+    if not ip:
+        try:
+            st = _tailscale_status()
+            if st:
+                self_key = st.get("Self", {}).get("UserID")
+                for _pid, peer in (st.get("Peer") or {}).items():
+                    if peer.get("UserID") == self_key:
+                        for cand in peer.get("TailscaleIPs") or []:
+                            if cand.startswith("100."):
+                                ip = cand
+                                break
+                    if ip:
+                        break
+                if not ip:
+                    for cand in st.get("Self", {}).get("TailscaleIPs") or []:
+                        if cand.startswith("100."):
+                            ip = cand
+                            break
+        except Exception:
+            ip = ""
     _TS_IP_CACHE["at"] = now
     _TS_IP_CACHE["ip"] = ip
     return ip
@@ -2738,26 +2772,68 @@ def t_msg_history(a):
 # ---------------------------------------------------------------------------
 # 审计日志
 # ---------------------------------------------------------------------------
+# 操作审计日志
+# ---------------------------------------------------------------------------
+# peer_call / delegate / 危险工具调用都写**同一个** audit.log。曾经这里有两套
+# 并行实现（audit_log 与 _audit_log），各自一把锁、各自一个轮转阈值（10MB 与
+# 5MB），而两个锁互相看不见对方：
+#   一边 os.replace 把文件挪成 .1，另一边还握着旧 fd 继续写 —— 轮转之后写进去
+#   的行全落进了 .1，当前日志反而是空的；
+#   而且调阈值的人会困惑：明明改成 5MB 了，文件怎么还是涨到 10MB 才转。
+# 现在统一成「一个路径、一把锁、一个写入口」，两个历史函数名保留为薄封装。
 AUDIT_PATH = os.path.join(HERE, "audit.log")
-_audit_lock = threading.Lock()
+AUDIT_LOG_PATH = AUDIT_PATH             # 旧名，与 AUDIT_PATH 是同一个文件
+AUDIT_LOCK = threading.Lock()           # 唯一的锁，两个入口共用
+_audit_lock = AUDIT_LOCK                # 旧名
+AUDIT_MAX_BYTES = 5 * 1024 * 1024
+AUDIT_ROTATE_BYTES = AUDIT_MAX_BYTES    # 旧名
+_AUDIT_WRITES = [0]
 
 
-AUDIT_ROTATE_BYTES = 10 * 1024 * 1024   # v5.0.3: audit.log 轮转阈值
+def _audit_rotate_file(path, max_bytes):
+    """超过上限就把当前日志挪成 `.1`，从头开始写。
+
+    设备要「长时间在线」，日志就不能无限涨：软路由的 overlay 常常只有几百 MB，
+    写满之后设备直接起不来，而且故障现场看不出是日志撑爆的。
+    """
+    try:
+        if os.path.getsize(path) < max_bytes:
+            return False
+    except OSError:
+        return False                    # 文件不存在 / 无权限：当作不用转
+    try:
+        os.replace(path, path + ".1")
+        return True
+    except OSError:
+        return False
+
+
+def _audit_rotate(path=None, max_bytes=None):
+    return _audit_rotate_file(
+        path or AUDIT_LOG_PATH,
+        AUDIT_MAX_BYTES if max_bytes is None else max_bytes)
 
 
 def _audit_rotate_if_needed(max_bytes=None):
-    """v5.0.3: audit.log 超过阈值时轮转保留一份（audit.log.1，旧的覆盖）。
+    return _audit_rotate_file(
+        AUDIT_PATH,
+        AUDIT_ROTATE_BYTES if max_bytes is None else max_bytes)
 
-    append-only 无轮转的日志在常年挂机设备上只增不减；单份备份已足够
-    排障用途，避免引入文件序列无限增长。
-    """
-    if max_bytes is None:
-        max_bytes = AUDIT_ROTATE_BYTES
+
+def _audit_write(path, line, max_bytes, every=1):
+    """唯一的写入点：同一把锁 + 同一套轮转，避免两条路径互相踩。"""
     try:
-        if os.path.exists(AUDIT_PATH) and os.path.getsize(AUDIT_PATH) > max_bytes:
-            os.replace(AUDIT_PATH, AUDIT_PATH + ".1")
-    except OSError:
-        pass
+        with AUDIT_LOCK:
+            _AUDIT_WRITES[0] += 1
+            # every=1 每次写都查（低频的 peer_call/delegate）；
+            # every=100 每 100 行查一次（每个危险工具调用都会写，别让 stat 变成开销）
+            if every <= 1 or _AUDIT_WRITES[0] % every == 1:
+                _audit_rotate_file(path, max_bytes)
+            with io.open(path, "a", encoding="utf-8") as f:
+                f.write(line)
+        return True
+    except (OSError, IOError):
+        return False
 
 
 def audit_log(action, caller, target, tool, status="ok", detail=""):
@@ -2766,13 +2842,7 @@ def audit_log(action, caller, target, tool, status="ok", detail=""):
         return
     line = "%s | %-6s | %s -> %s | %s | %s | %s\n" % (
         time.strftime("%Y-%m-%d %H:%M:%S"), action, caller, target, tool, status, detail[:200])
-    try:
-        with _audit_lock:
-            _audit_rotate_if_needed()   # v5.0.3: 持锁检查，避免并发轮转竞争
-            with io.open(AUDIT_PATH, "a", encoding="utf-8") as f:
-                f.write(line)
-    except (OSError, IOError):
-        pass
+    _audit_write(AUDIT_PATH, line, AUDIT_ROTATE_BYTES, every=1)
 
 
 # ---------------------------------------------------------------------------
@@ -2835,24 +2905,6 @@ def _tailscale_status():
             return json.loads(r.stdout)
     except Exception:
         pass
-    return None
-
-
-def _tailscale_ip():
-    """返回本机的 tailscale IP（100.64.0.0/10），没有则 None。"""
-    st = _tailscale_status()
-    if not st:
-        return None
-    self_key = st.get("Self", {}).get("UserID")
-    for peer_id, peer in st.get("Peer", {}).items():
-        if peer.get("UserID") == self_key:
-            for ip in peer.get("TailscaleIPs", []):
-                if ip.startswith("100."):
-                    return ip
-    # Fallback: check Self directly
-    for ip in st.get("Self", {}).get("TailscaleIPs", []):
-        if ip.startswith("100."):
-            return ip
     return None
 
 
@@ -4201,28 +4253,10 @@ for _t in V51_TOOLS:
 
 
 # ---------------------------------------------------------------------------
-# P1-2: 操作审计日志
+# P1-2: 危险工具调用的审计
 # ---------------------------------------------------------------------------
-AUDIT_LOG_PATH = os.path.join(HERE, "audit.log")
-AUDIT_LOCK = threading.Lock()
-#: 审计日志上限。超了就轮转成 `.1`（只留一份），旧的自然被覆盖。
-#: 设备要「长时间在线」，日志就不能无限涨：软路由的 overlay 常常只有几百 MB，
-#: 写满之后设备直接起不来，而且故障现场看不出是日志撑爆的。
-AUDIT_MAX_BYTES = 5 * 1024 * 1024
-_AUDIT_WRITES = [0]
-
-
-def _audit_rotate():
-    """超过上限就把当前日志挪成 `.1`，从头开始写。"""
-    try:
-        if os.path.getsize(AUDIT_LOG_PATH) < AUDIT_MAX_BYTES:
-            return
-    except OSError:
-        return
-    try:
-        os.replace(AUDIT_LOG_PATH, AUDIT_LOG_PATH + ".1")
-    except OSError:
-        pass
+# 路径/锁/阈值统一在上面定义（AUDIT_PATH / AUDIT_LOCK / AUDIT_MAX_BYTES），
+# 这里只负责把工具名与参数整理成一行，然后交给 _audit_write。
 
 
 def _audit_log(tool_name, args_dict, client_ip=""):
@@ -4238,13 +4272,8 @@ def _audit_log(tool_name, args_dict, client_ip=""):
             summary[k] = s[:200] + "..." if len(s) > 200 else s
         line = "%s | ip=%s | tool=%s | args=%s\n" % (
             ts, client_ip or "-", tool_name, json.dumps(summary, ensure_ascii=False))
-        with AUDIT_LOCK:
-            # 每 100 行才 stat 一次，别让轮转检查本身变成每行的开销
-            _AUDIT_WRITES[0] += 1
-            if _AUDIT_WRITES[0] % 100 == 1:
-                _audit_rotate()
-            with open(AUDIT_LOG_PATH, "a") as f:
-                f.write(line)
+        # 每 100 行才 stat 一次，别让轮转检查本身变成每行的开销
+        _audit_write(AUDIT_LOG_PATH, line, AUDIT_MAX_BYTES, every=100)
     except Exception:
         pass  # 审计日志写入失败不应影响主流程
 

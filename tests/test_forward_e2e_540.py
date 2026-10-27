@@ -132,11 +132,15 @@ class ForwardE2ETest(unittest.TestCase):
             self.skipTest("副端没起来（端口被占或环境不允许）")
         return p
 
-    def _start_forward(self, *fwd_args):
-        p = self.procs.spawn(
+    def _start_forward(self, *fwd_args, **kw):
+        env = dict(os.environ)
+        env.update(kw.get("env") or {})
+        p = subprocess.Popen(
             [PY, "-u", "fleet.py", "forward"] + list(fwd_args) +
             ["http://127.0.0.1:%d/mcp" % self.agent_port],
-            cwd=SCRIPTS)
+            cwd=SCRIPTS, env=env,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        self.procs.items.append(p)
         return p
 
     def _body_ok(self, port):
@@ -200,6 +204,54 @@ class ForwardE2ETest(unittest.TestCase):
             time.sleep(1.0)
         self.assertTrue(recovered, "副端重启后 -R 转发没有自动恢复")
         self.assertIsNone(p.poll(), "副端进程意外退出")
+
+
+    def test_concurrency_cap_refuses_excess(self):
+        """并发连接数有闸：超出上限的连接立刻被关掉，而不是无限起线程。
+
+        没有上限时，`--bind 0.0.0.0` + 一次端口扫描就能把线程数、内存和副端的
+        TUN_MAX 槽位一次性耗光；之后的正常转发全部失败，现场表现却是
+        「转发器还活着，只是再也连不上了」——最难查的那种。
+        """
+        self._start_agent()
+        cap = 3
+        lport = _free_port()
+        self._start_forward("-L", "%d:127.0.0.1:%d" % (lport, self.web_port),
+                            env={"FLEET_FWD_MAX_CONNS": str(cap)})
+        self.assertTrue(_wait_port(lport, 25), "本地监听没起来")
+        time.sleep(1.0)          # 让探活那条连接先退掉，别占名额
+
+        socks = []
+        try:
+            # 只建连不发送：这样每条连接都会一直占着名额（泵阻塞在 recv 上）
+            for _ in range(cap + 5):
+                try:
+                    s = socket.create_connection(("127.0.0.1", lport), timeout=10)
+                    s.settimeout(1.5)
+                    socks.append(s)
+                except Exception:
+                    pass
+            time.sleep(2.0)      # 等被拒的连接被对端关掉
+
+            alive = 0
+            for s in socks:
+                try:
+                    # 对端关掉后 recv 返回 b""；还活着则超时
+                    if s.recv(1) == b"":
+                        continue
+                except socket.timeout:
+                    alive += 1
+                except Exception:
+                    continue
+            self.assertGreaterEqual(alive, cap, "并发上限内的连接不该被误杀")
+            self.assertLess(alive, len(socks),
+                            "超出上限的连接必须被拒绝（%d 条全部存活）" % len(socks))
+        finally:
+            for s in socks:
+                try:
+                    s.close()
+                except Exception:
+                    pass
 
 
 if __name__ == "__main__":
