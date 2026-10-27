@@ -7,6 +7,7 @@
   把对方登记为 peer 后，send 会直接投递到对方自己的 fleet-agent，
   对方在本机 wait/recv（默认连 127.0.0.1）即可收到；回信同理投到你的节点。
   python3 fleet_chat.py peer add hark http://100.109.181.108:3100/mcp <对方token>
+  （token 可省：省时读 FLEET_CHAT_TOKEN 环境变量，交互终端下密文输入）
   python3 fleet_chat.py peer list | peer del hark
   peers 保存在 ~/.fleet_chat_peers.json（权限 0600）。未登记的收件人仍发往 --url。
 
@@ -141,7 +142,21 @@ def main():
         d = _peers()
         sub = a.text[0] if a.text else "list"
         if sub == "add" and len(a.text) >= 3:
-            d[a.text[1]] = {"url": a.text[2], "token": a.text[3] if len(a.text) > 3 else ""}
+            # SEC-06：token 不再强制写在命令行里（进 shell 历史）。优先顺序：
+            # 命令行第 4 位 > FLEET_CHAT_TOKEN 环境变量 > getpass 密文输入；
+            # 非交互且无 token 时报错（不挂起等输入）。
+            if len(a.text) > 3:
+                tok = a.text[3]
+            elif os.environ.get("FLEET_CHAT_TOKEN"):
+                tok = os.environ.get("FLEET_CHAT_TOKEN")
+            elif sys.stdin.isatty():
+                import getpass
+                tok = getpass.getpass("peer %s 的 token（密文输入，可空回车跳过）：" % a.text[1])
+            else:
+                print("未给 token：请设 FLEET_CHAT_TOKEN 环境变量，或在命令后补第 4 位 token",
+                      file=sys.stderr)
+                return
+            d[a.text[1]] = {"url": a.text[2], "token": tok}
             _save_peers(d)
             print("已登记 peer %s -> %s" % (a.text[1], a.text[2]))
         elif sub == "del" and len(a.text) >= 2:

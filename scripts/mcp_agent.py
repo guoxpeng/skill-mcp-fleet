@@ -145,15 +145,33 @@ DEFAULT_CONFIG = {
 }
 
 
+# S2：配置文件存在但损坏时不再静默用默认值——置旗标，main() 拒绝启动。
+# 仅文件不存在（首次运行）才用默认值。
+_CONFIG_LOAD_ERROR = ""
+
+
 def load_config():
+    global _CONFIG_LOAD_ERROR
     cfg = dict(DEFAULT_CONFIG)
     if os.path.exists(CONFIG_PATH):
         try:
             with open(CONFIG_PATH, encoding="utf-8") as f:
                 cfg.update(json.load(f))
         except Exception as e:
-            print("[warn] 读配置失败，用默认值: %s" % e, file=sys.stderr)
+            _CONFIG_LOAD_ERROR = str(e)
+            print("[warn] 读配置失败（文件存在但损坏，启动时将拒绝）: %s" % e,
+                  file=sys.stderr)
     return cfg
+
+
+def die_if_config_corrupt():
+    """S2：配置损坏时拒绝启动（非零退出），供 main() 与测试调用。"""
+    if _CONFIG_LOAD_ERROR:
+        print("[FATAL] 配置文件 %s 已损坏（%s），拒绝启动。" % (CONFIG_PATH, _CONFIG_LOAD_ERROR),
+              file=sys.stderr)
+        print("        请手工修复该文件（或从备份恢复）后再启动；不要以默认值裸跑。",
+              file=sys.stderr)
+        raise SystemExit(2)
 
 
 def save_config(cfg):
@@ -349,16 +367,33 @@ def _decode_output(b):
 
 
 def _wrap(cmd, sudo=False):
-    """把命令包成最终交给 bash 执行的字符串。全部用字符串拼接，避免 % 吃掉花括号。"""
+    """把命令包成最终交给 bash 执行的字符串。全部用字符串拼接，避免 % 吃掉花括号。
+
+    SEC-05：密码绝不出现在任何命令行字符串里。需要 sudo 密码时只返回
+    "sudo -S ..." 的命令串，密码由调用方经 stdin 管道喂给 sudo -S
+    （见 _sudo_stdin_prefix），构造出的命令串里永远不含密码。
+    """
     flag = "-lc" if CFG.get("login_shell", True) else "-c"
     if not sudo or _is_root():
         return "bash " + flag + " " + shlex.quote(cmd)
-    pw = CFG.get("sudo_password") or ""
-    if pw:
-        return ("printf '%s\\n' " + shlex.quote(pw)
-                + " | sudo -S bash " + flag + " " + shlex.quote(cmd))
+    if CFG.get("sudo_password"):
+        return "sudo -S bash " + flag + " " + shlex.quote(cmd)
     # 没配密码：尝试免密 sudo（-n），失败会明确报错，不会卡住
     return "sudo -n bash " + flag + " " + shlex.quote(cmd)
+
+
+def _sudo_stdin_prefix():
+    """SEC-05：sudo -S 用的 stdin 前缀（密码行），调用方拼在原 stdin 之前。
+
+    sudo -S 只读第一行当密码，剩余 stdin 仍流向命令本身，所以带原 stdin
+    的命令（如写文件）也不受影响。返回 b"" 表示不需要密码。
+    """
+    if _is_root():
+        return b""
+    pw = CFG.get("sudo_password") or ""
+    if not pw:
+        return b""
+    return (pw + "\n").encode("utf-8", "surrogateescape")
 
 
 def _kill_tree(p):
@@ -377,8 +412,34 @@ def _kill_tree(p):
             pass
 
 
+# S4：同步 exec 的流式读取上限（复用异步路径的分块读与丢弃模式）：
+# 读线程 64KB 分块攒，超限丢弃最老内容并记 dropped；事后 fmt_result 的
+# 200KB 截断仍然保留（双层保护：运行期内存有界 + 返回体有界）。
+RUN_BUF_MAX = 1048576      # 单次同步 exec 输出上限 1MB
+
+
+def _drain_pipe(pipe, buf, lock, state):
+    """读线程：64KB 分块读，超限丢弃最老内容（与异步 _job_reader 同模式）。"""
+    try:
+        while True:
+            chunk = pipe.read(65536)
+            if not chunk:
+                break
+            with lock:
+                buf += chunk
+                if len(buf) > RUN_BUF_MAX:
+                    buf[:] = buf[-RUN_BUF_MAX:]
+                    state["dropped"] = True
+    except Exception:
+        pass
+
+
 def run_local(command, sudo=False, timeout=None, work_dir=None, stdin=None):
-    """在设备本机执行命令，返回 (exit_code, stdout, stderr)。"""
+    """在设备本机执行命令，返回 (exit_code, stdout, stderr)。
+
+    S4：不再用 communicate() 全量攒输出（高产出命令会把内存撑爆），改
+    读线程流式攒 + 1MB 上限丢弃；超时照旧杀进程组，返回部分输出与标记。
+    """
     t = timeout or CFG.get("command_timeout", 120)
     wd = work_dir or CFG.get("work_dir") or "/"
     if _is_windows():
@@ -387,7 +448,19 @@ def run_local(command, sudo=False, timeout=None, work_dir=None, stdin=None):
         argv = ["cmd", "/c", command]
     else:
         argv = ["bash", "-c", _wrap(command, sudo=sudo)]
-    p = None
+    # SEC-05：sudo 密码经 stdin 前缀喂给 sudo -S，不进命令行字符串；
+    # sudo -S 只读第一行当密码，剩余 stdin 仍流向命令本身。
+    pw_prefix = b"" if _is_windows() else _sudo_stdin_prefix()
+    if stdin is None and not pw_prefix:
+        in_data = None
+    else:
+        if isinstance(stdin, bytes):
+            in_body = stdin
+        elif stdin is not None:
+            in_body = stdin.encode("utf-8")
+        else:
+            in_body = b""
+        in_data = pw_prefix + in_body
     try:
         # POSIX 下放进独立进程组：超时时整组杀掉。原来只杀 bash，
         # 它拉起的子孙进程（如 `ping`、`tail -f`、后台服务）会成孤儿继续跑，
@@ -395,26 +468,56 @@ def run_local(command, sudo=False, timeout=None, work_dir=None, stdin=None):
         p = subprocess.Popen(
             argv,
             cwd=wd if os.path.isdir(wd) else None,
-            stdin=subprocess.PIPE if stdin is not None else subprocess.DEVNULL,
+            stdin=subprocess.PIPE if in_data is not None else subprocess.DEVNULL,
             stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             start_new_session=not _is_windows(),
         )
-        out, err = p.communicate(
-            input=stdin.encode("utf-8") if stdin is not None else None,
-            timeout=t)
-        return (p.returncode, _decode_output(out), _decode_output(err))
-    except subprocess.TimeoutExpired:
-        _kill_tree(p)
-        try:
-            out, err = p.communicate(timeout=5)
-        except Exception:
-            out, err = b"", b""
-        return (-1, _decode_output(out or b""),
-                (_decode_output(err or b"") + "\n[超时 %ss 被终止]" % t).lstrip())
     except FileNotFoundError:
         return -1, "", "[执行失败] 找不到 shell（Windows 需 cmd，POSIX 需 bash）"
     except Exception as e:
         return -1, "", "[执行异常] %r" % (e,)
+    out_buf, err_buf = bytearray(), bytearray()
+    lock = threading.Lock()
+    state = {"dropped": False}
+    readers = []
+    for pipe, buf in ((p.stdout, out_buf), (p.stderr, err_buf)):
+        th = threading.Thread(target=_drain_pipe, args=(pipe, buf, lock, state), daemon=True)
+        th.start()
+        readers.append(th)
+    # 写 stdin 用独立线程，避免大输入与大输出同时占满管道导致死锁。
+    if in_data is not None:
+        def _writer():
+            try:
+                p.stdin.write(in_data)
+            except Exception:
+                pass
+            try:
+                p.stdin.close()
+            except Exception:
+                pass
+        threading.Thread(target=_writer, daemon=True).start()
+    try:
+        code = p.wait(timeout=t)
+    except subprocess.TimeoutExpired:
+        _kill_tree(p)
+        try:
+            code = p.wait(timeout=5)
+        except Exception:
+            code = -1
+        for th in readers:
+            th.join(timeout=2)
+        out = _decode_output(bytes(out_buf))
+        err = _decode_output(bytes(err_buf))
+        if state["dropped"]:
+            err += "\n[输出超 1MB，已丢弃早期内容]"
+        return (-1, out, (err + "\n[超时 %ss 被终止]" % t).lstrip())
+    for th in readers:
+        th.join(timeout=5)
+    out = _decode_output(bytes(out_buf))
+    err = _decode_output(bytes(err_buf))
+    if state["dropped"]:
+        err += "\n[输出超 1MB，已丢弃早期内容]"
+    return (code, out, err)
 
 
 def fmt_result(code, out, err):
@@ -502,13 +605,21 @@ def t_exec_async(a):
         argv = ["cmd", "/c", cmd]
     else:
         argv = ["bash", "-c", _wrap(cmd, sudo=bool(a.get("sudo")))]
+    # SEC-05：sudo 密码经 stdin 喂给 sudo -S（同步写一行即关，不阻塞）。
+    pw_prefix = b"" if _is_windows() else _sudo_stdin_prefix()
     try:
         proc = subprocess.Popen(
             argv,
             cwd=wd if os.path.isdir(wd) else None,
-            stdin=subprocess.DEVNULL,
+            stdin=subprocess.PIPE if pw_prefix else subprocess.DEVNULL,
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
             start_new_session=not _is_windows())
+        if pw_prefix:
+            try:
+                proc.stdin.write(pw_prefix)
+                proc.stdin.close()
+            except Exception:
+                pass
     except FileNotFoundError:
         return "错误: 找不到 shell（Windows 需 cmd，POSIX 需 bash）", True
     except Exception as e:
@@ -541,16 +652,30 @@ def t_exec_poll(a):
         offset = max(0, int(a.get("offset", 0)))
     except (TypeError, ValueError):
         offset = 0
+    # L-02：客户端可传 limit（字节数）做分页；无 limit 时行为不变。
+    limit = None
+    try:
+        if a.get("limit") is not None:
+            limit = max(0, int(a.get("limit")))
+    except (TypeError, ValueError):
+        limit = None
     with job["lock"]:
         data = bytes(job["buf"])
         running = job["exit"] is None
         exit_code = job["exit"]
         dropped = job["dropped"]
-    text = _decode_output(data[offset:])
+    if limit is not None:
+        data = data[offset:offset + limit]
+        end = offset + len(data)
+    else:
+        data = data[offset:]
+        end = offset + len(data)
+    text = _decode_output(data)
     head = "[job %s] %s" % (job["id"], "运行中" if running else "已结束 exit=%s" % exit_code)
     if dropped and offset == 0:
         head += "（早期输出因超 1MB 被丢弃）"
-    return "%s\n--- offset %d -> %d ---\n%s" % (head, offset, len(data), text), False
+    # marker 的 Y = 下一页起始字节偏移（无 limit 时等于缓冲总长，与原来一致）。
+    return "%s\n--- offset %d -> %d ---\n%s" % (head, offset, end, text), False
 
 
 def t_exec_result(a):
@@ -949,13 +1074,55 @@ def _init_proto():
     _delivery_engine = MessageDelivery(_mail_engine, _get_peers, self_url())
     _sync_engine = SyncEngine(_mail_engine, _get_peers, self_url())
 
+def _verify_agent(url):
+    """SEC-02：确认对面是真 agent（UDP 发现加 peer 之前调用）。
+
+    匿名 GET / 必须返回带 server 字段的 JSON；再 POST initialize，必须
+    拿到 JSON-RPC 形态的响应（result/error），或 HTTP 401/403（证明这是
+    一个带鉴权的 MCP 端点，不是随便一个 HTTP 服务）。两步都用 3 秒短
+    超时，不阻塞发现线程。任一步失败 → 不是可信 agent。
+    """
+    import urllib.request
+    import urllib.error
+    try:
+        req = urllib.request.Request(url.rstrip("/").removesuffix("/mcp") + "/")
+        with urllib.request.urlopen(req, timeout=3) as r:
+            info = json.loads(r.read().decode("utf-8", "ignore") or "{}")
+        if not isinstance(info, dict) or not info.get("server"):
+            return False
+    except Exception:
+        return False
+    try:
+        payload = json.dumps({"jsonrpc": "2.0", "id": 1, "method": "initialize",
+                              "params": {"protocolVersion": "2024-11-05", "capabilities": {},
+                                         "clientInfo": {"name": "mcp-fleet-verify",
+                                                        "version": SERVER_VERSION}}}).encode("utf-8")
+        req = urllib.request.Request(url, data=payload, method="POST",
+                                     headers={"Content-Type": "application/json",
+                                              "Accept": "application/json, text/event-stream"})
+        with urllib.request.urlopen(req, timeout=3) as r:
+            body = r.read().decode("utf-8", "ignore")
+        resp = json.loads(body) if body.strip() else {}
+        return isinstance(resp, dict) and ("result" in resp or "error" in resp)
+    except urllib.error.HTTPError as e:
+        return e.code in (401, 403)
+    except Exception:
+        return False
+
+
 def _on_discover(name, ip, port, caps):
-    """UDP 发现回调：自动 peer_add。"""
+    """UDP 发现回调：先验真再自动 peer_add（默认开关不动）。
+
+    原来广播里自称什么名字就直接登记，局域网里任何人发一个 UDP 包
+    就能把假地址写进 peers；现在加前必须验真，失败不加。
+    """
     url = "http://%s:%d/mcp" % (ip, port)
     try:
         with PEERS_LOCK:
             d = load_peers()
             if name not in d["nodes"]:
+                if not _verify_agent(url):
+                    return
                 d["nodes"][name] = {"url": url, "token": "",
                                     "added_by": "udp-discover",
                                     "updated": int(time.time())}
@@ -992,6 +1159,72 @@ def save_peers(d):
     except Exception:
         pass
     os.replace(tmp, PEERS_PATH)
+
+
+INVITES_LOCK = threading.Lock()  # S3：邀请 verify 专用锁（读→验→配对→标记→写 全流程）
+
+
+def _invite_file_path():
+    return os.path.join(os.path.dirname(CONFIG_PATH), "invites.json")
+
+
+def _save_invites_atomic(invites, path):
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(invites, f)
+        f.write("\n")
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, path)
+
+
+def _verify_invite(payload):
+    """S3：邀请 verify 全流程（可单测）。
+
+    返回 (http_status, body)。整个读→验→配对→标记→写包在 INVITES_LOCK
+    里，杜绝并发 double-verify；标记落盘失败返回 500 而不是 200（配对
+    本身是幂等 upsert，调用方重试可继续，不会把“未标记”说成“成功”）。
+    """
+    invite_id = payload.get("invite_id", "")
+    peer_name = payload.get("name", "")
+    peer_url = payload.get("url", "")
+    peer_token = payload.get("token", "")
+    if not invite_id or not peer_name or not peer_url:
+        return 400, {"error": "need invite_id, name, url"}
+    path = _invite_file_path()
+    with INVITES_LOCK:
+        try:
+            invites = json.load(open(path)) if os.path.exists(path) else {}
+        except Exception:
+            invites = {}
+        inv = invites.get(invite_id)
+        if not inv:
+            return 403, {"error": "邀请码不存在"}
+        if inv.get("used"):
+            return 403, {"error": "邀请码已使用"}
+        if int(time.time()) > inv.get("expires", 0):
+            return 403, {"error": "邀请码已过期"}
+        with PEERS_LOCK:
+            d = load_peers()
+            d["nodes"][peer_name] = {"url": peer_url, "token": peer_token,
+                                     "added_by": "invite", "updated": int(time.time())}
+            save_peers(d)
+        inv["used"] = True
+        inv["used_by"] = peer_name
+        inv["used_at"] = int(time.time())
+        try:
+            _save_invites_atomic(invites, path)
+        except Exception as e:
+            return 500, {"error": "标记邀请码已使用失败，请重试：%s" % e}
+    return 200, {
+        "ok": True,
+        "verified": True,
+        "my_name": SERVER_NAME,
+        "my_url": self_url(),
+        "my_token": CFG.get("auth_token", ""),
+        "my_version": SERVER_VERSION,
+        "message": "确权通过，已与 %s 建立连接" % peer_name
+    }
 
 
 def _lan_ip():
@@ -1116,7 +1349,7 @@ def _peer_rpc(url, token, payload, sid, hops, timeout):
     return (json.loads(body) if body.strip() else {}), sid
 
 
-def peer_call(url, token, tool, arguments, timeout=130):
+def peer_call(url, token, tool, arguments, timeout=120):
     """对另一个节点做一次完整 MCP 调用：initialize → tools/call。返回 (text, is_err)。"""
     hops = int(getattr(_REQ, "hops", 0) or 0) + 1
     if hops > int(CFG.get("peer_max_hops", 3)):
@@ -1192,7 +1425,7 @@ def t_peer_call(a):
     args = a.get("arguments") or {}
     if isinstance(args, str):
         args = json.loads(args or "{}")
-    t = int(a.get("timeoutMs") or 130000) / 1000.0
+    t = int(a.get("timeoutMs") or 120000) / 1000.0  # L-15：与主控下限 120 秒对齐
     my_name = CFG.get("name", "node")
     audit_log("peer_call", my_name, name, a["tool"], "calling")
     text, is_err = peer_call(_norm_mcp_url(v["url"]), v.get("token", ""), a["tool"], args, t)
@@ -2535,14 +2768,24 @@ class Handler(BaseHTTPRequestHandler):
             peer_name = payload.get("name", "")
             peer_url = payload.get("url", "")
             if peer_name and peer_url:
+                # SEC-10：已有条目时默认拒绝覆盖（握手重放/冒名不能悄悄改地址），
+                # 要求显式 force=true 才覆盖。
+                refused = False
                 try:
                     with PEERS_LOCK:
                         d = load_peers()
-                        d["nodes"][peer_name] = {"url": peer_url, "token": "",
-                                                "added_by": "discover", "updated": int(time.time())}
-                        save_peers(d)
+                        if peer_name in d["nodes"] and not payload.get("force"):
+                            refused = True
+                        else:
+                            d["nodes"][peer_name] = {"url": peer_url, "token": "",
+                                                    "added_by": "discover",
+                                                    "updated": int(time.time())}
+                            save_peers(d)
                 except Exception:
                     pass
+                if refused:
+                    self._json(409, {"error": "peer 已存在，覆盖需 force=true"})
+                    return
             self._json(200, {"name": SERVER_NAME, "url": self_url(),
                             "version": SERVER_VERSION, "ok": True})
             return
@@ -2646,63 +2889,22 @@ class Handler(BaseHTTPRequestHandler):
                 "expires_at": time.strftime("%Y-%m-%d %H:%M:%S",
                                            time.localtime(expires)),
                 "ttl": ttl,
+                # SEC-12：邀请码 base64 解码后就是令牌本身——只标机制，不改机制。
+                "warning": "邀请码 base64 解码后就是本节点令牌本身：用后即焚，"
+                           "不要转发、不要留存；对方用它登记后即作废。",
                 "install_cmd": "bash install.sh --invite %s" % invite_code
             })
             return
 
         if path == "/fleet/invite/verify":
-            # v4.4: 验证邀请码 + 自动双向配对
+            # v4.4: 验证邀请码 + 自动双向配对（逻辑见 _verify_invite，可单测）
             try:
                 payload = json.loads(raw.decode("utf-8"))
             except Exception:
                 self._json(400, {"error": "bad json"})
                 return
-            invite_id = payload.get("invite_id", "")
-            peer_name = payload.get("name", "")
-            peer_url = payload.get("url", "")
-            peer_token = payload.get("token", "")
-            if not invite_id or not peer_name or not peer_url:
-                self._json(400, {"error": "need invite_id, name, url"})
-                return
-            # 验证邀请码
-            _invite_file = os.path.join(os.path.dirname(CONFIG_PATH), "invites.json")
-            try:
-                invites = json.load(open(_invite_file)) if os.path.exists(_invite_file) else {}
-            except Exception:
-                invites = {}
-            inv = invites.get(invite_id)
-            if not inv:
-                self._json(403, {"error": "邀请码不存在"})
-                return
-            if inv.get("used"):
-                self._json(403, {"error": "邀请码已使用"})
-                return
-            if int(time.time()) > inv.get("expires", 0):
-                self._json(403, {"error": "邀请码已过期"})
-                return
-            # 验证通过 → 双向配对
-            with PEERS_LOCK:
-                d = load_peers()
-                d["nodes"][peer_name] = {"url": peer_url, "token": peer_token,
-                                         "added_by": "invite", "updated": int(time.time())}
-                save_peers(d)
-            # 标记邀请码已使用
-            inv["used"] = True
-            inv["used_by"] = peer_name
-            inv["used_at"] = int(time.time())
-            try:
-                json.dump(invites, open(_invite_file, "w"))
-            except Exception:
-                pass
-            self._json(200, {
-                "ok": True,
-                "verified": True,
-                "my_name": SERVER_NAME,
-                "my_url": self_url(),
-                "my_token": CFG.get("auth_token", ""),
-                "my_version": SERVER_VERSION,
-                "message": "确权通过，已与 %s 建立连接" % peer_name
-            })
+            code, body = _verify_invite(payload)
+            self._json(code, body)
             return
 
         if path not in ("/mcp", "/rpc", ""):
@@ -2840,24 +3042,46 @@ def main():
                     help="TLS 私钥文件路径（PEM 格式），启用 HTTPS")
     args = ap.parse_args()
 
+    # S2：配置文件存在但损坏时拒绝启动（不再以默认值裸跑）。
+    die_if_config_corrupt()
+
     # ---- 鉴权前置校验（v3.1）---------------------------------------------
     if args.generate_token and not (CFG.get("auth_token") or ""):
         CFG["auth_token"] = gen_token()
         if save_config(CFG):
             print("  [ok] 已生成随机 auth_token 并写入 %s（权限 0600）" % CONFIG_PATH)
-            print("  [ok] 令牌: %s" % CFG["auth_token"])
+            # SEC-08：令牌走 stderr，不在 stdout（stdout 常被重定向进日志/管道）。
+            print("  [ok] 令牌: %s" % CFG["auth_token"], file=sys.stderr)
             print("  [ok] 请填入主端 mcp.json 的 headers：Authorization: Bearer <令牌>")
         else:
-            print("  [!] 生成令牌后写配置失败，本次仍以无鉴权启动", file=sys.stderr)
+            # S2：生成后写配置失败同样拒绝启动（原来继续以无鉴权启动）。
+            print("[FATAL] 生成令牌后写配置失败，拒绝以无鉴权启动。", file=sys.stderr)
+            sys.exit(2)
     if (args.require_auth or CFG.get("require_auth")) and not (CFG.get("auth_token") or ""):
         print("[FATAL] 已要求鉴权但 auth_token 为空，拒绝启动。", file=sys.stderr)
         print("        先执行：python3 mcp_agent.py --generate-token --require-auth",
               file=sys.stderr)
         sys.exit(2)
+    # SEC-09：自设短令牌大声警告（不拒绝，避免断现有部署）。
+    _tok = CFG.get("auth_token") or ""
+    if _tok and len(_tok) < 20:
+        print("  " + "!" * 68)
+        print("  [!] auth_token 只有 %d 字符（弱令牌，易被猜解）：请换 20 字符以上强随机串。"
+              % len(_tok))
+        print("  [!] 换法：python3 mcp_agent.py --generate-token（已有令牌时不覆盖，"
+              "需先手工清空配置里的 auth_token 再生成）。")
+        print("  " + "!" * 68)
 
     global LISTEN_PORT
     LISTEN_PORT = args.port
-    httpd = FleetHTTPServer((args.host, args.port), Handler)
+    # S8：端口占用时给明确诊断 + 独立退出码 3，不再直接抛 traceback。
+    try:
+        httpd = FleetHTTPServer((args.host, args.port), Handler)
+    except OSError as e:
+        print("[FATAL] 端口 %s:%d 绑定失败：%s" % (args.host, args.port, e), file=sys.stderr)
+        print("        可能已有旧 agent 在跑：先确认（ss -ltnp | grep %d / lsof -i :%d），"
+              "或换一个 --port。" % (args.port, args.port), file=sys.stderr)
+        sys.exit(3)
     # P1-1: TLS 支持
     if args.tls_cert and args.tls_key:
         import ssl as _ssl
