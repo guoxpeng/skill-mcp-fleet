@@ -14,6 +14,7 @@
 """
 import json
 import os
+import re
 import shutil
 import socket
 import subprocess
@@ -1545,7 +1546,8 @@ def test_install_sh_no_crlf():
 # 13. 常量与适配器表
 # ===========================================================================
 def test_version_and_adapter_registry():
-    assert fi.VERSION == "5.2.0"
+    # 只校验三段式，不写死具体值——写死等于给每次补丁加一道无意义的人工门槛。
+    assert re.match(r"^\d+\.\d+\.\d+$", fi.VERSION), fi.VERSION
     assert set(fi.ADAPTERS) == set(fi.SERVICE_KEYS) - {"auto"}
     for key, cls in fi.ADAPTERS.items():
         assert cls.key == key

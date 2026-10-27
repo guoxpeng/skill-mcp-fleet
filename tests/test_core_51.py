@@ -1202,7 +1202,9 @@ class TestCompatibility:
     """版本常量与 Python 3.6 语法兼容。"""
 
     def test_version(self):
-        assert core.VERSION == "5.2.0"
+        # 不写死版本号：写死会让每次补丁都红一片，逼着人去改测试而不是改代码。
+        # 这里只校验「三段式」这一条真正需要守住的规则。
+        assert re.match(r"^\d+\.\d+\.\d+$", core.VERSION), core.VERSION
 
     def test_python36_syntax(self):
         source_path = core.__file__

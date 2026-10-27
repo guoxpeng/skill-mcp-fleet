@@ -138,13 +138,17 @@ bash scripts/demo.sh                        # 本机双节点 30 秒演示
 
 ```bash
 python3 scripts/build_package.py
-# → dist/mcp-fleet-v5.2.0.zip + SHA256SUMS + MANIFEST.json
+# → dist/mcp-fleet-v5.2.1.zip + SHA256SUMS + MANIFEST.json
 ```
 
 - 提交包文件数 **≤ 30**、大小 **≤ 40 MB**，由脚本自动裁剪并以清单/SHA256 固化。
 - 纯标准库、零第三方运行时依赖、MIT 许可、可离线部署。
-- 版本：代码 `SERVER_VERSION=5.2.0` ＝ git tag `v5.2.0` ＝ GitHub Release。
+- 版本：代码 `SERVER_VERSION=5.2.1` ＝ git tag `v5.2.1` ＝ GitHub Release。
   完整演进见 `CHANGELOG.md`。
+- **版本号一律三段式 `X.Y.Z`**：默认只动补丁位（修 bug、稳定性、性能），
+  新增能力才动次版本位，破坏性变更才动主版本位。构建脚本会做三段式校验与
+  同源对账（5 个脚本 + `SKILL.md` frontmatter），任何一处漂移直接判失败。
+  规则详见 `AGENTS.md` 4.1 节。
 
 ## 八、仓库结构
 

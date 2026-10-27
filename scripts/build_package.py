@@ -26,10 +26,23 @@ import zipfile
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
-DEFAULT_VERSION = "5.2.0"
+DEFAULT_VERSION = "5.2.1"
 MAX_FILES = 30
 MAX_BYTES = 40 * 1024 * 1024
 SKILL_NAME = "mcp-fleet"
+
+# 版本号必须是三段式 X.Y.Z。两段式（5.2 / 4.6）会让「每改一次就得进位」
+# 变成习惯，版本涨得比内容快，评审和回滚都没法对账。
+VERSION_RE = re.compile(r"^\d+\.\d+\.\d+$")
+
+# 版本号散落在多处，必须同源。任何一处漂移都算校验失败。
+VERSION_SOURCES = [
+    ("scripts/fleet.py", re.compile(r'^VERSION = "([^"]+)"', re.M)),
+    ("scripts/fleet_core.py", re.compile(r'^VERSION = "([^"]+)"', re.M)),
+    ("scripts/fleet_agent.py", re.compile(r'^VERSION = "([^"]+)"', re.M)),
+    ("scripts/fleet_install.py", re.compile(r'^VERSION = "([^"]+)"', re.M)),
+    ("scripts/mcp_agent.py", re.compile(r'"version": "([^"]+)",', re.M)),
+]
 
 # 提交包白名单：按顺序收集，超过 MAX_FILES 时先丢 references 之外的大文件。
 CORE_FILES = [
@@ -102,6 +115,31 @@ def parse_frontmatter(path):
     raise ValueError("SKILL.md frontmatter 未闭合")
 
 
+def check_version_sync():
+    """校验版本号：三段式，且所有落点一致。
+
+    版本号在 5 个脚本 + SKILL frontmatter 里各有一份，靠人工同步必然漂移。
+    构建时统一对账，比发布后收到「节点报 5.2.0、技能市场写 5.2.1」的反馈便宜。
+    """
+    errors = []
+    if not VERSION_RE.match(DEFAULT_VERSION):
+        errors.append("构建版本 %r 不是三段式 X.Y.Z（例：5.2.1）" % DEFAULT_VERSION)
+    for rel, pat in VERSION_SOURCES:
+        path = os.path.join(ROOT, rel)
+        if not os.path.exists(path):
+            continue
+        found = pat.search(open(path, encoding="utf-8").read())
+        if not found:
+            errors.append("%s 里找不到版本号" % rel)
+            continue
+        ver = found.group(1)
+        if not VERSION_RE.match(ver):
+            errors.append("%s 版本 %r 不是三段式 X.Y.Z" % (rel, ver))
+        elif ver != DEFAULT_VERSION:
+            errors.append("%s 版本 %s ≠ 构建版本 %s" % (rel, ver, DEFAULT_VERSION))
+    return errors
+
+
 def validate_skill():
     """按 Agent Skills 规范校验：name/description 必填、name 合法、description 长度适中。"""
     path = os.path.join(ROOT, "SKILL.md")
@@ -120,6 +158,8 @@ def validate_skill():
     version = str(fm.get("version") or "")
     if not version:
         errors.append("frontmatter 缺少 version 字段（技能市场会默认 1.0.0）")
+    elif not VERSION_RE.match(version):
+        errors.append("frontmatter version=%s 不是三段式 X.Y.Z（例：5.2.1）" % version)
     elif version != DEFAULT_VERSION:
         errors.append("frontmatter version=%s 与构建版本 %s 不一致" %
                       (version, DEFAULT_VERSION))
@@ -158,7 +198,7 @@ def collect(with_tests=True):
 
 
 def build(out_dir, version, with_tests=True, max_files=MAX_FILES):
-    errors = validate_skill()
+    errors = validate_skill() + check_version_sync()
     if errors:
         print("[x] SKILL 校验失败：", file=sys.stderr)
         for e in errors:
@@ -222,12 +262,15 @@ def build(out_dir, version, with_tests=True, max_files=MAX_FILES):
 
 
 def check():
-    errors = validate_skill()
+    ver_errors = check_version_sync()
+    errors = validate_skill() + ver_errors
     files = collect()
     total = sum(os.path.getsize(os.path.join(ROOT, rel)) for _, rel in files)
     print("SKILL 校验: %s" % ("通过" if not errors else "失败"))
     for e in errors:
         print("  - " + e)
+    print("版本号: %s%s" % (DEFAULT_VERSION,
+                          "（三段式，各落点一致）" if not ver_errors else "（不一致）"))
     print("收集文件: %d / %d，总大小 %.1f KB" % (len(files), MAX_FILES, total / 1024.0))
     missing = [rel for _, rel in files if not os.path.exists(os.path.join(ROOT, rel))]
     if missing:

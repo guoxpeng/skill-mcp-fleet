@@ -9,7 +9,7 @@
 > 配套阅读：`agent-playbook.md`（怎么干活）、`prompt-pack.md`（怎么把规则喂给模型）。
 
 示例 JSON 的字段与约束逐字对照代码，并已通过 `validate_envelope()` 校验；示例统一
-使用 `fleet_agent.VERSION`（当前 `"5.2.0"`），时间戳只是「某次运行时刻」。
+使用 `fleet_agent.VERSION`（当前 `"5.2.1"`），时间戳只是「某次运行时刻」。
 
 **章节导航**：§0 速查 · §1 传输层 · §2 信封 schema（强校验字段） · §3 各 kind 的
 payload 约定 · §4 状态机 · §5 thread/task/deadline/验收 · §6 错误与重试 ·
@@ -182,7 +182,7 @@ make_envelope(kind, thread_id, from_, to, payload,
   text = encode_envelope(env)          # 单行 JSON，放进 msg_send.text
   ```
 
-- **版本号取值**：`v` 由 `make_envelope()` 自动填 `fleet_agent.VERSION`（当前 `"5.2.0"`），
+- **版本号取值**：`v` 由 `make_envelope()` 自动填 `fleet_agent.VERSION`（当前 `"5.2.1"`），
   校验门槛是主版本号 `>= 5`（接受 5.x / 6.x / 7.x 等更高版本）。手写信封时直接取
   `VERSION` 即可，不要写死旧版本号；低于 5 的版本会被拒绝并提示
   「本节点要求主版本 >= 5」。
