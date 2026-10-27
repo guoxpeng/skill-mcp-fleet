@@ -550,8 +550,15 @@ class MCPClient:
         if "error" in r:
             raise MCPError(str(r["error"]))
         res = r.get("result", {})
-        text = "\n".join(c.get("text", "") for c in res.get("content", []) or [])
-        if not text:
+        content = res.get("content")
+        if content:
+            # 注意判的是 content 是否存在，**不是 text 是否为空**：
+            # `download` 读空文件、读越界 offset 时合法返回空字符串，
+            # 按 `if not text` 兜底会把 "" 变成一坨 JSON，调用方拿去
+            # base64 解码就是垃圾数据——这类错误极难从现象反推。
+            text = "\n".join(c.get("text", "") for c in content)
+        else:
+            # 没有 content 字段（resources / prompts 之类）：保留完整结构便于排查
             text = json.dumps(res, ensure_ascii=False, indent=2)
         return text, bool(res.get("isError"))
 
@@ -4470,25 +4477,67 @@ def _remote_size(client, path):
         raise MCPError("远端 stat 输出异常：%r" % line[0][:100])
 
 
+def _cp_pull_mode(client, remote, size, timeout):
+    """探测副端的 ``download`` 是否支持 offset/length（5.2.2 起）。
+
+    为什么值得多花一次调用：老的拉取路径是 `dd if=... skip=N count=1 | base64`，
+    依赖副端同时有 `dd` 和 `base64` 两个命令。busybox 常常没编译 base64 applet，
+    于是 OpenWrt / iStoreOS 上 `fleet cp` 拉文件直接报「对端返回被截断」——
+    报错还完全指不到真正原因。新的 download 分块走副端 Python 自己读，
+    零外部命令依赖。
+    """
+    if size <= 0:
+        return "download"
+    want = min(16, size)
+    try:
+        text, iserr = client.call(
+            "download", {"filePath": remote, "offset": 0, "length": want},
+            timeout=timeout)
+    except Exception:
+        return "dd"
+    if iserr:
+        return "dd"
+    try:
+        raw = base64.b64decode(re.sub(r"[^A-Za-z0-9+/=]", "", text or ""))
+    except Exception:
+        return "dd"
+    # 老版本会忽略 offset/length 直接返回整个文件
+    return "download" if len(raw) == want else "dd"
+
+
+def _cp_pull_chunk(client, remote, offset, want, timeout, mode):
+    """取一块远端数据（已解码的原始字节）。"""
+    if mode == "download":
+        text, iserr = client.call(
+            "download", {"filePath": remote, "offset": offset, "length": want},
+            timeout=timeout)
+        if iserr:
+            raise MCPError("读取分块失败：%s" % str(text)[:300])
+        clean = re.sub(r"[^A-Za-z0-9+/=]", "", text or "")
+        return base64.b64decode(clean) if clean else b""
+    # 兼容老副端：dd 按块取，再交给副端的 base64 编码
+    cmd = ("dd if=" + shlex.quote(remote) + " bs=" + str(CP_PULL_CHUNK)
+           + " skip=" + str(offset // CP_PULL_CHUNK) + " count=1 2>/dev/null | base64")
+    b64 = _cp_exec(client, cmd, timeout=timeout)
+    # 只留 base64 字母表：副端的截断提示/告警是中文，混进来会让
+    # b64decode 直接抛「non-ASCII」而不是给出可读的错因。
+    clean = re.sub(r"[^A-Za-z0-9+/=]", "", b64 or "")
+    return base64.b64decode(clean) if clean else b""
+
+
 def _cp_pull_file(client, remote, local, timeout, quiet=False):
-    """分块拉取：dd 取一段 → base64 → 本地解码拼接。任意大小都不会撞上限。"""
+    """分块拉取，任意大小都不会撞上限。"""
     size = _remote_size(client, remote)
     tmp = local + ".fleetpart"
     d = os.path.dirname(os.path.abspath(local))
     if d and not os.path.isdir(d):
         os.makedirs(d, exist_ok=True)
     got = 0
+    mode = _cp_pull_mode(client, remote, size, timeout) if size else "download"
     with open(tmp, "wb") as f:
-        idx = 0
         while got < size:
-            cmd = ("dd if=" + shlex.quote(remote) + " bs=" + str(CP_PULL_CHUNK)
-                   + " skip=" + str(idx) + " count=1 2>/dev/null | base64")
-            b64 = _cp_exec(client, cmd, timeout=timeout)
-            # 只留 base64 字母表：副端的截断提示/告警是中文，混进来会让
-            # b64decode 直接抛「non-ASCII」而不是给出可读的错因。
-            clean = re.sub(r"[^A-Za-z0-9+/=]", "", b64 or "")
-            raw = base64.b64decode(clean) if clean else b""
             expect = min(CP_PULL_CHUNK, size - got)
+            raw = _cp_pull_chunk(client, remote, got, expect, timeout, mode)
             if len(raw) != expect:
                 raise MCPError(
                     "对端返回被截断：本块期望 %d 字节，实得 %d 字节。\n"
@@ -4497,7 +4546,6 @@ def _cp_pull_file(client, remote, local, timeout, quiet=False):
                     % (expect, len(raw)))
             f.write(raw)
             got += len(raw)
-            idx += 1
             if not quiet and size > CP_PULL_CHUNK:
                 sys.stderr.write("\r  拉取 %d%%（%d/%d 字节）" % (got * 100 // max(size, 1), got, size))
                 sys.stderr.flush()

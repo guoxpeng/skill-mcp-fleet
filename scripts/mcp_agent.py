@@ -1195,13 +1195,18 @@ TUN_CHUNK = 262144             # 单次 read 最多返回 256KB
 
 
 def _tun_sweep():
-    """回收过期/空闲连接。"""
+    """回收过期/空闲连接。
+
+    **listener 也要回收**。原来这里对 `kind == "listen"` 直接 continue，理由是
+    「监听器没有数据流」；结果主端崩溃/断网时来不及 `tunnel_close`，listener
+    就永久留着——占一个 TUN_MAX 槽位，还一直占着那个端口。跑几次 `-R` 之后
+    再监听同一个端口就是 "Address already in use"，而且现场看不出是上一轮
+    残留的 socket 没放。
+    """
     now = time.time()
     dead = []
     with TUNNELS_LOCK:
         for tid, s in list(TUNNELS.items()):
-            if s["kind"] == "listen":
-                continue
             if s.get("end"):
                 if now - s["end"] > TUN_TTL:
                     dead.append(tid)
@@ -1395,6 +1400,9 @@ def t_tunnel_accept(a):
         return err, True
     if sess["kind"] != "listen":
         return "%s 不是 listener" % sess["id"], True
+    # 刷新活跃时间：`_tun_sweep` 靠它区分「主端还在轮询」和「主端已经没了」。
+    # 不刷新的话，正常跑着的 `-R` 转发会在 TUN_IDLE 之后被当成孤儿回收掉。
+    sess["last"] = time.time()
     try:
         wait = float(a.get("wait") or 0)
     except Exception:
@@ -1405,6 +1413,7 @@ def t_tunnel_accept(a):
         with sess["lock"]:
             got, sess["pending"] = sess["pending"], []
             ended = bool(sess.get("end"))
+            sess["last"] = time.time()
         if got or ended or time.time() >= deadline:
             return json.dumps({"tunnels": got, "alive": not ended},
                               ensure_ascii=False), False
@@ -1763,34 +1772,58 @@ def t_upload(a):
         raw = base64.b64decode(b64data)
     except Exception as e:
         return "[exit 1] base64 decode failed: %r" % (e,), True
-    if _is_windows():
+    # 非 sudo 一律走 Python 直接写：**不依赖远端有没有 base64 命令**。
+    # busybox 常常没编译 base64 applet，走 `base64 -d > f` 的话 OpenWrt /
+    # iStoreOS 上 `fleet cp` 直接废掉。顺带省掉一次 fork。
+    if _is_windows() or not a.get("sudo"):
         try:
+            d = os.path.dirname(p)
+            if d and not os.path.isdir(d):
+                os.makedirs(d, exist_ok=True)
             with open(p, "wb") as f:
                 f.write(raw)
             return "[exit 0] Upload OK / 上传成功: %s (%d bytes)" % (p, len(raw)), False
         except Exception as e:
-            return "[exit 1] Write failed: %r" % (e,), True
-    # Linux: 用 base64 -d 写入
+            if not a.get("sudo"):
+                return "[exit 1] Write failed: %r" % (e,), True
+            # 落到 sudo 分支：进程本身没有写权限，只能借 root
+    # sudo：Python 进程不是 root，只能借 `sudo base64 -d`
     cmd = "base64 -d > " + shlex.quote(p)
-    code, out, err = run_local(cmd, sudo=bool(a.get("sudo")), stdin=b64data)
+    code, out, err = run_local(cmd, sudo=True, stdin=b64data)
     if code == 0:
         return "[exit 0] Upload OK / 上传成功: %s (%d bytes)" % (p, len(raw)), False
     return fmt_result(code, out, err), True
 
 
 def t_download(a):
-    """P2-2: 读取文件返回 base64 内容（用于二进制文件传输）。"""
+    """P2-2: 读取文件返回 base64 内容（用于二进制文件传输）。
+
+    可选 ``offset`` / ``length`` 支持分块读取：客户端就不必再用
+    `dd if=... skip=N | base64` 这种依赖外部命令的方式拉大文件。
+    """
     p = _check_path(a["filePath"])
-    if _is_windows():
-        try:
-            with open(p, "rb") as f:
-                raw = f.read()
-            return base64.b64encode(raw).decode(), False
-        except Exception as e:
+    try:
+        offset = max(0, int(a.get("offset") or 0))
+    except Exception:
+        offset = 0
+    try:
+        length = max(0, int(a.get("length") or 0))
+    except Exception:
+        length = 0
+    # 同样优先纯 Python：不依赖远端 base64 命令，也不受 max_output_bytes 影响
+    try:
+        with open(p, "rb") as f:
+            if offset:
+                f.seek(offset)
+            raw = f.read(length) if length else f.read()
+        return base64.b64encode(raw).decode(), False
+    except Exception as e:
+        if _is_windows():
             return "[exit 1] Read failed: %r" % (e,), True
-    cmd = "base64 " + shlex.quote(p)
-    code, out, err = run_local(cmd)
-    return fmt_result(code, out, err), code != 0
+        # 权限不够（/etc/shadow 之类）：退回命令，走 sudo
+        cmd = "base64 " + shlex.quote(p)
+        code, out, err = run_local(cmd, sudo=bool(a.get("sudo")))
+        return fmt_result(code, out, err), code != 0
 
 
 def t_ps(a):

@@ -85,6 +85,26 @@ fleet forward --list nas
   `ash`。这些设备上 `exec` 一律返回「找不到 shell」——软路由恰恰是「把家里设备
   接进来」最想接入的节点。现在按 `/bin/bash → /bin/sh → /bin/ash` 探测并缓存，
   探测不到就退到 POSIX 保证存在的 `sh`。
+- **`fleet cp` 在 OpenWrt / iStoreOS 上双向都废（致命）**：`upload` 走
+  `base64 -d > f`、`download` 走 `base64 f`、拉取分块走 `dd | base64`——三条路
+  全都依赖远端命令。busybox 默认不编译 `base64` applet，于是这些设备上
+  传什么都失败，报错还只写「对端返回被截断」，完全指不到真正原因。
+  现在 `upload` / `download` 改由副端 Python 直接读写文件，`download` 新增
+  `offset` / `length` 参数做分块，主端先探测一次再决定走新路还是退回 `dd`
+  （老副端会忽略参数返回整文件，用长度比对识别）。零外部命令依赖，
+  3MB 拉取 6.28s → 0.94s（顺带省掉每块两次 fork）。
+- **`download` 读空内容时主端把返回值包成 JSON**：`_call_once` 里
+  `if not text: text = json.dumps(res)` 判的是**文本是否为空**，而不是
+  **content 是否存在**。`download` 读空文件、或 offset 越过文件末尾时，
+  合法返回就是空字符串，被这句兜底变成 `{"content":[{"text":""}]}`，
+  调用方 base64 解码得到垃圾字节写进本地文件——现象是「文件传过去但内容是坏的」，
+  从现象根本反推不到这里。
+- **僵尸 tunnel listener 永久占槽位 + 占端口**：`_tun_sweep` 对
+  `kind == "listen"` 直接 `continue`，理由是「监听器没有数据流」。主端崩溃或
+  断网来不及 `tunnel_close`，listener 就一直留着；跑几次 `-R` 之后再监听
+  同一个端口就是 `Address already in use`，现场看不出是上一轮的 socket 没放。
+  现在 listener 也按 `last` 回收，并在 `tunnel_accept` 的入口和长轮询返回处
+  刷新时间戳——不刷新的话，正常跑着的 `-R` 反而会被当成孤儿回收掉。
 - **`fleet cp` 大文件基本不可用（致命）**：推 600KB 二进制时被拒，报
   「该操作需要用户确认：防火墙变更」。根因是执行策略把 `upload` 的 `content`
   （base64 文件正文）也拿去跑危险命令正则——`ufw` 只有 3 个字符，几十万字符的
@@ -148,6 +168,10 @@ fleet forward --list nas
   会话被保留、放着的被回收」，以及 8 个槽位占满后第 9 个能挤掉最久未读的。
 - 审计日志轮转、升级备份清理各有独立用例（含「函数要真的被调用」这类断言，
   防止只写了清理函数却没人调）。
+- `download` 分块、`upload` 不依赖 `base64`、拉取模式探测各有独立用例；
+  另有一条**空 content 不得被包成 JSON** 的断言锁住上面那个坑。
+- **真机 listener 回收**：把 `TUN_IDLE` 调到 5s 起真 agent，验证空闲 listener
+  被回收且**端口真的释放**，而持续 accept 的 listener 8 秒轮询后仍存活。
 
 ---
 
