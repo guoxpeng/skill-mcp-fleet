@@ -536,9 +536,19 @@ class TestCliIntegrity:
         """main() 必须把 _discovery_layer 声明为 global（v4.0 起的历史 bug）。
 
         缺少声明时 `_discovery_layer = DiscoveryLayer(...)` 只创建局部变量，
-        模块级引用（_dashboard_data 读取）永远是 None。"""
+        模块级引用（_dashboard_data 读取）永远是 None。
+
+        v5.2.5：这里**不比对整行字符串**——往 global 里加 `LISTEN_HOST`
+        是合法改动，写成全等断言会让「加一个名字」变成「改一次测试」。
+        按名字逐个断言，才是这条用例真正想守的东西。"""
         s = _src("mcp_agent.py")
-        assert "global LISTEN_PORT, _discovery_layer" in s
+        names = set()
+        for line in s.splitlines():
+            line = line.strip()
+            if line.startswith("global "):
+                names.update(n.strip() for n in line[len("global "):].split(","))
+        for need in ("LISTEN_PORT", "LISTEN_HOST", "_discovery_layer"):
+            assert need in names, "main() 的 global 声明里缺 %s" % need
 
     def test_no_duplicate_collections_import(self):
         """fleet_proto.py 不得重复 import collections（独立重复行已删除）。"""

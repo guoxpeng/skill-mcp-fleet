@@ -76,7 +76,7 @@ import uuid
 
 # ---------------------------------------------------------------- 基础
 
-VERSION = "5.2.4"
+VERSION = "5.2.5"
 PROTOCOL = "2024-11-05"
 HERE = os.path.dirname(os.path.abspath(__file__))
 
@@ -1210,6 +1210,14 @@ def resolve_target(target, agent=None, port=3100, sync=None):
     for n, m in nodes.items():        # 允许 http://... 直接当 key 写进过配置
         if m["url"] == t:
             return m["url"], m
+    # 本机节点不在任何登记表里（它是 agent，不是「副端」），但它是个合法
+    # target：`fleet cp ./a.py node:/tmp/a.py`、`fleet exec node "ls"` 都该能用。
+    # 地址走回环，理由同 `_local_reach_url`。
+    _me = local_node()
+    if _me and t == (_me.get("name") or ""):
+        return _local_reach_url(_me["url"]), {
+            "agent": "local", "config": _me.get("dir", ""),
+            "token": _me.get("token", ""), "name": _me.get("name")}
     if t.startswith(("http://", "https://")) or IPV4.match(t) or HOSTNAME.match(t):
         return normalize_url(t, port), {"agent": "direct", "config": "", "token": ""}
     raise KeyError("找不到副端 %r。已注册的：%s\n（先跑 `fleet.py list`；"
@@ -1268,14 +1276,25 @@ def cmd_targets(a):
 
 
 def cmd_tools(a):
-    url, meta = resolve_target(a.target, a.agent, a.port)
+    # 省略 target 就列**本机**的工具：`fleet tools` 是「这东西能干什么」的
+    # 第一反应，不该先逼人知道副端叫什么（和 ping / health / exec 一致）。
+    target = (getattr(a, "target", "") or "").strip()
+    if target:
+        url, meta = resolve_target(target, a.agent, a.port)
+        shown = target
+    else:
+        got = _local_endpoint()
+        if not got:
+            return die("本机没有安装节点，也没指定副端。装节点：sh scripts/install.sh")
+        url, meta = got
+        shown = meta.get("name") or "本机"
     c = MCPClient(url, a.timeout, token=meta.get("token", ""))
     c.handshake()
     tools = c.list_tools()
     if a.json:
         print(json.dumps(tools, ensure_ascii=False, indent=2))
         return 0
-    print("%s  →  %s v%s，%d 个工具\n" % (a.target, c.info.get("name"), c.info.get("version"), len(tools)))
+    print("%s  →  %s v%s，%d 个工具\n" % (shown, c.info.get("name"), c.info.get("version"), len(tools)))
     for t in tools:
         req = (t.get("inputSchema") or {}).get("required") or []
         print("  %-16s %s" % (t["name"], (t.get("description") or "").split("\n")[0]))
@@ -2035,6 +2054,42 @@ def cmd_ping(a):
     return 0
 
 
+def _print_doctor_report(text):
+    """本机自检的结果是 JSON（给机器看的）；`fleet doctor` 是给人敲的。
+
+    直接 `print(text)` 会甩出一坨 13 项、每项四个键的 JSON——出问题时人正着急，
+    最不该让他先读 JSON。这里按「通过 / 建议 / 真问题」三档重排；
+    解析不了就原样打印（宁可丑，不能吞）。
+    """
+    try:
+        d = json.loads(text)
+        checks = d.get("checks") or []
+        summary = d.get("summary") or ""
+        ok_all = bool(d.get("ok"))
+    except (ValueError, TypeError, AttributeError):
+        print(text)
+        return
+    if not checks:
+        print(text)
+        return
+    print("本机自检：%s  %s" % (ok("通过") if ok_all else err("有问题"), dim(summary)))
+    w = max(len(c.get("name") or "") for c in checks)
+    for c in checks:
+        name = c.get("name") or "?"
+        detail = (c.get("detail") or "").replace("\n", " ").strip()
+        if c.get("ok"):
+            print("  %s %-*s  %s" % (ok("ok  "), w, name, dim(detail)))
+        elif c.get("critical"):
+            print("  %s %-*s  %s" % (err("FAIL"), w, name, detail))
+        else:
+            print("  %s %-*s  %s" % (warn("warn"), w, name, dim(detail)))
+    bad = [c for c in checks if not c.get("ok") and c.get("critical")]
+    if bad:
+        print("")
+        print("先解决：%s（其余项多半是被它带出来的）"
+              % "、".join(c.get("name") for c in bad))
+
+
 def cmd_doctor(a):
     if not getattr(a, "target", None):
         got = _local_mcp(a)
@@ -2052,7 +2107,10 @@ def cmd_doctor(a):
                            "     启动：  fleet start\n"
                            "     详情：  %s" % msg)
             return die("本机自检失败：%s" % e)
-        print(text)
+        if getattr(a, "json", False):
+            print(text)
+        else:
+            _print_doctor_report(text)
         # 本机自检里最容易漏的一条：agent 进程跑的是不是磁盘上这份代码
         for line in _version_drift_lines(_running_agent_version(me), me.get("dir"), VERSION):
             print(line)
@@ -2319,8 +2377,23 @@ def cmd_exec(a):
 
 
 def cmd_call(a):
-    url, meta = resolve_target(a.target, a.agent, a.port)
-    if a.tool == "list":
+    tool = (a.tool or "").strip()
+    target = (getattr(a, "target", "") or "").strip()
+    # `fleet call sysinfo`：工具名被 argparse 吃成了 target。和 `fleet exec "df -h"`
+    # 是同一个坑，判定也放在同一处——只有「没给 --tool、且这个位置参数不是任何
+    # 已知副端」时才把它当工具名，其余情况一律当 target。
+    if not tool and target and not _is_known_target(target, a.agent):
+        # `list` 是 --tool 的文档化取值，不是"猜"出来的，不必解释
+        if target != "list":
+            print(dim("    （%r 不是已注册副端，按工具名在本机调用；指定副端："
+                      "fleet call <名字> --tool %s）" % (target, target)), file=sys.stderr)
+        tool, target = target, ""
+    if not tool:
+        return die("没给工具名。用法：fleet call <副端> --tool <工具>"
+                   "　或　fleet call <工具>（在本机调用）\n"
+                   "    看有哪些工具：fleet tools <副端>")
+    if tool == "list":
+        a.target = target or ((local_node() or {}).get("name") or "")
         return cmd_tools(a)
     arguments = {}
     if a.args:
@@ -2340,21 +2413,29 @@ def cmd_call(a):
                     arguments[k] = json.loads(v)
                 except ValueError:
                     arguments[k] = v
+    if target:
+        url, meta = resolve_target(target, a.agent, a.port)
+    else:
+        got = _local_endpoint()
+        if not got:
+            return die("本机没有安装节点，也没指定副端。装节点：sh scripts/install.sh")
+        url, meta = got
     c = MCPClient(url, max(a.timeout, 120), token=meta.get("token", ""),
                   connect_timeout=_connect_timeout(a))
     c.handshake()
     try:
-        text, iserr = c.call(a.tool, arguments, timeout=max(a.timeout, 120))
+        text, iserr = c.call(tool, arguments, timeout=max(a.timeout, 120))
     except MCPError as e:
-        return die("调用 %s 失败：%s" % (a.tool, e))
+        return die("调用 %s 失败：%s" % (tool, e))
     sys.stdout.write(text if text.endswith("\n") else text + "\n")
     return 1 if iserr else 0
 
 
-def _mcp_client(a, toks=None):
-    target = (getattr(a, "target", "") or "").strip()
+def _mcp_client(a, toks=None, target=None):
     if toks is not None:
         target, toks = _pick_exec_target(a, toks)
+    elif target is None:
+        target = (getattr(a, "target", "") or "").strip()
     if target:
         url, meta = resolve_target(target, a.agent, a.port)
     else:
@@ -2387,9 +2468,27 @@ def cmd_exec_async(a):
     return 1 if iserr else 0
 
 
+def _pick_job_args(a):
+    """exec-poll / exec-result / exec-kill 的位置参数兜底，返回 (target, job_id)。
+
+    `fleet exec-poll <job_id>` 是最自然的用法（exec-async 的提示也这么写），
+    但 target 是必需位置参数：job_id 被当成 target，真正的 job_id 缺失，
+    于是回一句 argparse 的 usage——提示和用法互相矛盾，用户只能猜。
+    只有一个位置参数时，它就是 job_id，节点默认本机。
+    """
+    target = (getattr(a, "target", "") or "").strip()
+    jid = (getattr(a, "job_id", "") or "").strip()
+    if target and not jid:
+        return "", target
+    return target, jid
+
+
 def cmd_exec_poll(a):
-    c = _mcp_client(a)
-    args = {"job_id": a.job_id, "offset": a.offset}
+    target, jid = _pick_job_args(a)
+    if not jid:
+        return die("用法：fleet exec-poll <job_id>（job_id 由 exec-async 返回）")
+    c = _mcp_client(a, target=target)
+    args = {"job_id": jid, "offset": a.offset}
     try:
         text, iserr = c.call("exec_poll", args, timeout=max(a.timeout, 30))
     except MCPError as e:
@@ -2399,8 +2498,11 @@ def cmd_exec_poll(a):
 
 
 def cmd_exec_result(a):
-    c = _mcp_client(a)
-    args = {"job_id": a.job_id, "timeoutMs": int(a.wait * 1000)}
+    target, jid = _pick_job_args(a)
+    if not jid:
+        return die("用法：fleet exec-result <job_id> [--wait 秒]")
+    c = _mcp_client(a, target=target)
+    args = {"job_id": jid, "timeoutMs": int(a.wait * 1000)}
     try:
         text, iserr = c.call("exec_result", args, timeout=max(a.timeout, int(a.wait) + 30))
     except MCPError as e:
@@ -2410,9 +2512,12 @@ def cmd_exec_result(a):
 
 
 def cmd_exec_kill(a):
-    c = _mcp_client(a)
+    target, jid = _pick_job_args(a)
+    if not jid:
+        return die("用法：fleet exec-kill <job_id>")
+    c = _mcp_client(a, target=target)
     try:
-        text, iserr = c.call("exec_kill", {"job_id": a.job_id}, timeout=max(a.timeout, 30))
+        text, iserr = c.call("exec_kill", {"job_id": jid}, timeout=max(a.timeout, 30))
     except MCPError as e:
         return die("调用失败：%s" % e)
     sys.stdout.write(text if text.endswith("\n") else text + "\n")
@@ -3448,10 +3553,15 @@ def cmd_invite(a):
         if uri:
             print(ok("[+] ") + "邀请已生成（%s 过期）" % data.get("expires", "?"))
             print("  设备指纹: %s" % data.get("fingerprint", ""))
-            print("  邀请 URI: %s" % uri)
             print("")
-            print("  对方执行：sh scripts/install.sh --join '%s'" % uri)
-            print("           或：fleet join '%s'" % uri)
+            # 只打印**一次**完整 URI：原来同一串 700 多字符的码打了三遍，
+            # 终端里折成几十行，用户既看不清也容易复制断行。
+            print("  邀请码（整行复制，别断开）:")
+            print("    %s" % uri)
+            print("")
+            print("  对方执行（二选一）：")
+            print("    没装节点： sh scripts/install.sh --join '<上面的邀请码>'")
+            print("    已装节点： fleet join '<上面的邀请码>'")
             if getattr(a, "qr", False):
                 print("")
                 _show_qr(uri)
@@ -4020,22 +4130,35 @@ def cmd_send(a):
     return 1 if is_err else 0
 
 
+def _node_log_paths(d):
+    """本机节点日志的候选位置。
+
+    **第一项必须是 `run/node.log`**——那是 `fleet start` 真正重定向的地方。
+    原来这张表里没有它，于是刚 `fleet start` 起来、日志明明有 40KB，
+    `fleet logs` 却报「未找到日志文件」，还列出三个不存在的路径。
+    """
+    return [
+        os.path.join(d, "run", "node.log"),
+        os.path.join(d, "data", "logs", "agent.log"),
+        os.path.join(d, "data", "node.log"),
+        os.path.join(d, "agent.log"),
+    ]
+
+
 def cmd_logs(a):
     """v5.2: 查看本机节点日志尾部（安装器日志或 systemd journal）。"""
     me = local_node(getattr(a, "self_url", None))
     if not me:
         return die("本机没有安装节点")
     n = int(getattr(a, "tail", 100) or 100)
-    candidates = [
-        os.path.join(me["dir"], "data", "logs", "agent.log"),
-        os.path.join(me["dir"], "data", "node.log"),
-        os.path.join(me["dir"], "agent.log"),
-    ]
+    candidates = _node_log_paths(me["dir"])
     for path in candidates:
         if os.path.isfile(path):
             try:
                 with open(path, encoding="utf-8", errors="replace") as f:
                     lines = f.readlines()[-n:]
+                # 抬头走 stderr：stdout 留给日志本身，`fleet logs | grep x` 不受影响
+                print(dim("== %s（末 %d 行）==" % (path, n)), file=sys.stderr)
                 sys.stdout.write("".join(lines))
                 return 0
             except Exception as e:
@@ -4045,7 +4168,10 @@ def cmd_logs(a):
         return subprocess.call(["journalctl", "-u", "mcp-fleet-" + me["name"],
                                 "-n", str(n), "--no-pager"])
     except Exception:
-        return die("未找到日志文件（%s）" % ", ".join(candidates))
+        pass
+    return die("未找到日志文件。找过：\n    %s\n"
+               "    节点没启动过时不会有日志：fleet start（启动后日志在 %s）"
+               % ("\n    ".join(candidates), candidates[0]))
 
 
 
@@ -4173,6 +4299,11 @@ def _fetch_remote_installer():
 
 def cmd_update(a):
     """v5.2.0: 升级本机节点（默认从远端拉最新发布包；--offline 用本地）。"""
+    if getattr(a, "check", False):
+        # 检查新版的实现只有一处（`fleet up --check`），这里直接转过去，
+        # 免得两份判断逻辑慢慢漂成两种结论。
+        argv = ["up", "--check"] + (["--json"] if getattr(a, "json", False) else [])
+        return cmd_up(_menu_args(argv))
     installer = _installer_path()
     if not installer:
         return die("找不到 fleet_install.py；请重新下载安装包，或手工执行 "
@@ -5123,13 +5254,16 @@ def _cp_clean_parts(client, remote, timeout):
 
 
 def _remote_tar(client, path, timeout):
-    """把远端目录打成临时 tar，返回远端 tar 路径。"""
-    base = path.rstrip("/")
-    parent = os.path.dirname(base) or "/"
-    name = os.path.basename(base)
+    """把远端目录打成临时 tar，返回远端 tar 路径。
+
+    **打包成 `-C <dir> .`，不包目录名本身**：解包到目标目录后，目标目录
+    就是源目录的副本。原来包的是 `-C <parent> <name>`，解到目标目录就变成
+    `<目标>/<源目录名>/...`——`cp -r ./src nas:/opt/app/src` 会得到
+    `/opt/app/src/src/...`，而且拉回来再套一层，往返一次多一层。
+    """
     tmp = "/tmp/.fleet-cp-%s.tgz" % uuid.uuid4().hex[:8]
-    _cp_exec(client, "tar czf " + shlex.quote(tmp) + " -C " + shlex.quote(parent)
-             + " " + shlex.quote(name), timeout=timeout)
+    _cp_exec(client, "tar czf " + shlex.quote(tmp) + " -C " + shlex.quote(path) + " .",
+             timeout=timeout)
     return tmp
 
 
@@ -5143,6 +5277,15 @@ def cmd_cp(a):
     """
     src, dst = a.src, a.dst
     known = discover_nodes(a.agent)
+    # 本机节点也允许当 `<名字>:<路径>` 用（scp 手感里本机就是一台机器）。
+    # 它不在登记表里，不补进来的话 `fleet cp ./a.txt node:/tmp/a.txt` 会被
+    # 判成「格式不对」——而格式明明是对的，用户只能反复看帮助。
+    _me = local_node()
+    if _me and _me.get("name") and _me["name"] not in known:
+        known = dict(known)
+        known[_me["name"]] = {"url": _local_reach_url(_me["url"]),
+                              "token": _me.get("token", ""),
+                              "agent": "local", "config": _me.get("dir", "")}
     src_node, src_path = _split_cp_spec(src, known)
     dst_node, dst_path = _split_cp_spec(dst, known)
     if src_node and dst_node:
@@ -5151,7 +5294,8 @@ def cmd_cp(a):
                    % (src_node, dst_node, src_node, src_path, dst_node, dst_path))
     if not src_node and not dst_node:
         return die("至少一侧要写成 <节点名>:<路径>，例如 nas:/opt/app/main.py\n"
-                   "    已注册节点：%s" % (", ".join(sorted(known)) or "（无，先 fleet list）"))
+                   "    可用节点：%s" % (", ".join(sorted(known))
+                                      or "（无。装本机节点：sh scripts/install.sh）"))
     node = src_node or dst_node
     try:
         client, url, meta = client_for(node, a.agent, a.port, timeout=a.timeout,
@@ -5187,9 +5331,8 @@ def cmd_cp(a):
                 tmpdir = tempfile.mkdtemp(prefix="fleet-cp-")
                 tarpath = os.path.join(tmpdir, "payload.tgz")
                 base = src_path.rstrip("/")
-                rc = subprocess.call(["tar", "czf", tarpath, "-C",
-                                      os.path.dirname(os.path.abspath(base)) or ".",
-                                      os.path.basename(base)])
+                # 同样打 `-C <dir> .`：目标目录即副本，不多套一层源目录名
+                rc = subprocess.call(["tar", "czf", tarpath, "-C", base, "."])
                 if rc != 0:
                     shutil.rmtree(tmpdir, ignore_errors=True)
                     return die("本地打包失败（tar exit %d）" % rc)
@@ -5620,7 +5763,10 @@ def build_parser():
     sub.add_parser("stop", help="停止本机节点").set_defaults(func=cmd_stop)
     sub.add_parser("restart", help="重启本机节点").set_defaults(func=cmd_restart)
 
-    common(sub.add_parser("tools", help="列副端工具清单")).set_defaults(func=cmd_tools)
+    sp = common(sub.add_parser("tools", help="列工具清单（省略副端=本机）"),
+                need_target=False)
+    sp.add_argument("target", nargs="?", default="", help="副端名字/地址；省略=本机")
+    sp.set_defaults(func=cmd_tools)
     common(sub.add_parser("probe", help="连通性 + 握手 + 试调（只读）")).set_defaults(func=cmd_probe)
     # ping 的 `--timeout` 默认压到 5 秒：`common()` 给的是 30，
     # 而探活是给看门脚本/菜单用的——离线节点要等 30 秒才出结果，
@@ -5667,8 +5813,10 @@ def build_parser():
     sp.add_argument("--timeout-ms", type=int, help="命令超时（毫秒）")
     sp.set_defaults(func=cmd_exec)
 
-    sp = common(sub.add_parser("call", help="调任意工具"))
-    sp.add_argument("--tool", required=True, help="工具名（list 表示列工具）")
+    sp = common(sub.add_parser("call", help="调任意工具"), need_target=False)
+    sp.add_argument("target", nargs="?", default="",
+                    help="副端名字/地址；省略=本机。也可以只写工具名（fleet call sysinfo）")
+    sp.add_argument("--tool", default="", help="工具名（list 表示列工具）；省略时取位置参数")
     sp.add_argument("--args", help="参数 JSON")
     sp.add_argument("--arg", action="append", metavar="k=v",
                     help="参数简写，可重复，值按 JSON 解析")
@@ -5712,21 +5860,35 @@ def build_parser():
     sp.add_argument("--workdir", help="工作目录")
     sp.set_defaults(func=cmd_exec_async)
 
-    sp = common(sub.add_parser("exec-poll", help="取后台任务的增量输出"))
-    sp.add_argument("job_id", help="exec-async 返回的 job_id")
+    # 这四个的 target 都是可选的：`fleet exec-poll <job_id>` 才是自然用法，
+    # 只有一个位置参数时按 job_id 解释、节点默认本机（见 _pick_job_args）。
+    sp = common(sub.add_parser("exec-poll", help="取后台任务的增量输出"),
+                need_target=False)
+    sp.add_argument("target", nargs="?", default=None,
+                    help="副端名字/地址；省略则本机节点")
+    sp.add_argument("job_id", nargs="?", help="exec-async 返回的 job_id")
     sp.add_argument("--offset", type=int, default=0, help="从第几个字节开始取（默认 0）")
     sp.set_defaults(func=cmd_exec_poll)
 
-    sp = common(sub.add_parser("exec-result", help="等待后台任务完成并取全量输出"))
-    sp.add_argument("job_id", help="exec-async 返回的 job_id")
+    sp = common(sub.add_parser("exec-result", help="等待后台任务完成并取全量输出"),
+                need_target=False)
+    sp.add_argument("target", nargs="?", default=None,
+                    help="副端名字/地址；省略则本机节点")
+    sp.add_argument("job_id", nargs="?", help="exec-async 返回的 job_id")
     sp.add_argument("--wait", type=int, default=120, help="最长等待秒数（默认 120）")
     sp.set_defaults(func=cmd_exec_result)
 
-    sp = common(sub.add_parser("exec-kill", help="终止一个后台任务"))
-    sp.add_argument("job_id", help="exec-async 返回的 job_id")
+    sp = common(sub.add_parser("exec-kill", help="终止一个后台任务"),
+                need_target=False)
+    sp.add_argument("target", nargs="?", default=None,
+                    help="副端名字/地址；省略则本机节点")
+    sp.add_argument("job_id", nargs="?", help="exec-async 返回的 job_id")
     sp.set_defaults(func=cmd_exec_kill)
 
-    sp = common(sub.add_parser("exec-jobs", help="列出副端所有后台任务"))
+    sp = common(sub.add_parser("exec-jobs", help="列出副端所有后台任务"),
+                need_target=False)
+    sp.add_argument("target", nargs="?", default=None,
+                    help="副端名字/地址；省略则本机节点")
     sp.set_defaults(func=cmd_exec_jobs)
 
     sp = sub.add_parser("health", help="批量体检所有副端")
@@ -5868,6 +6030,10 @@ def build_parser():
     sp.add_argument("--rollback", action="store_true", help="回滚到最近一次升级备份")
     sp.add_argument("--offline", action="store_true",
                     help="不联网，使用节点目录里的本地安装器")
+    # `fleet update --check` 是「有没有新版」最自然的写法，而实现检查的是
+    # `fleet up --check`。两个命令名字太像，与其让用户猜，不如转过去。
+    sp.add_argument("--check", action="store_true",
+                    help="只检查有没有新版（等同 fleet up --check），不改任何文件")
     sp.set_defaults(func=cmd_update)
     sp = sub.add_parser("up", help="v5.2.1: 从 git 升级本地脚本（有新版才动，失败自动回滚）")
     sp.add_argument("--check", action="store_true", help="只检查有没有新版，不改文件")
@@ -6337,7 +6503,8 @@ def cmd_start(a):
         port = 3100
     logdir = os.path.join(d, "run")
     os.makedirs(logdir, exist_ok=True)
-    logf = open(os.path.join(logdir, "node.log"), "ab")
+    logpath = _node_log_paths(d)[0]
+    logf = open(logpath, "ab")
     try:
         p = subprocess.Popen([sys.executable, agent, "--host", host, "--port", str(port)],
                              cwd=d, stdout=logf, stderr=logf,
@@ -6356,7 +6523,7 @@ def cmd_start(a):
         if _local_health(me, timeout=1):
             print(ok("[+] ") + "本机节点已启动：%s  %s（pid %d）"
                   % (me["name"], _local_reach_url(me["url"]), p.pid))
-            print(dim("    日志：%s" % os.path.join(logdir, "node.log")))
+            print(dim("    日志：%s（fleet logs --tail 50）" % logpath))
             return 0
         if p.poll() is not None:
             break

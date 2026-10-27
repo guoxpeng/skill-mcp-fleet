@@ -104,7 +104,7 @@ for _stream in (sys.stdout, sys.stderr):
 DEFAULT_CONFIG = {
     "name": "node",             # 副端标识（显示在状态页与 serverInfo）
     "tool_prefix": "",          # 工具名前缀，如 "nas_"；留空则用裸名（exec/read/...）
-    "version": "5.2.4",
+    "version": "5.2.5",
     "sudo_password": "",        # 留空且非 root 时会尝试免密 sudo
     "work_dir": "/",            # 默认工作目录
     "command_timeout": 120,     # 秒
@@ -880,7 +880,11 @@ def t_exec_async(a):
         JOBS[jid] = job
     th = threading.Thread(target=_job_reader, args=(job,), daemon=True)
     th.start()
-    return ("job_id=%s\n用 exec_poll %s 取输出，exec_result %s 等待完成，exec_kill %s 终止。"
+    # 提示必须**能直接复制**：原来写的是工具名 `exec_poll <jid>`，CLI 用户
+    # 照着敲会得到 argparse 的 usage（而且 target 还是必填位置参数）。
+    return ("job_id=%s\n取输出：fleet exec-poll %s ｜ 等完成：fleet exec-result %s "
+            "｜ 终止：fleet exec-kill %s\n"
+            "（MCP 客户端对应工具名：exec_poll / exec_result / exec_kill）"
             % (jid, jid, jid, jid)), False
 
 
@@ -1838,14 +1842,32 @@ def t_service_logs(a):
 
 
 def t_sysinfo(a):
+    """系统概况。**必须跨平台**——这是新用户/新 agent 调的第一个工具。
+
+    原来整条命令只按 Linux 写：macOS 没有 `free -h`（内存段空白）、BSD 的
+    `ps` 不认 `--sort`（CPU 段空白），而 stderr 被堆在最后，于是用户看到的
+    是两个空标题，得滚到底才知道 `free: command not found`。
+    现在每段都写成「首选 || 退回」，缺哪个就用另一个。
+    """
     cmd = (
         "echo '=== 主机 ==='; hostname; uname -srm; uptime; "
-        "echo; echo '=== 内存 ==='; free -h; "
-        "echo; echo '=== 磁盘 ==='; df -h | grep -vE 'tmpfs|overlay|udev'; "
-        "echo; echo '=== CPU 前5 ==='; ps -eo pcpu,pmem,comm --sort=-pcpu | head -6"
+        "echo; echo '=== 内存 ==='; "
+        "(free -h 2>/dev/null || free 2>/dev/null || "
+        "{ sysctl -n hw.memsize 2>/dev/null | "
+        "awk '{printf \"总内存: %.1f GB\\n\", $1/1073741824}'; "
+        "vm_stat 2>/dev/null | head -5; }); "
+        "echo; echo '=== 磁盘 ==='; "
+        "df -h 2>/dev/null | grep -vE 'tmpfs|overlay|udev|devfs|map auto_home'; "
+        "echo; echo '=== CPU 前5 ==='; "
+        "(ps -eo pcpu,pmem,comm --sort=-pcpu 2>/dev/null "
+        "|| ps -Ao pcpu,pmem,comm -r 2>/dev/null) | head -6"
     )
     code, out, err = run_local(cmd)
-    return fmt_result(code, out, err), code != 0
+    # 这里返回的是**报告**，不是命令结果：不带 `[exit 0]` 头。
+    text = out.rstrip()
+    if err.strip():
+        text += "\n--- stderr ---\n" + err.strip()
+    return _truncate(text), code != 0
 
 
 def t_http_get(a):
@@ -2221,6 +2243,19 @@ try:
     LISTEN_PORT = int(open(os.path.join(HERE, "port.txt")).read().strip())
 except Exception:
     LISTEN_PORT = None                # main() 里会按实际监听端口覆盖
+#: 实际绑定地址。None = 还没启动（模块被 import 时），不能拿它下判断。
+LISTEN_HOST = None
+
+
+def _bound_loopback():
+    """本进程是否只绑在回环上——没配令牌时的默认，也是「对端连不进来」的原因。
+
+    不知道（还没启动）时返回 False：宁可不说，也不要在 import 阶段乱断言。
+    """
+    h = (LISTEN_HOST or "").strip()
+    if not h:
+        return False
+    return h in ("127.0.0.1", "localhost", "::1")
 
 
 def load_peers():
@@ -2565,7 +2600,17 @@ def _peer_entry(name):
 
 def t_peers(a):
     nodes = load_peers()["nodes"]
-    lines = ["本机: %s  回连地址: %s" % (SERVER_NAME, self_url()), ""]
+    # 「回连地址」原来无条件报 `self_url()`（内网 IP / tailnet IP）。可 agent
+    # 默认只绑 127.0.0.1（没令牌时的安全默认），于是这里报出去的地址
+    # **自己都连不上**，对端更连不上——`fleet nodes` 和 `fleet status`
+    # 在同一台机器上给出两个地址、其中一个必然失败，用户只能靠猜。
+    if _bound_loopback():
+        url = "http://127.0.0.1:%s/mcp" % (LISTEN_PORT or 3100)
+        note = ("  （只监听回环：别的设备连不进来。要让对端回连，先配 auth_token"
+                " 再重启：fleet token 或 install.sh --generate-token）")
+    else:
+        url, note = self_url(), ""
+    lines = ["本机: %s  回连地址: %s%s" % (SERVER_NAME, url, note), ""]
     if not nodes:
         lines.append("（还没有对等节点。用 peer_add 添加，或在本机跑：fleet pair <对方地址> --token <令牌>）")
     for n in sorted(nodes):
@@ -2653,8 +2698,14 @@ def t_peer_info(a):
 
     公钥是公开信息；token 不在这里返回（对方本来就持有或走签名）。
     """
+    reachable = not _bound_loopback()
     return json.dumps({
         "name": SERVER_NAME, "url": self_url(), "version": SERVER_VERSION,
+        # 只绑回环时报出去的地址对端也连不上。把「能不能回连」明说，
+        # 免得对端把 192.168.x.x 写进 peers.json 然后永远 不通。
+        "reachable": reachable,
+        "unreachable_reason": "" if reachable else
+        "本机只监听 127.0.0.1（未配置 auth_token）；配令牌后重启才能被回连",
         "node_id": IDENTITY.node_id if IDENTITY else "",
         "fingerprint": IDENTITY.fingerprint if IDENTITY else "",
         "public_key": IDENTITY.public_key_b64 if IDENTITY else "",
@@ -4049,8 +4100,14 @@ def _selfcheck_findings():
         add("identity_missing", "high", "节点身份缺失（token 降级）",
             "fleet_core 未启用或 identity.json 损坏", None, False)
     if not (CFG.get("auth_token") or CFG.get("require_signature")):
-        add("auth_disabled", "medium", "未启用鉴权",
-            "token 与签名都未开启；对外监听时风险高", None, False)
+        # 只监听回环时无鉴权不是风险（能连上的本来就是本机用户），
+        # 报 medium 只会让刚装好的人去找一个不存在的配置项。
+        if _bound_loopback():
+            add("auth_disabled", "info", "未启用鉴权（当前仅监听回环，可接受）",
+                "要接受别的设备连接时必须配 auth_token", None, False)
+        else:
+            add("auth_disabled", "medium", "未启用鉴权",
+                "token 与签名都未开启；对外监听时风险高", None, False)
     # 审计链
     try:
         if AUDIT_CHAIN is not None and not AUDIT_CHAIN.verify()[0]:
@@ -4074,18 +4131,36 @@ def _selfcheck_findings():
     # 权限目录
     for label, path, mode in (("data_dir", DATA_DIR, 0o700),
                               ("mailbox", os.path.join(HERE, "mailbox"), 0o700)):
-        if os.path.exists(path):
-            try:
-                cur = os.stat(path).st_mode & 0o077
-                if cur:
-                    add("dir_perm", "medium", "%s 权限过宽" % label,
-                        oct(os.stat(path).st_mode & 0o777),
-                        "fix_permissions", True)
-            except Exception:
-                pass
-            if not os.access(path, os.W_OK):
-                add("dir_unwritable", "high", "%s 不可写" % label, path,
-                    "fix_permissions", True)
+        if not os.path.exists(path):
+            continue
+        try:
+            st = os.stat(path)
+        except Exception:
+            continue
+        bits = oct(st.st_mode & 0o777)
+        if st.st_mode & 0o002:
+            # 别的用户能**写** = 能替换 identity.json / 审计链，这是真风险
+            add("dir_perm", "high", "%s 对其他用户可写" % label, bits,
+                "fix_permissions", True)
+        elif (st.st_mode & 0o077) and \
+                os.path.abspath(path) != os.path.abspath(HERE):
+            # 只是「可读/可进」：独立数据目录该收紧到 700。
+            # **代码目录（HERE）本身就是 0755，这不是数据目录配错**——
+            # 敏感文件自己是 0600。原来一刀切报警，用户照做去 chmod 代码
+            # 目录，问题依旧，还把仓库权限搞乱。
+            add("dir_perm", "medium", "%s 权限过宽" % label, bits,
+                "fix_permissions", True)
+        if not os.access(path, os.W_OK):
+            add("dir_unwritable", "high", "%s 不可写" % label, path,
+                "fix_permissions", True)
+    # 数据目录和代码目录重合：身份/审计/邮箱全写进代码目录，升级或重装
+    # 时容易被一起清掉。正规安装（install.sh）会写独立的 data_dir，
+    # 所以这条只出现在「直接跑脚本」的场景。
+    if os.path.abspath(DATA_DIR) == os.path.abspath(HERE):
+        add("data_dir_shared", "info", "数据目录与代码目录重合",
+            "未配置 data_dir，身份/审计/邮箱都写在 %s；升级或重装时容易"
+            "一起删掉。建议在 mcp_agent_config.json 里设 data_dir 到独立目录"
+            "（安装器默认就是 <install>/data）" % DATA_DIR, None, False)
     # 残留 pid
     pid_path = os.path.join(DATA_DIR, "fleet.pid")
     try:
@@ -4160,9 +4235,15 @@ def _repair_do(action):
         return True, "重启已调度（约 1 秒后执行；请等待 10 秒后重新自检）"
     if action == "fix_permissions":
         fixed = []
-        for path, mode in ((CONFIG_PATH, 0o600),
-                           (DATA_DIR, 0o700),
-                           (os.path.join(HERE, "mailbox"), 0o700)):
+        targets = [(CONFIG_PATH, 0o600),
+                   (os.path.join(HERE, "mailbox"), 0o700)]
+        # 数据目录**不等于代码目录**时才收紧到 700。两者重合时（没配
+        # data_dir 的开发/手工部署）chmod 代码目录只会把仓库或共享安装目录
+        # 改坏——而真正的敏感文件自己已经是 0600。检查和修复必须同一套判断，
+        # 否则就是「自检不报、修复照改」。
+        if os.path.abspath(DATA_DIR) != os.path.abspath(HERE):
+            targets.insert(1, (DATA_DIR, 0o700))
+        for path, mode in targets:
             try:
                 if os.path.exists(path):
                     os.chmod(path, mode)
@@ -5305,8 +5386,10 @@ def main():
     # v5.0.9 修复：原来缺 _discovery_layer 的 global 声明，此处赋值只创建了
     # 局部变量，模块级引用（_dashboard_data 读取）永远是 None，导致
     # Dashboard 各节点的 last_seen 自 v4.0 起一直为空。
-    global LISTEN_PORT, _discovery_layer
+    global LISTEN_PORT, LISTEN_HOST, _discovery_layer
     LISTEN_PORT = args.port
+    # 记下真实绑定地址：`peers` / `peer_info` 要靠它判断「对端到底能不能回连」
+    LISTEN_HOST = args.host or "127.0.0.1"
     # v5.0.7: --read-only 运行时开启只读模式（不写回配置文件）
     if args.read_only:
         CFG["read_only"] = True

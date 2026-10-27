@@ -10,6 +10,101 @@
 
 ---
 
+## [5.2.5] — 2026-10-27 · 单看每行都对，串起来就矛盾
+
+5.2.4 修的是「一条命令自己不对劲」。这一版修的是**命令与命令之间**：
+`nodes` 报的地址 `status` 说连不上、`exec-async` 提示的补救命令照敲就报
+usage、`cp` 推进去再拉回来目录多一层、自检建议你去 `chmod` 代码目录。
+每一条单独看都有道理，用户按顺序走一遍就卡住——而这正是「拿它当 ssh 用」
+时的真实路径。
+
+### 修复：两条命令说的不是同一件事
+- **`fleet nodes` 报的回连地址，自己都连不上**。`self_url()` 拼的是
+  `http://172.16.1.21:3100/mcp`（网卡地址），而没配令牌时 agent 只绑
+  `127.0.0.1`——同一个 `fleet status` 里写的是回环。两条命令并排看就是
+  自相矛盾，而用户会拿 `nodes` 里那串去配对端。现在记下真实
+  `LISTEN_HOST`：绑回环时如实报 `127.0.0.1` 并附一句「只监听回环：
+  别的设备连不进来。要让对端回连，先配 auth_token 再重启」；
+  `peer_info` 同步给出 `reachable` / `unreachable_reason`，让**对端**
+  也能看出这不是网络问题。
+- **`fleet exec-async` 的提示照抄就报 usage**。它说「取输出：
+  `fleet exec-poll <job_id>`」，但 `exec-poll` 的 `target` 是必填位置参数，
+  只给 job_id 会被当成 target。现在 `exec-poll` / `exec-result` /
+  `exec-kill` / `exec-jobs` 的 target 均可省略（由 `_pick_job_args` 兜底），
+  提示也改成可直接复制的完整命令，并注明 MCP 客户端对应的工具名。
+- **`fleet cp ./a.txt node:/tmp/a.txt` 报「格式不对」**。本机节点是 agent，
+  不在任何「副端」登记表里，于是解析时认不出 `node:` 是谁。现在
+  `resolve_target` 与 `cmd_cp` 都补入本机节点——`exec` / `cp` 都能用本机
+  名字当 target，和副端一致。
+- **`fleet call sysinfo` 直接被 argparse 挡在门外**。`--tool` 是
+  `required=True`，于是「在本机调一个工具」这个最自然的写法被吃成
+  `target=sysinfo`、然后报一句 `--tool is required` 的 usage。现在
+  `--tool` 与 target 都可省略：只有一个位置参数且它不是任何已知副端时，
+  它就是工具名（在 stderr 说明一句），`fleet call node --tool sysinfo` 照旧。
+  和 `fleet exec "df -h"` 用的是同一套判定思路。
+- **`fleet tools` 必须给副端**，而它恰恰是「这东西能干什么」的第一反应。
+  现在省略即列本机工具，与 `ping` / `health` / `exec` 一致。
+- **`fleet logs` 永远说「未找到日志文件」**。`fleet start` 把输出重定向到
+  `<节点目录>/run/node.log`，而 `logs` 只在 `data/logs/agent.log`、
+  `data/node.log`、`agent.log` 三处找——日志明明有 40 KB 却报不存在，
+  还把三个不存在的路径列给你看。现在两边共用 `_node_log_paths()`，
+  `run/node.log` 排第一；找不到时说明「节点没启动过时不会有日志，
+  先 `fleet start`」。
+- **`fleet doctor` 直接甩一坨 JSON**。13 项检查、每项四个键——用户出问题时
+  正着急，最不该让他先读 JSON。现在按「通过 / 建议 / 真问题」重排成清单，
+  关键项失败时最后补一句「先解决：port（其余项多半是被它带出来的）」；
+  `--json` 仍输出原始 JSON 给脚本用。
+- **`fleet update --check` 报 `unrecognized arguments`**。`up` 和 `update`
+  名字太像：查新版在 `up --check`，升级本机节点在 `update`。用户按字面意思
+  敲 `update --check` 得到一句 usage，还得自己猜该换成哪个命令。
+  现在 `update --check` 直接转发给 `up --check`（同一份实现，不复制逻辑）。
+- **UDP 发现端口被占时刷屏，而且 macOS 上根本共享不了**。同一台机器上跑
+  两个节点（测试、容器、开发机都很常见）时，`_listen_loop` 只设了
+  `SO_REUSEADDR`——Linux 够用，macOS/BSD 必须 `SO_REUSEPORT` 才能共享，
+  于是第二个节点永远绑不上，每 2/4/8 秒打一条 `warn`（实测日志里 36 条），
+  看起来像出了大事，其实只是发现功能静默失效、其余功能一切正常。
+  现在补 `SO_REUSEPORT`；真绑不上时前 3 次说清「发现功能暂不可用，
+  其余功能正常」，第 4 次起不再重复。
+
+### 修复：传输往返一次就变形
+- **`cp -r ./src nas:/opt/app/src` 得到 `/opt/app/src/src/...`**。远端打包用的是
+  `tar czf - -C <父目录> <目录名>`，解到目标目录后自然多套一层；拉回来再套
+  一层，往返几次目录就烂了。现在打 `-C <目录> .`，推/拉同一套逻辑，
+  目标目录就是源目录的副本。实测往返结构完全一致。
+- **`fleet invite` 把 700 多字符的邀请码打了三遍**。终端里折成几十行，
+  用户既看不清也容易复制断行（断一个字符就解不开）。现在只完整打印
+  一次，其余两处用「上面的邀请码」引用。
+
+### 修复：报出来的问题其实不该报
+- **`fleet sysinfo` 在 macOS 上内存、CPU 两段是空的**。命令只按 Linux 写
+  （`free -h`、`ps --sort`），失败信息全堆在末尾，中间只剩两个空标题。
+  现在每段都「首选 || 退回」（`sysctl -n hw.memsize` 经 `awk` 转 GB、
+  `ps -Ao ... -r`），输出也不再冒充命令结果去带 `[exit 0]` 头。
+- **自检把代码目录的 0755 当成「数据目录配错」**，而 `fleet repair --auto`
+  会照着建议去 `chmod 700` **代码目录**——默认安装下 `DATA_DIR == HERE`，
+  修完连自己都读不了。现在检查与修复用同一判断（只有数据目录与代码目录
+  **不是同一个**时才收紧），并另加一条 info 级 `data_dir_shared` 说明
+  现状；回环监听时的 `auth_disabled` 也降为 info（那是有意的默认）。
+
+### 测试
+- `tests/test_usage_525.py`（35 条）：本机节点作 target（`exec` / `cp` 两条
+  路径）、`_pick_job_args` 的兜底、`cp` 的 tar 布局（含一次真打包
+  roundtrip，断言目录结构不多层）、`t_peers` / `t_peer_info` 在回环与
+  非回环下的措辞与 `reachable` 字段、自检权限判断不误伤代码目录、
+  `sysinfo` 命令必须带 macOS 退回分支、邀请码只完整打印一次；
+  `fleet call` 的四种手势（裸工具名 / 显式 target / 只给 `--tool` /
+  什么都不给），断言 `--tool` 不能是 required；`logs` 与 `start` 共用
+  同一张日志路径表；`doctor` 的 JSON → 清单转换（含解析失败要原样打印、
+  `--json` 必须保留 JSON）；UDP 发现必须设 `SO_REUSEPORT` 且提示有界；
+  `update --check` 必须转发给 `up --check` 而不是自己再写一份判断。
+- 顺带修掉一条**写法过严**的老用例：`test_discovery_layer_global_in_main`
+  断言整行 `global LISTEN_PORT, _discovery_layer`，于是「往 global 里加
+  一个 `LISTEN_HOST`」也会红。改成按名字逐个断言——它想守的是「别漏声明」，
+  不是「这行不许改」。
+- 全量 **986 passed, 1 skipped**（5.2.4 是 951，本版净增 35 条）。
+
+---
+
 ## [5.2.4] — 2026-10-27 · 换个位置用：真实使用者视角下的 18 处体验坑
 
 这一版是把「自己当用户」重跑一遍：不看代码，只敲命令，看哪里别扭、哪里慢、

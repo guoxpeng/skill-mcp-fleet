@@ -62,7 +62,7 @@ try:  # Python 3.6+ 均有 urllib.request；显式兜底便于极简环境
 except ImportError:  # pragma: no cover - 正常 CPython 不会走到
     urllib = None
 
-VERSION = "5.2.4"
+VERSION = "5.2.5"
 
 # MCP initialize instructions 硬上限（契约要求 ≤ 6000 字符）
 MAX_INSTRUCTIONS = 6000

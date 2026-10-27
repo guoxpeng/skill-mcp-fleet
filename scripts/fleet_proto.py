@@ -772,6 +772,15 @@ class DiscoveryLayer:
             try:
                 self._sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
                 self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                # macOS/BSD 上 UDP 端口共享靠 SO_REUSEPORT，只设 SO_REUSEADDR
+                # 仍然 EADDRINUSE。同一台机器上跑两个节点（测试、容器、开发机）
+                # 就会变成「每 2/4/8 秒一条 warn，永远绑不上」——发现功能静默失效，
+                # 日志里却像出了大事。
+                if hasattr(socket, "SO_REUSEPORT"):
+                    try:
+                        self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
+                    except Exception:
+                        pass
                 try:
                     self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
                 except Exception:
@@ -783,9 +792,16 @@ class DiscoveryLayer:
                 bind_failures += 1
                 wait = min(2 ** bind_failures, 60)  # 指数退避，最大 60s
                 # v5.0.6.1: 端口被占用/权限不足时不退订，等重试
+                # v5.2.5: 只在前 3 次说清楚，之后静默——发现不可用**不影响**
+                # 已登记节点的连接与执行，不该让日志里全是同一条 warn。
                 if bind_failures <= 3:
-                    print("[mcp-fleet/warn] UDP 监听端口 %d 失败: %s — %ds 后重试"
-                             % (self.discover_port, e, wait), file=sys.stderr)
+                    print("[mcp-fleet/warn] UDP 发现端口 %d 被占用（%s）—"
+                          " 发现功能暂不可用，其余功能正常；%ds 后重试"
+                          % (self.discover_port, e, wait), file=sys.stderr)
+                elif bind_failures == 4:
+                    print("[mcp-fleet/warn] UDP 发现端口 %d 仍被占用，不再重复提示"
+                          "（同机多节点/容器共用端口时可忽略）" % self.discover_port,
+                          file=sys.stderr)
                 self._stop.wait(wait)
                 continue
             # 正常接收循环
