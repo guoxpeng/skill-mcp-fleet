@@ -112,6 +112,32 @@ sudo bash install.sh --name nas --port 3100 --tailnet my-tailnet --tailnet-key t
 
 Tailscale 不是必需的。如果你只需要同网段通信，不需要安装 Tailscale。如果你需要跨网段（比如 NAS 在家、云主机在公网），Tailscale 提供端到端加密的虚拟网络，fleet 在其上自动构建 agent mesh。
 
+沙盒主控经受限隧道代理访问 tailnet 的限制（逐地址审批、漫游换 IP 重批、
+优先 tailnet 地址）见 `docs/tailnet-limits.md`。
+
+### 手机（Termux）保活：Termux:Boot + wake lock + 电池白名单
+
+Android 杀后台是手机副端掉线的主因（2026-10-26 实测：Termux 切后台后 agent
+进程静默消失）。注意：**安装脚本目前只在安装时拿一次 wake lock，不配
+Termux:Boot、不改电池白名单**——以下步骤需手工做，缺一不可：
+
+```bash
+# 1) 装 Termux:Boot 应用（F-Droid / Play），开机自启靠它
+# 2) 在 ~/.termux/boot/ 放启动脚本（开机自动执行），例如 start-fleet.sh：
+termux-wake-lock   # 每次开机都要重新拿，重启后上次的锁就没了
+cd ~/.mcp-fleet/phone-v6 2>/dev/null || cd /opt/*_mcp
+nohup python3 mcp_agent.py --host 0.0.0.0 --port 3101 > agent.log 2>&1 &
+bash termux-watchdog.sh   # 仓库根目录的常驻看门狗，60 秒一轮，死了自动拉起
+
+# 3) 电池白名单（否则省电策略照样杀；需 adb 或 root 二选一）：
+dumpsys deviceidle whitelist +com.termux
+
+# 4) 平时自查：termux-watchdog.sh --once 只跑一轮（配 cron/Tasker 定时调也行）
+```
+
+相关脚本都在仓库根目录：`termux-watchdog.sh`（agent 保活）、
+`tailscale-keepalive.sh`（tailscaled 掉线/掉登录态时自动恢复）。
+
 ## 通讯协议（v4.1 新增）
 
 ### UDP 广播发现

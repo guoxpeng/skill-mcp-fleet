@@ -527,22 +527,90 @@ def discover_nodes(agent=None):
         found.setdefault(name, {"url": v.get("url"), "agent": "registry",
                                 "config": REGISTRY,
                                 "description": v.get("description", ""),
-                                "token": v.get("token", "")})
+                                "token": _token_from_headers(v)})
     return found
 
 
 def _token_from_headers(entry):
-    """从 mcp.json 的 headers 里把 token 抠出来（Bearer / X-Fleet-Token）。"""
-    h = entry.get("headers") or {}
-    if not isinstance(h, dict):
+    """统一凭据读取（P0-2）：两种来源都认，优先级固定。
+
+    1. headers.Authorization: Bearer <token>
+    2. headers.X-Fleet-Token
+    3. 裸 token 字段（旧登记表 / 旧 agent 配置只有这一种）
+
+    原来只认 headers，手动只改裸 token 字段后 probe 继续 401；
+    原来登记表只认裸 token，headers 里的令牌又被忽略。
+    现在 agent 配置与登记表两种来源都走这一条，避免双轨。
+    """
+    if not isinstance(entry, dict):
         return ""
-    for k, v in h.items():
-        kl = str(k).lower()
-        if kl == "x-fleet-token":
-            return str(v).strip()
-        if kl == "authorization" and str(v).lower().startswith("bearer "):
-            return str(v)[7:].strip()
-    return ""
+    h = entry.get("headers") or {}
+    if isinstance(h, dict):
+        for k, v in h.items():
+            if str(k).lower() == "authorization" and str(v).lower().startswith("bearer "):
+                return str(v)[7:].strip()
+        for k, v in h.items():
+            if str(k).lower() == "x-fleet-token":
+                return str(v).strip()
+    return str(entry.get("token") or "").strip()
+
+
+def _entry_with_dual_token(url, token, description):
+    """写路径统一格式（P0-2）：两种凭据形式永远同时写。
+
+    agent 配置条目与登记表条目都同时带 headers.Authorization 与裸 token，
+    之后无论哪一方只改其中一种形式，读路径（_token_from_headers）都认。
+    """
+    entry = {"url": url, "description": description}
+    if token:
+        entry["headers"] = {"Authorization": "Bearer " + token}
+        entry["token"] = token
+    return entry
+
+
+def _write_agent_config_entry(name, url, token):
+    """把副端写进第一个已存在的 workbuddy 配置（P0-1）。
+
+    返回 (path, "") 表示写成功；(None, 原因) 表示跳过 ——
+    本机没有已存在的 workbuddy 配置时不新建文件，只写登记表并明示。
+    """
+    cands = agent_config_paths().get("workbuddy", [])
+    path = next((p for p in cands if os.path.isfile(p)), None)
+    if path is None:
+        return None, "本机没有已存在的 workbuddy 配置，跳过 agent 配置写入（只写登记表）"
+    try:
+        cfg = load_json_config(path)
+    except Exception as e:
+        return None, "%s 读取失败（%s），跳过 agent 配置写入" % (path, e)
+    k = servers_key(cfg)
+    cfg.setdefault(k, {})
+    entry = {"type": "http", "url": url,
+             "description": "%s 副端 MCP（远程操控该设备）" % name}
+    if token:
+        entry["headers"] = {"Authorization": "Bearer " + token}
+        entry["token"] = token
+    cfg[k][name] = entry
+    save_json_config(path, cfg)
+    return path, ""
+
+
+def _verify_registration(name, url, token):
+    """pair/add 后回读 discover_nodes，校验生效条目与写入一致（P0-1）。
+
+    生效条目是 list/probe/exec 实际用的那一条；若被别的 agent 配置旧条目
+    遮住（setdefault 先到先得），这里会直接报错而不是报假成功。
+    返回 (ok, 生效条目或错误信息)。
+    """
+    eff = discover_nodes().get(name)
+    if not eff:
+        return False, "回读登记失败：%s 不在生效登记里" % name
+    if eff.get("url") != url:
+        return False, ("回读校验失败：生效地址 %s ≠ 写入地址 %s"
+                       "（可能被其他 agent 配置的旧条目遮住）" % (eff.get("url"), url))
+    if (eff.get("token") or "") != (token or ""):
+        return False, ("回读校验失败：生效令牌与写入不一致"
+                       "（可能被其他 agent 配置的旧条目遮住）")
+    return True, eff
 
 
 IPV4 = re.compile(r"^\d{1,3}(\.\d{1,3}){3}(:\d+)?$")
@@ -741,7 +809,22 @@ def cmd_probe(a):
     try:
         info = http_probe(url, token=meta.get("token", ""))
     except Exception as e:
-        return die("GET / 失败：%r\n    排查：确认副端在跑、端口放行、主端网络可达。" % (e,))
+        # P1-5：probe 失败时重读一次登记再报失败 —— 捡起用户刚手工改过的
+        # 地址/令牌（每次 CLI 调用本来就会重读文件，这里是防“解析时与探活时
+        # 登记不一致”的最后一道网；直接给地址的 target 没有登记可重读）。
+        fresh = discover_nodes(a.agent).get(a.target) or {}
+        new_url = fresh.get("url", "")
+        if new_url and new_url != url:
+            try:
+                info = http_probe(new_url,
+                                  token=fresh.get("token", meta.get("token", "")))
+                print(warn("[i] ") + "登记已变（%s → %s），改用新地址继续"
+                      % (url, new_url))
+                url, meta = new_url, fresh
+            except Exception:
+                return die("GET / 失败：%r\n    排查：确认副端在跑、端口放行、主端网络可达。" % (e,))
+        else:
+            return die("GET / 失败：%r\n    排查：确认副端在跑、端口放行、主端网络可达。" % (e,))
     print(ok("[+] ") + "HTTP 可达（%.0f ms）  server=%s v%s，工具 %s 个"
           % ((time.time() - t0) * 1000, info.get("server"), info.get("version"), info.get("tools")))
     c = MCPClient(url, a.timeout, token=meta.get("token", ""))
@@ -1351,13 +1434,19 @@ def cmd_add(a):
                 return 2
             print(warn("[force] ") + "仍然写入配置。")
         else:
+            # P0-3：探活 GET / 通过不等于能调工具（有些 agent 的 GET / 不验
+            # 权、tools/call 才验）。exec 试调失败按探活失败处理：返回 2，
+            # 除非 --force，否则不写登记。
             try:
                 c = MCPClient(url, a.timeout, token=token)
                 c.handshake()
                 text, _ = c.call("exec", {"command": "hostname; uname -srm"}, timeout=a.timeout)
                 print(ok("[+] ") + "工具测试：" + text.strip().replace("\n", " / ")[:120])
             except MCPError as e:
-                print(warn("[!] ") + "工具测试失败：%s" % e)
+                print(err("[x] ") + "工具测试失败：%s" % e)
+                if not a.force:
+                    return 2
+                print(warn("[force] ") + "仍然写入配置。")
 
     # 写 agent 配置
     written = []
@@ -1384,7 +1473,9 @@ def cmd_add(a):
             "description": "%s 副端 MCP（远程操控该设备：exec/文件/Docker/systemd/系统信息）" % a.name,
         }
         if token:
+            # P0-2：两种凭据形式同时写，之后只改其一也不会丢
             entry["headers"] = {"Authorization": "Bearer " + token}
+            entry["token"] = token
         cfg[k][a.name] = entry
         save_json_config(path, cfg)
         written.append(path)
@@ -1392,9 +1483,10 @@ def cmd_add(a):
 
     # 写本地登记表（让不支持 MCP 的 agent 也能用 fleet.py 操控）
     reg = load_registry()
-    reg.setdefault("nodes", {})[a.name] = {"url": url,
-                                           "description": "mcp-fleet 副端",
-                                           "token": token}
+    node = {"url": url, "description": "mcp-fleet 副端", "token": token}
+    if token:
+        node["headers"] = {"Authorization": "Bearer " + token}
+    reg.setdefault("nodes", {})[a.name] = node
     save_registry(reg)
     print(ok("[+] ") + "已登记到 %s" % REGISTRY)
 
@@ -1613,10 +1705,42 @@ def cmd_pair(a):
     rname = a.name or info.get("name") or host_of(url)
     print(ok("[+] ") + "对方在线：%s v%s  %s" % (rname, info.get("version", "?"), url))
 
+    # P0-3：写任何登记之前，先用将要存储的 token 做一次带鉴权 exec 试调。
+    # 只验握手不够：有些 agent 的 initialize 不验权、tools/call 才验，
+    # 令牌不对也能“握手成功”然后报假成功。试调失败 → 报错、不写登记。
+    # （exec 返回 isError 只说明命令本身报错，调用已通过鉴权，不算失败。）
+    try:
+        _text, _iserr = c.call("exec", {"command": "hostname; uname -srm"}, timeout=a.timeout)
+        if _iserr:
+            print(warn("[!] ") + "exec 试调返回 isError（鉴权已通过，命令本身报错），继续配对")
+    except MCPError as e:
+        return die("带鉴权 exec 试调失败：%s\n    令牌可能不对，未写入任何登记。" % e)
+
+    # P0-1：pair 同时写 agent 配置与登记表。原来只写登记表，
+    # 而 discover_nodes 先读 agent 配置（setdefault），旧 agent 配置条目
+    # 会把刚 pair 的登记遮住，造成“显示已登记、probe 仍走旧地址”。
+    apath, askip = _write_agent_config_entry(rname, url, token)
+    if apath:
+        print(ok("[+] ") + "已写入 %s" % apath)
+    else:
+        print(warn("[i] ") + askip)
     reg = load_registry()
-    reg.setdefault("nodes", {})[rname] = {"url": url, "token": token, "description": "对等节点"}
+    node = {"url": url, "token": token, "description": "对等节点"}
+    if token:
+        node["headers"] = {"Authorization": "Bearer " + token}
+    reg.setdefault("nodes", {})[rname] = node
     save_registry(reg)
     print(ok("[+] ") + "本机 → %s：已登记（%s）" % (rname, REGISTRY))
+
+    # P0-1：写完回读校验 —— 生效条目（list/probe/exec 实际用的那一条）
+    # 的 url 与 token 必须与写入一致，否则报错、不报成功、不继续反向登记。
+    _okv, _vmsg = _verify_registration(rname, url, token)
+    if not _okv:
+        print(err("[x] ") + _vmsg)
+        print(dim("    已写入的登记本身没错，是别的 agent 配置旧条目遮住了它；"
+                  "先清理遮挡条目再重跑 pair。"))
+        return 2
+    print(ok("[+] ") + "回读校验通过：生效登记 %s = %s" % (rname, url))
 
     me = local_node(a.self_url)
     if a.one_way:
@@ -1779,11 +1903,13 @@ def cmd_accept(a):
         return die("确权失败：%s" % e)
     if not result.get("ok"):
         return die("确权失败：%s" % result.get("error", "unknown"))
-    # 对方已登记本机，本机也登记对方
+    # 对方已登记本机，本机也登记对方（P0-2：两种凭据形式同时写）
     if me:
         reg = load_registry()
-        reg.setdefault("nodes", {})[device_code] = {
-            "url": url, "token": token, "description": "邀请配对"}
+        node = {"url": url, "token": token, "description": "邀请配对"}
+        if token:
+            node["headers"] = {"Authorization": "Bearer " + token}
+        reg.setdefault("nodes", {})[device_code] = node
         save_registry(reg)
     print(ok("[+] ") + "确权通过！已与 %s 建立连接" % device_code)
     print("  对方设备码 : %s" % device_code)

@@ -1005,9 +1005,36 @@ def _lan_ip():
         s.close()
 
 
+_TS_IP_CACHE = {"ip": None, "at": 0.0}
+
+
+def _tailscale_ip_cached():
+    """_tailscale_ip() 的 60 秒缓存：self_url() 在 mesh/info/invite 等
+    请求路径里都会调，每次都 fork `tailscale status --json` 太贵；
+    tailnet IP 在 60 秒内不会变两次，过期自动重取。"""
+    now = time.time()
+    if _TS_IP_CACHE["ip"] and now - _TS_IP_CACHE["at"] < 60:
+        return _TS_IP_CACHE["ip"]
+    ip = _tailscale_ip()
+    _TS_IP_CACHE["ip"] = ip
+    _TS_IP_CACHE["at"] = now
+    return ip
+
+
 def self_url():
-    """别的节点回连本机的地址：配置 self_url > 当前隧道地址 > 内网 IP:端口。"""
+    """别的节点回连本机的地址：配置 self_url > tailnet IP > 当前隧道地址 > 内网 IP:端口。
+
+    P1-6：原来没有 tailnet 一项，agent 自报局域网地址时沙盒（只能走 tailnet）
+    够不着；现在 tailnet IP 优先于隧道与局域网地址（配置 self_url 仍最高，
+    显式配置永远赢）。"""
     u = (CFG.get("self_url") or "").strip()
+    if not u:
+        try:
+            ts_ip = _tailscale_ip_cached()
+        except Exception:
+            ts_ip = None
+        if ts_ip:
+            u = "http://%s:%s" % (ts_ip, LISTEN_PORT or 3100)
     if not u:
         try:
             u = open(os.path.join(HERE, "current_url.txt"), encoding="utf-8").read().strip()
@@ -1017,6 +1044,23 @@ def self_url():
         u = "http://%s:%s" % (_lan_ip(), LISTEN_PORT or 3100)
     u = u.rstrip("/")
     return u if u.endswith("/mcp") else u + "/mcp"
+
+
+def _listener_self_check(host, port, timeout=2):
+    """实测本机监听端口是否真能连上（P1-9：只读配置的横幅会撒谎）。
+
+    返回 (ok, 说明)。host 为 0.0.0.0 时改测 127.0.0.1（同机等价）。
+    注意：横幅打印时 socket 已 bind 但 serve_forever 未必已跑，
+    TCP 握手走内核 backlog 即可完成，测的是“监听已建立”而非“已 accept”。
+    """
+    import socket as _sock
+    check_host = "127.0.0.1" if host in ("127.0.0.1", "0.0.0.0") else host
+    try:
+        _s = _sock.create_connection((check_host, int(port)), timeout=timeout)
+        _s.close()
+        return True, "%s:%s 能连上" % (check_host, port)
+    except Exception as e:
+        return False, "%s:%s 连不上（%s）" % (check_host, port, type(e).__name__)
 
 
 def _norm_mcp_url(u):
@@ -1109,7 +1153,15 @@ def _peer_entry(name):
 
 def t_peers(a):
     nodes = load_peers()["nodes"]
-    lines = ["本机: %s  回连地址: %s" % (SERVER_NAME, self_url()), ""]
+    # P1-9：peers 头只读配置会撒谎（进程死了还显示地址），这里实测 pid 与端口。
+    _pport = globals().get("LISTEN_PORT") or 3100
+    _live_ok, _live_msg = _listener_self_check("127.0.0.1", _pport)
+    lines = ["本机: %s  回连地址: %s" % (SERVER_NAME, self_url()),
+             "服务状态: pid=%d 端口=%s %s" % (
+                 os.getpid(), _pport,
+                 "运行中（" + _live_msg + "）" if _live_ok
+                 else "[!] 服务可能已死（" + _live_msg + "）"),
+             ""]
     if not nodes:
         lines.append("（还没有对等节点。用 peer_add 添加，或在本机跑：fleet pair <对方地址> --token <令牌>）")
     for n in sorted(nodes):
@@ -2816,17 +2868,25 @@ def main():
         _mcp_url = "https://%s:%d/mcp" % (args.host, args.port)
     else:
         _mcp_url = "http://%s:%d/mcp" % (args.host, args.port)
+    # P1-6：横幅里的对外地址改用 self_url()（tailnet 优先），不再直接贴
+    # 绑定地址（0.0.0.0/127.0.0.1 对端根本连不上）。TLS 时 self_url() 不带
+    # https scheme，仍用原 https 绑定地址，避免协议写错。
+    _banner_url = _mcp_url if (args.tls_cert and args.tls_key) else self_url()
     # v4.3: 醒目的设备码 + API + 配对命令
     _bar = "═" * 60
     print("╔%s╗" % _bar)
     print("║  MCP Fleet 节点已启动 v%-47s║" % (SERVER_VERSION,))
     print("║%-60s║" % "")
     print("║  设备码 : %-50s║" % SERVER_NAME)
-    print("║  API    : %-50s║" % _mcp_url)
+    print("║  API    : %-50s║" % _banner_url)
     print("║%-60s║" % "")
     print("║  在其他设备上运行以下命令配对：                       ║")
-    print("║  fleet.py pair %s@%s" % (SERVER_NAME, _mcp_url) + " " * max(1, 60 - 18 - len(SERVER_NAME) - len(_mcp_url)) + "║")
+    print("║  fleet.py pair %s@%s" % (SERVER_NAME, _banner_url) + " " * max(1, 60 - 18 - len(SERVER_NAME) - len(_banner_url)) + "║")
     print("╚%s╝" % _bar)
+    # P1-9：横幅只读配置会撒谎（进程死了还显示地址），这里实测 pid 与端口。
+    _live_ok, _live_msg = _listener_self_check(args.host, args.port)
+    print("  进程            : pid=%d  监听=%s:%d" % (os.getpid(), args.host, args.port))
+    print("  监听自检        : %s" % (("通过，" if _live_ok else "[!] 失败，") + _live_msg))
     print("  工具数          : %d (%s)" % (len(TOOLS), ", ".join(t["name"] for t in TOOLS[:4]) + " ..."))
     print("  工作目录        : %s" % CFG.get("work_dir"))
     print("  运行身份        : %s" % ("root" if _is_root() else "非 root"))
