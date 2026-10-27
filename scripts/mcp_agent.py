@@ -104,7 +104,7 @@ for _stream in (sys.stdout, sys.stderr):
 DEFAULT_CONFIG = {
     "name": "node",             # 副端标识（显示在状态页与 serverInfo）
     "tool_prefix": "",          # 工具名前缀，如 "nas_"；留空则用裸名（exec/read/...）
-    "version": "5.2.3",
+    "version": "5.2.4",
     "sudo_password": "",        # 留空且非 root 时会尝试免密 sudo
     "work_dir": "/",            # 默认工作目录
     "command_timeout": 120,     # 秒
@@ -312,6 +312,49 @@ METRICS = None
 EXEC_POLICY = None
 TASK_STORE = None
 
+
+def _looks_like_chain(path):
+    """这个文件是哈希链（JSONL）还是人类可读的纯文本日志？"""
+    try:
+        with io.open(path, "rb") as f:
+            for raw in f:
+                line = raw.strip()
+                if not line:
+                    continue
+                try:
+                    rec = json.loads(line.decode("utf-8"))
+                except (ValueError, UnicodeDecodeError):
+                    return False
+                return isinstance(rec, dict) and "hash" in rec and "idx" in rec
+    except (OSError, IOError):
+        return False
+    return False
+
+
+def _audit_chain_path():
+    """哈希链审计文件的路径。
+
+    **历史坑（默认安装上 `fleet audit` 永远失败）**：链文件原来写死成
+    `DATA_DIR/audit.log`，而人类可读的纯文本审计日志也叫 `audit.log`；
+    没配 `data_dir` 时 `DATA_DIR == HERE`，两者**是同一个文件**。于是：
+
+    - 纯文本行让链的 `_read_tail_state()` 解析失败 → 每次 `append()` 都抛
+      「审计链末尾记录损坏」，链**一条都没写进去**（静默，因为外面套了 try）；
+    - `verify()` 读到第一行不是 JSON → 永远返回 `(False, 0)`，
+      `fleet audit` 报 `ok:false`、`fleet doctor` 报审计「损坏」——
+      全是假警报，而且用户无从修。
+
+    现在链单独一个文件名；只有老文件确实是合法链时才继续用（不丢历史）。
+    """
+    old = os.path.join(DATA_DIR, "audit.log")
+    new = os.path.join(DATA_DIR, "audit.chain.jsonl")
+    if os.path.exists(new):
+        return new
+    if os.path.exists(old) and _looks_like_chain(old):
+        return old                      # 老节点：链就在 audit.log 里，别丢
+    return new
+
+
 if _HAS_CORE:
     try:
         IDENTITY = _core.Identity.load_or_create(os.path.join(DATA_DIR, "identity.json"))
@@ -325,7 +368,7 @@ if _HAS_CORE:
         print("[warn] 执行策略初始化失败，使用默认策略: %s" % _e, file=sys.stderr)
         EXEC_POLICY = _core.ExecPolicy.default()
     try:
-        AUDIT_CHAIN = _core.AuditChain(os.path.join(DATA_DIR, "audit.log"))
+        AUDIT_CHAIN = _core.AuditChain(_audit_chain_path())
     except Exception as _e:
         print("[warn] 审计链初始化失败，降级为旧审计: %s" % _e, file=sys.stderr)
 

@@ -58,7 +58,8 @@ ls <install_dir>.bak-*    # 手工查看备份
 | 安装目录 | `/opt/mcp-fleet/<name>` 或 `~/.mcp-fleet/<name>` | `~/.mcp-fleet/<name>` | `%LOCALAPPDATA%\\mcp-fleet\\<name>` |
 | 数据 | `<install>/data` | 同左 | 同左 |
 | 服务日志 | `<data>/logs/agent.log` | 同左 | 同左 |
-| 审计 | `<data>/audit.log` | 同左 | 同左 |
+| 审计（哈希链） | `<data>/audit.chain.jsonl` | 同左 | 同左 |
+| 审计（人读文本） | `<data>/audit.log` | 同左 | 同左 |
 | 端口 | 3100/tcp + 3199/udp | 同左 | 同左 |
 
 ## 7. 30 秒诊断顺序

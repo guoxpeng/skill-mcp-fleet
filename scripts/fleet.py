@@ -76,7 +76,7 @@ import uuid
 
 # ---------------------------------------------------------------- 基础
 
-VERSION = "5.2.3"
+VERSION = "5.2.4"
 PROTOCOL = "2024-11-05"
 HERE = os.path.dirname(os.path.abspath(__file__))
 
@@ -97,6 +97,24 @@ def _env_int(name, default, lo=1, hi=100000):
 
 
 FWD_MAX_CONNS = _env_int("FLEET_FWD_MAX_CONNS", 128, 1, 100000)
+
+#: 建连与握手的超时上限（秒）。**和「命令执行超时」是两件事**。
+#: 混在一起会很难受：`--timeout` 的语义是「这条命令最多跑多久」，
+#: 但原来的 `MCPClient(url, max(a.timeout, 120))` 拿它去当建连超时，
+#: 于是设备离线时握手要等 120 秒 × 2 次重试 = 4 分钟才报错——
+#: 用户看到的就是「fleet exec 卡死了」。离线判定应该几秒内给出。
+CONNECT_TIMEOUT = 10
+
+
+def _connect_timeout(a):
+    """建连/握手用的超时：短、有上下界，不受 `--timeout` 抬高。"""
+    try:
+        t = float(getattr(a, "timeout", 0) or 0)
+    except Exception:
+        t = 0.0
+    if t <= 0:
+        return float(CONNECT_TIMEOUT)
+    return max(3.0, min(t, float(CONNECT_TIMEOUT)))
 
 # v5.2: CLI 内置提示词。菜单/`fleet prompt` 直接输出，可原样粘给 AI 客户端。
 PROMPT_PACK = {
@@ -148,6 +166,54 @@ try:                                  # Windows 控制台默认 GBK，中文会�
     sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 except Exception:
     pass
+
+
+def _registry_candidates():
+    """所有可能的登记表位置，当前在用的排第一。"""
+    out = [REGISTRY]
+    for p in (os.path.join(HERE, "peers.json"),
+              os.path.join(os.path.expanduser("~"), ".mcp-fleet", "nodes.json")):
+        if p not in out:
+            out.append(p)
+    return out
+
+
+def registry_alternatives():
+    """**别的**登记表里有没有节点，返回 [(路径, 节点数), ...]。
+
+    为什么需要它：登记表的位置是「跟着 fleet.py 所在目录走」的——同目录有
+    `mcp_agent_config.json` 就用该目录的 `peers.json`（与本节点 agent 共用），
+    否则用 `~/.mcp-fleet/nodes.json`。这带来一个很难自查的现象：
+    **同一台机器上，从不同目录跑 fleet.py 会看到不同的节点列表**。
+    用户只会觉得「我的节点怎么没了」，而且没有任何提示。
+    """
+    hits = []
+    for p in _registry_candidates()[1:]:
+        if not os.path.isfile(p):
+            continue
+        try:
+            with open(p, encoding="utf-8") as f:
+                d = json.load(f)
+        except Exception:
+            continue
+        nodes = d.get("nodes") if isinstance(d, dict) else None
+        if isinstance(nodes, dict) and nodes:
+            hits.append((p, len(nodes)))
+    return hits
+
+
+def _warn_other_registries(prefix="  "):
+    """当前登记表是空的（或没有想要的节点）时，提示另一张表里有什么。"""
+    alt = registry_alternatives()
+    if not alt:
+        return
+    print(warn("%s但别的登记表里有节点：" % prefix))
+    for p, n in alt:
+        print("%s  %s（%d 个）" % (prefix, p, n))
+    print("%s切换过去：  FLEET_REGISTRY=%s fleet list" % (prefix, alt[0][0]))
+    print(dim("%s为什么会分成两份：fleet.py 同目录若有 mcp_agent_config.json，"
+              "就会改用该目录的 peers.json（与本节点 agent 共用一张表）。" % prefix))
+
 
 C_OK, C_ERR, C_WARN, C_DIM, C_OFF = "\033[32m", "\033[31m", "\033[33m", "\033[2m", "\033[0m"
 if os.environ.get("NO_COLOR") or not sys.stdout.isatty():
@@ -321,7 +387,7 @@ class _PooledHTTP(object):
     只处理 http；https 仍走 urllib，避免把证书与代理逻辑复制一份出来。
     """
 
-    def __init__(self, url, timeout=30, proxy=None):
+    def __init__(self, url, timeout=30, proxy=None, connect_timeout=None):
         parts = urllib.parse.urlsplit(url)
         self.url = url
         self.host = parts.hostname
@@ -330,6 +396,9 @@ class _PooledHTTP(object):
         if parts.query:
             self.path += "?" + parts.query
         self.timeout = timeout
+        # 建连单独一个短超时：设备离线时 TCP 连不上，没必要等满「请求超时」。
+        # 连上之后每个请求各自 settimeout（见 post），两者互不影响。
+        self.connect_timeout = float(connect_timeout or timeout)
         self.proxy = proxy
         self._conn = None
 
@@ -344,18 +413,25 @@ class _PooledHTTP(object):
         self.close()
         if self.proxy:
             phost, pport, _auth = self.proxy
-            self._conn = http.client.HTTPConnection(phost, pport, timeout=self.timeout)
+            self._conn = http.client.HTTPConnection(phost, pport, timeout=self.connect_timeout)
         else:
-            self._conn = http.client.HTTPConnection(self.host, self.port, timeout=self.timeout)
+            self._conn = http.client.HTTPConnection(self.host, self.port,
+                                                    timeout=self.connect_timeout)
         # 立刻建连并关掉 Nagle：http.client 是「写头 → 写体 → 读响应」的
         # 小包序列，攒包会让每请求多等一拍延迟 ACK（实测 174KB 响应
         # 从 50ms 变 250ms）。延迟建连的话第一次 request 已经发出去了，
         # 来不及设，所以这里主动 connect()。
+        #
+        # **connect() 的异常必须抛出去**。原来整段包在 `except: pass` 里，
+        # 连不上也当成功：于是这里白等一个 connect_timeout，紧接着
+        # `conn.request()` 发现没有 socket 又自己重连一次，再等一个
+        # connect_timeout——单次尝试的耗时直接翻倍，叠加 `retry=True`
+        # 就是 4 倍。设备离线时 `fleet exec` 要 40 秒才报错，原因就在这里。
+        self._conn.connect()
         try:
-            self._conn.connect()
             self._conn.sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
         except Exception:
-            pass
+            pass                    # setsockopt 失败不影响功能，可以忽略
         return self._conn
 
     def close(self):
@@ -423,10 +499,13 @@ class _PooledHTTP(object):
 class MCPClient:
     """Streamable HTTP 客户端：initialize → notifications/initialized → tools/*"""
 
-    def __init__(self, url, timeout=30, token="", insecure=False):
+    def __init__(self, url, timeout=30, token="", insecure=False, connect_timeout=None):
         self.url = url
         self.insecure = bool(insecure)
         self.timeout = timeout
+        # 建连/握手用的短超时。和 timeout（请求/命令执行超时）分开，
+        # 否则「设备离线」要等满命令超时才知道，`fleet exec` 看起来像卡死。
+        self.connect_timeout = float(connect_timeout or min(timeout, CONNECT_TIMEOUT))
         self.sid = None
         self.info = {}
         self.token = (token or "").strip()
@@ -453,9 +532,14 @@ class MCPClient:
                 return self._post_once(payload, timeout=timeout)
             except MCPError as e:
                 msg = str(e)
-                # 鉴权/协议类错误不重试，只重试「连不上 / 超时 / 5xx」
+                # 鉴权/协议类错误不重试，只重试「连不上 / 5xx」
                 if ("HTTP 401" in msg or "HTTP 403" in msg or "HTTP 4" in msg
                         or "不是合法 JSON" in msg or "超过上限" in msg):
+                    raise
+                # **超时不重试**：握手是几十字节的请求，等满一个建连超时还拿不到
+                # 响应，说明对面根本不在（黑洞地址），再等一轮纯属浪费用户时间。
+                # 连接被拒/重置这类「立刻失败」的错误仍然重试，那才是瞬时抖动。
+                if "超时" in msg:
                     raise
                 last = e
                 if i + 1 < attempts:
@@ -493,7 +577,8 @@ class MCPClient:
             # 直连或经代理：都复用 TCP，省掉每次调用的三次握手
             if self._pool is None:
                 self._pool = _PooledHTTP(self.url, timeout=self.timeout,
-                                         proxy=proxy if mode == "proxy" else None)
+                                         proxy=proxy if mode == "proxy" else None,
+                                         connect_timeout=self.connect_timeout)
             try:
                 status, hdrs, raw = self._pool.post(data, headers, timeout=timeout)
             except socket.timeout:
@@ -547,9 +632,14 @@ class MCPClient:
 
     # -- 协议层 --------------------------------------------------
     def handshake(self):
+        # 握手是个几十字节的小请求，**必须用建连级的短超时**。
+        # 用默认的请求超时（exec 场景下是 120s）会很难受：节点离线时
+        # 握手要等 120 秒 × 2 次重试 = 4 分钟才报错，用户看到的就是「卡死」。
+        # 这里报出来的「超时（Ns）」也就和真实等待时间对得上了。
         r = self._post({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {
             "protocolVersion": PROTOCOL, "capabilities": {},
-            "clientInfo": {"name": "mcp-fleet", "version": VERSION}}}, retry=True)
+            "clientInfo": {"name": "mcp-fleet", "version": VERSION}}},
+            timeout=self.connect_timeout, retry=True)
         self.info = r.get("result", {}).get("serverInfo", {}) or {}
         self._ready = True
         try:
@@ -1027,7 +1117,11 @@ def sync_from_directory(name, cur_url=None, timeout=8, quiet=False, verbose=True
         return None
     if cur_url:
         try:
-            if http_probe(cur_url, timeout=min(timeout, 5), token=token):
+            # retries=0：这只是「旧地址还通不通」的预判，不通就去问目录，
+            # 没必要按 http_probe 的默认重试 3 次（5s+1s+5s+2s+5s+4s ≈ 22 秒）。
+            # 节点离线时这 22 秒会叠加到后面的握手超时上，用户看到的就是
+            # 「fleet exec 卡了快一分钟」。
+            if http_probe(cur_url, timeout=min(timeout, 3), token=token, retries=0):
                 return None         # 还通着就别折腾
         except Exception:
             pass                    # 不通 → 继续去问目录
@@ -1143,6 +1237,8 @@ def cmd_list(a):
         return 0
     if not nodes:
         print(warn("没有发现任何副端。"))
+        print(dim("  当前登记表：%s" % REGISTRY))
+        _warn_other_registries()
         print("  装一台：  python fleet.py install-cmd --name pi")
         print("  再注册：  python fleet.py add --name pi --ip 192.168.1.9 --port 3100")
         return 0
@@ -1900,27 +1996,39 @@ def cmd_ping(a):
     退出码：0 可达 / 1 不可达（脚本可直接判）。
     """
     sync = False if getattr(a, "no_sync", False) else None
-    try:
-        url, meta = resolve_target(a.target, a.agent, a.port, sync=sync)
-    except Exception as e:
-        print(err("不可达") + "  %s：%s" % (a.target, e))
-        return 1
+    name = (getattr(a, "target", "") or "").strip()
+    if not name:
+        # 不给 target 就探本机：`fleet ping` 是「我的节点活着吗」的第一反应，
+        # 要求先知道副端名字不合理（status/health/audit 都是这么默认的）。
+        got = _local_endpoint()
+        if not got:
+            print(err("不可达") + "  本机没有安装节点，也没指定副端"
+                  "（fleet list 看有哪些）")
+            return 1
+        url, meta = got
+        name = meta.get("name") or "本机"
+    else:
+        try:
+            url, meta = resolve_target(a.target, a.agent, a.port, sync=sync)
+        except Exception as e:
+            print(err("不可达") + "  %s：%s" % (a.target, e))
+            return 1
     t0 = time.time()
     try:
         info = http_probe(url, timeout=a.timeout, token=meta.get("token", ""), retries=0)
     except Exception as e:
         msg = str(e)
         if "鉴权" in msg or "401" in msg or "403" in msg:
-            print(warn("仅可达") + "  %s  HTTP 层有响应但鉴权失败（%s）" % (a.target, msg))
-            print(dim("     令牌不对：fleet add --name %s --url %s --token <令牌>" % (a.target, url)))
+            print(warn("仅可达") + "  %s  HTTP 层有响应但鉴权失败（%s）" % (name, msg))
+            print(dim("     令牌不对：fleet add --name %s --url %s --token <令牌>" % (name, url)))
         else:
-            print(err("不可达") + "  %s：%s" % (a.target, msg))
+            print(err("不可达") + "  %s：%s" % (name, _human_net_err(e)))
         return 1
     ms = (time.time() - t0) * 1000
     print(ok("可达") + "  %s  %s  %.0f ms  %s v%s"
-          % (a.target, url, ms, info.get("server") or "?", info.get("version") or "?"))
+          % (name, url, ms, info.get("server") or "?", info.get("version") or "?"))
     if a.json:
-        print(json.dumps({"target": a.target, "url": url, "reachable": True,
+        print(json.dumps({"target": name, "url": url, "reachable": True,
                           "rtt_ms": round(ms, 1), "server": info.get("server"),
                           "version": info.get("version")},
                          ensure_ascii=False, indent=2))
@@ -1936,8 +2044,18 @@ def cmd_doctor(a):
         try:
             text, is_err = client.call("fleet_doctor", {}, timeout=a.timeout)
         except MCPError as e:
+            msg = str(e)
+            if "连不上" in msg or "超时" in msg:
+                # 这是用户出问题后敲的第一个命令，最不该只回一句裸错误。
+                # 「找不到配置」和「配置在但进程没起」是两件事，分开说。
+                return die("本机节点配好了，但**进程没在运行**。\n"
+                           "     启动：  fleet start\n"
+                           "     详情：  %s" % msg)
             return die("本机自检失败：%s" % e)
         print(text)
+        # 本机自检里最容易漏的一条：agent 进程跑的是不是磁盘上这份代码
+        for line in _version_drift_lines(_running_agent_version(me), me.get("dir"), VERSION):
+            print(line)
         return 1 if is_err else 0
     url, meta = resolve_target(a.target, a.agent, a.port)
     base = base_of(url)
@@ -1948,38 +2066,51 @@ def cmd_doctor(a):
     print("  来源     : %s %s" % (meta.get("agent"), dim(meta.get("config") or "")))
     fails = []
 
-    # 1 TCP
+    # 1 TCP（短超时：这一步只是为了判断「对面在不在」，没必要等满 30 秒）
     t0 = time.time()
+    tcp_ok = False
     try:
-        s = socket.create_connection((host, port), timeout=a.timeout)
+        s = socket.create_connection((host, port), timeout=min(float(a.timeout or 8), 8.0))
         s.close()
+        tcp_ok = True
         print(ok("  [1/7] TCP ") + "%s:%d 通（%.0f ms）" % (host, port, (time.time() - t0) * 1000))
     except Exception as e:
-        print(err("  [1/7] TCP ") + "%s:%d 不通：%r" % (host, port, e))
+        print(err("  [1/7] TCP ") + "%s:%d 不通：%s" % (host, port, _human_net_err(e)))
         fails.append("TCP 不通：云主机/容器要在安全组或平台侧放行该端口；内网确认 IP 与防火墙。")
 
-    # 2 HTTP
-    try:
-        info = http_probe(url, token=meta.get("token", ""))
-        print(ok("  [2/7] HTTP") + " 200，server=%s v%s，tools=%s，root=%s"
-              % (info.get("server"), info.get("version"), info.get("tools"), info.get("root")))
-    except Exception as e:
-        print(err("  [2/7] HTTP") + " 失败：%r" % (e,))
-        fails.append("HTTP 探活失败：副端进程可能没起。"
-                     "容器里跑 `bash 副端安装目录/mcp-ctl.sh status`；"
-                     "systemd 机器跑 `systemctl status <name>-mcp`。")
+    # TCP 都不通，后面的 HTTP / MCP / E2E 必然失败。继续跑只会让用户多等
+    # 两三个超时（实测离线节点整套 79 秒），还刷一堆红字把真因埋掉。
+    if not tcp_ok:
+        print(dim("  [2-7/7] TCP 不通，跳过后续检查（先解决上面这条）"))
+        info = None
+    else:
+        # 2 HTTP
+        try:
+            info = http_probe(url, timeout=min(float(a.timeout or 8), 8.0),
+                              token=meta.get("token", ""), retries=0)
+            print(ok("  [2/7] HTTP") + " 200，server=%s v%s，tools=%s，root=%s"
+                  % (info.get("server"), info.get("version"), info.get("tools"), info.get("root")))
+        except Exception as e:
+            info = None
+            print(err("  [2/7] HTTP") + " 失败：%s" % _human_net_err(e))
+            fails.append("HTTP 探活失败：副端进程可能没起。"
+                         "容器里跑 `bash 副端安装目录/mcp-ctl.sh status`；"
+                         "systemd 机器跑 `systemctl status <name>-mcp`。")
 
     # 3 MCP
-    c = MCPClient(url, a.timeout, token=meta.get("token", ""))
-    try:
-        c.handshake()
-        tools = c.list_tools()
-        print(ok("  [3/7] MCP ") + "握手 OK，%d 个工具" % len(tools))
-    except MCPError as e:
-        print(err("  [3/7] MCP ") + "失败：%s" % e)
-        fails.append("MCP 协议层失败：用 `python scripts/probe_fleet.py %s` 交叉验证；"
-                     "若它通而 agent 不通，是 agent 侧配置/版本问题。" % url)
-        tools = []
+    c = MCPClient(url, a.timeout, token=meta.get("token", ""),
+                  connect_timeout=_connect_timeout(a))
+    tools = []
+    if tcp_ok:
+        try:
+            c.handshake()
+            tools = c.list_tools()
+            print(ok("  [3/7] MCP ") + "握手 OK，%d 个工具" % len(tools))
+        except MCPError as e:
+            print(err("  [3/7] MCP ") + "失败：%s" % e)
+            fails.append("MCP 协议层失败：用 `python scripts/probe_fleet.py %s` 交叉验证；"
+                         "若它通而 agent 不通，是 agent 侧配置/版本问题。" % url)
+            tools = []
 
     # 4 真实调用
     if tools:
@@ -2075,8 +2206,56 @@ def cmd_doctor(a):
     return 0
 
 
+def _is_known_target(t, agent=None):
+    """这个字符串是「副端」还是「命令」？
+
+    只看它能不能被解析成节点：已注册名字、配置里存过的 url、或像地址的串。
+    """
+    try:
+        nodes = discover_nodes(agent)
+    except Exception:
+        nodes = {}
+    if t in nodes:
+        return True
+    for _n, m in nodes.items():
+        if m.get("url") == t:
+            return True
+    return bool(t.startswith(("http://", "https://")) or IPV4.match(t)
+                or HOSTNAME.match(t))
+
+
+def _pick_exec_target(a, toks):
+    """决定「这条命令在哪跑」：返回 (target, toks)；target 为空表示本机。
+
+    两种兜底：
+    - 显式 `--local`（脚本里用它最稳）；
+    - **只给了一个位置参数，而它不是任何副端** —— 这是高频手滑：
+      `fleet exec "df -h"` 里那个参数会被 argparse 当成 target，
+      于是只回一句「命令为空」，用户完全看不出问题在哪。
+    """
+    target = (a.target or "").strip()
+    if getattr(a, "local", False) and target:
+        toks.insert(0, target)          # `--local "ls -l"`：那个位置被当成 target 了
+        target = ""
+    if target and not toks and not _is_known_target(target, a.agent):
+        print(dim("    （%r 不是已注册副端，按本机命令执行；指定副端："
+                  "fleet exec <名字> \"命令\"）" % target), file=sys.stderr)
+        toks.append(target)
+        target = ""
+    return target, toks
+
+
+def _local_endpoint():
+    """本机节点的 (url, meta)；没装节点返回 None。"""
+    me = local_node()
+    if not me:
+        return None
+    return (_local_reach_url(me["url"]),
+            {"agent": "local", "config": me.get("dir", ""),
+             "token": me.get("token", ""), "name": me.get("name", "本机")})
+
+
 def cmd_exec(a):
-    url, meta = resolve_target(a.target, a.agent, a.port)
     # argparse 的 REMAINDER 会把写在 target 之后的 --sudo 也吞进 command，
     # 这里把开头的已知开关捞出来，让 `exec nas --sudo "cmd"` 与
     # `exec --sudo nas "cmd"` 两种写法都成立。
@@ -2100,9 +2279,13 @@ def cmd_exec(a):
             toks.pop(0)
         else:
             break
+    target, toks = _pick_exec_target(a, toks)
     cmd = " ".join(toks)
     if not cmd.strip():
-        return die("命令为空")
+        if target:
+            return die("命令为空。用法：fleet exec %s \"要执行的命令\"" % target)
+        return die("命令为空。用法：fleet exec <副端> \"命令\"\n"
+                   "     只跑本机：fleet exec --local \"命令\"（不装副端也能用）")
     args = {"command": cmd}
     if sudo:
         args["sudo"] = True
@@ -2110,14 +2293,29 @@ def cmd_exec(a):
         args["workDir"] = workdir
     if timeout_ms:
         args["timeoutMs"] = timeout_ms
-    c = MCPClient(url, max(a.timeout, 120), token=meta.get("token", ""))
+    if target:
+        url, meta = resolve_target(target, a.agent, a.port)
+    else:
+        got = _local_endpoint()
+        if not got:
+            return die("本机没有安装节点，也没指定副端。\n"
+                       "     安装：  sh scripts/install.sh\n"
+                       "     用别的：fleet exec <名字> \"命令\"（fleet list 看有哪些）")
+        url, meta = got
+    c = MCPClient(url, max(a.timeout, 120), token=meta.get("token", ""),
+                  connect_timeout=_connect_timeout(a))
     c.handshake()
     try:
         text, iserr = c.call("exec", args, timeout=max(a.timeout, 120))
     except MCPError as e:
         return die("调用失败：%s" % e)
     sys.stdout.write(text if text.endswith("\n") else text + "\n")
-    return 1 if iserr else 0
+    # 退出码原样回传（和 ssh 一致）：脚本里 `fleet exec nas "test -f /x"` 要能
+    # 用真实码判断，笼统返回 1 会把 42、127 这些信息全丢掉。
+    code, _o, _e = parse_exec(text)
+    if iserr:
+        return min(code, 255) if isinstance(code, int) and code > 0 else 1
+    return 0
 
 
 def cmd_call(a):
@@ -2142,7 +2340,8 @@ def cmd_call(a):
                     arguments[k] = json.loads(v)
                 except ValueError:
                     arguments[k] = v
-    c = MCPClient(url, max(a.timeout, 120), token=meta.get("token", ""))
+    c = MCPClient(url, max(a.timeout, 120), token=meta.get("token", ""),
+                  connect_timeout=_connect_timeout(a))
     c.handshake()
     try:
         text, iserr = c.call(a.tool, arguments, timeout=max(a.timeout, 120))
@@ -2152,18 +2351,29 @@ def cmd_call(a):
     return 1 if iserr else 0
 
 
-def _mcp_client(a):
-    url, meta = resolve_target(a.target, a.agent, a.port)
-    c = MCPClient(url, max(a.timeout, 120), token=meta.get("token", ""))
+def _mcp_client(a, toks=None):
+    target = (getattr(a, "target", "") or "").strip()
+    if toks is not None:
+        target, toks = _pick_exec_target(a, toks)
+    if target:
+        url, meta = resolve_target(target, a.agent, a.port)
+    else:
+        got = _local_endpoint()
+        if not got:
+            raise KeyError("本机没有安装节点，也没指定副端")
+        url, meta = got
+    c = MCPClient(url, max(a.timeout, 120), token=meta.get("token", ""),
+                  connect_timeout=_connect_timeout(a))
     c.handshake()
     return c
 
 
 def cmd_exec_async(a):
-    c = _mcp_client(a)
-    cmd = " ".join(a.command).strip()
+    toks = list(a.command)
+    c = _mcp_client(a, toks)
+    cmd = " ".join(toks).strip()
     if not cmd:
-        return die("命令为空")
+        return die("命令为空。用法：fleet exec-async <副端> \"命令\"")
     args = {"command": cmd}
     if a.sudo:
         args["sudo"] = True
@@ -2262,6 +2472,30 @@ def _node_uptime(url, token="", timeout=3):
         return None
 
 
+def _human_net_err(e):
+    """把 urlopen/socket 的原始异常翻译成一句**能指导下一步**的话。
+
+    `<urlopen error timed out>` 这种字符串对用户毫无帮助：看不出是设备关机、
+    防火墙挡了端口、地址写错、还是证书问题——而这四种的处理方式完全不同。
+    """
+    s = str(e)
+    low = s.lower()
+    if "timed out" in low or "timeout" in low:
+        return "超时（设备关机/休眠，或防火墙挡了端口）"
+    if "connection refused" in low or "errno 61" in low or "errno 111" in low:
+        return "连接被拒（端口没人监听：agent 没启动，或端口写错了）"
+    if "no route to host" in low or "errno 65" in low or "errno 113" in low:
+        return "不可路由（不在同一网段，或设备没接入这个网络）"
+    if ("name or service not known" in low or "nodename nor servname" in low
+            or "getaddrinfo" in low or "temporary failure in name resolution" in low):
+        return "域名解析失败（地址拼错，或 DNS 不可用）"
+    if "certificate" in low or "ssl" in low:
+        return "TLS 证书校验失败（自签证书请加 --insecure）"
+    if "connection reset" in low:
+        return "连接被重置（中间设备/代理中断，或对端刚重启）"
+    return s[:80]
+
+
 def _fmt_age(sec):
     try:
         sec = int(sec)
@@ -2279,18 +2513,35 @@ def _fmt_age(sec):
 def cmd_health(a):
     nodes = discover_nodes(a.agent)
     if not nodes:
+        # 单机用户敲 `fleet health` 不该只看到「没有发现任何副端」——那读起来
+        # 像是出错了。先报本机节点，再说没有副端。
+        me = local_node()
+        if me:
+            up = _local_health(me)
+            print("本机节点：%s  %s%s" % (
+                me.get("name"),
+                ok("运行中") if up else warn("未运行"),
+                "  " + _local_reach_url(me["url"]) if up else ""))
+            print(dim("  没起来就 fleet start；要管别的设备：fleet add --name x --url http://IP:3100/mcp --token T"))
         print(warn("没有发现任何副端。"))
-        return 1
+        print(dim("  当前登记表：%s" % REGISTRY))
+        _warn_other_registries()
+        return 0
     rows, bad = [], 0
     seen = _load_seen()
     now = time.time()
-    for name in sorted(nodes):
+
+    def probe_one(name):
         url = nodes[name]["url"]
         ntok = nodes[name].get("token", "")
         row = {"name": name, "url": url}
         t0 = time.time()
         try:
-            info = http_probe(url, timeout=a.timeout, token=ntok)
+            # 体检是「一眼看清谁在线」，不是诊断。离线节点必须**快速判死**：
+            # 用 `--timeout` 的默认 30 秒再乘 3 次重试，一台离线节点就要
+            # 一分半。这里封顶 8 秒且不重试。
+            info = http_probe(url, timeout=min(float(a.timeout or 8), 8.0),
+                              token=ntok, retries=0)
             row.update(status="up", version=info.get("version"),
                        tools=info.get("tools"), ms=int((time.time() - t0) * 1000))
             # 在线时长与「什么时候开始见到它」——这是长在线的证据，不是装饰
@@ -2300,7 +2551,8 @@ def cmd_health(a):
                 row["health"] = {k: hp.get(k) for k in
                                  ("inbox", "outbox", "peers", "read_only")}
             if a.deep:
-                c = MCPClient(url, a.timeout, token=ntok)
+                c = MCPClient(url, a.timeout, token=ntok,
+                              connect_timeout=_connect_timeout(a))
                 c.handshake()
                 text, iserr = c.call("exec", {"command": "echo OK"}, timeout=a.timeout)
                 code, out, _ = parse_exec(text)
@@ -2308,13 +2560,24 @@ def cmd_health(a):
                 if row["deep"] == "FAIL":
                     row["status"] = "degraded"
         except Exception as e:
-            row.update(status="down", error=str(e)[:80], ms=int((time.time() - t0) * 1000))
+            row.update(status="down", error=_human_net_err(e),
+                       ms=int((time.time() - t0) * 1000))
+        return row
+
+    # **并行探测**。串行时一台离线节点就要占满 8 秒，家里有五台设备
+    # 其中三台没开机，一次 `fleet health` 就得等半分钟——体检本该是「一眼」。
+    # 记账（seen.json）留在主线程按顺序做，避免并发写同一份字典。
+    from concurrent.futures import ThreadPoolExecutor
+    names = sorted(nodes)
+    with ThreadPoolExecutor(max_workers=min(16, len(names))) as ex:
+        probed = list(ex.map(probe_one, names))
+
+    for row in probed:
         if row["status"] != "up":
             bad += 1
-
         # 记账：首次见到 / 最后一次可达 / 累计次数。掉线不清零，才能回答
         # 「这台是不是长期在线」——只看当次 UP 是看不出稳定性的。
-        s = seen.setdefault(name, {})
+        s = seen.setdefault(row["name"], {})
         s.setdefault("first_seen", int(now))
         if row["status"] == "up":
             s["last_ok"] = int(now)
@@ -2345,8 +2608,13 @@ def cmd_health(a):
                 span = "  连续 %s（已观测 %s）" % (_fmt_age(up), _fmt_age(watched))
             else:
                 span = ""
-            print("  %s %-*s  v%-6s %3s 工具  %5d ms%s%s"
-                  % (ok("UP  "), w, r["name"], r.get("version") or "?", r.get("tools") or 0,
+            # 工具数是 GET / 里**没有**的字段（要握手才有）。原来用
+            # `r.get("tools") or 0` 打出来是「0 工具」，看着像节点没加载工具——
+            # 不知道就写 `?`，别拿 0 冒充事实。
+            tools = r.get("tools")
+            tools_s = ("%3d 工具" % tools) if isinstance(tools, int) else "  ? 工具"
+            print("  %s %-*s  v%-6s %s  %5d ms%s%s"
+                  % (ok("UP  "), w, r["name"], r.get("version") or "?", tools_s,
                      r["ms"], span, extra))
         elif r["status"] == "degraded":
             print("  %s %-*s  HTTP 通但工具调用失败" % (warn("DEGR"), w, r["name"]))
@@ -2565,7 +2833,8 @@ def cmd_bootstrap(a):
 def cmd_tunnel(a):
     url, meta = resolve_target(a.target, a.agent, a.port)
     inst = a.dir or "/opt/%s_mcp" % a.target
-    c = MCPClient(url, max(a.timeout, 120), token=meta.get("token", ""))
+    c = MCPClient(url, max(a.timeout, 120), token=meta.get("token", ""),
+                  connect_timeout=_connect_timeout(a))
     c.handshake()
 
     def run(cmd, timeout=90):
@@ -3474,13 +3743,114 @@ def cmd_discover_proto(a):
 
 # ---------------------------------------------------------------- v5.2 命令
 
+def _local_reach_url(url, timeout=0.6):
+    """本机 CLI 和自己的 agent 说话：能用回环就用回环。
+
+    原来直接用 `_lan_ip()` 拼地址，等于为了访问同一台机器绕一圈局域网。
+    三个常见坑：防火墙拦了 en0 入站、多网卡（docker0/utun）选错一张、
+    开了 Tailscale 出口节点后默认路由不在 en0 上——本机自检尤其不该受这些影响。
+
+    回环连不上（agent 只绑了某个具体地址）就原样返回，不改变既有行为；
+    公网/隧道地址一律不碰。
+    """
+    try:
+        p = urllib.parse.urlsplit(url)
+    except Exception:
+        return url
+    host, port = p.hostname or "", p.port
+    if not host or not port:
+        return url
+    if host in ("127.0.0.1", "localhost", "::1"):
+        return url
+    import ipaddress
+    try:
+        ip = ipaddress.ip_address(host)
+    except ValueError:
+        return url                      # 域名：可能是隧道地址，不碰
+    if not (ip.is_private or ip.is_loopback or ip.is_link_local):
+        return url
+    try:
+        s = socket.create_connection(("127.0.0.1", port), timeout=timeout)
+        s.close()
+    except Exception:
+        return url                      # 回环没监听，退回原地址
+    return urllib.parse.urlunsplit(
+        (p.scheme, "127.0.0.1:%d" % port, p.path, p.query, p.fragment))
+
+
+def _disk_agent_version(node_dir):
+    """节点目录里 agent 代码自报的版本；读不到返回空串。
+
+    真相在**代码**里：`mcp_agent.py` 是 `SERVER_VERSION = DEFAULT_CONFIG["version"]`，
+    配置文件里的 version 只是安装当时写进去的，重装不覆盖，永远停在那一天。
+    """
+    if not node_dir:
+        return ""
+    try:
+        with open(os.path.join(node_dir, "mcp_agent.py"),
+                  "r", encoding="utf-8", errors="replace") as f:
+            text = f.read(2 * 1024 * 1024)
+    except (OSError, IOError):
+        return ""
+    # 锚在 `DEFAULT_CONFIG` 上再找 version：文件里别处也会出现 "version"
+    # （客户端信息、/health 响应样例、注释），取全文第一个会读错。
+    # 原来只读前 8KB，头顶的说明一变长就会读不到、然后**静默不检查**——
+    # 那又是一种假保护，所以这里读全文件，锚点找不到才退回宽松匹配。
+    i = text.find("DEFAULT_CONFIG")
+    if i >= 0:
+        m = re.search(r'"version"\s*:\s*"([0-9][0-9.]*)"', text[i:i + 4096])
+    else:
+        m = re.search(r'"version"\s*:\s*"([0-9][0-9.]*)"', text[:8192])
+    return m.group(1) if m else ""
+
+
+def _running_agent_version(me, timeout=2):
+    """本机 agent 进程自报的版本；连不上返回空串（调用方当「未知」处理）。"""
+    if not me:
+        return ""
+    try:
+        info = http_probe(_local_reach_url(me["url"]), timeout=timeout,
+                          token=me.get("token", ""), retries=0) or {}
+    except Exception:
+        return ""
+    return (info.get("version") or "").strip()
+
+
+def _version_drift_lines(running, node_dir, cli_version=None):
+    """运行中的进程 / 磁盘代码 / CLI 三方版本对不上时，返回要打印的行。
+
+    **这是「我明明改好了、为什么行为没变」的唯一答案来源。** agent 是长驻进程，
+    代码在磁盘上换了它也不会换；而 `fleet status` 原来只报运行中进程自报的版本，
+    用户看到 5.4.0 会以为就是最新的，实际上磁盘早就不是那份代码了。
+    """
+    running = (running or "").strip()
+    disk = _disk_agent_version(node_dir)
+    cli = (cli_version or VERSION or "").strip()
+    out = []
+    if not disk:
+        return out                       # 单文件部署 / 目录里没有源码：无从比较
+    if running and running != disk:
+        out.append("%s 运行中的 agent 是 v%s，磁盘上的代码是 v%s"
+                   % (warn("[!]"), running, disk))
+        out.append("    " + dim("进程跑的还是启动时那份代码，之后改的东西都没生效。"
+                                "重启加载：fleet restart"))
+    if cli and cli != disk:
+        out.append("%s 这个 CLI 是 v%s，节点目录里的 agent 代码是 v%s"
+                   % (warn("[!]"), cli, disk))
+        out.append("    " + dim("两者不是同一次安装/升级的结果（%s）。"
+                                "统一版本：fleet update 或 sh scripts/install.sh --upgrade"
+                                % node_dir))
+    return out
+
+
 def _local_mcp(a):
     """返回本机节点的 (name, MCPClient) 或 None。"""
     me = local_node(getattr(a, "self_url", None))
     if not me:
         return None
-    return me, MCPClient(me["url"], getattr(a, "timeout", 30),
-                         token=me.get("token") or "", insecure=True)
+    url = _local_reach_url(me["url"])
+    return dict(me, url=url), MCPClient(url, getattr(a, "timeout", 30),
+                                        token=me.get("token") or "", insecure=True)
 
 
 def _http_json(url, token="", timeout=10, insecure=False):
@@ -3567,6 +3937,10 @@ def cmd_status(a):
     print("对端数量  : %s" % health.get("peers"))
     print("收件箱    : %s 条 / 待投递 %s" % (health.get("inbox"), health.get("outbox")))
     print("运行时长  : %ss" % health.get("uptime_s"))
+    # 版本漂移：进程自报的版本不等于磁盘代码时，用户会误以为改的东西已经生效
+    for line in _version_drift_lines(health.get("version"), me.get("dir"),
+                                     VERSION):
+        print(line)
     return 0
 
 
@@ -3867,7 +4241,8 @@ CODE_FILES = [
 # 这些即使出现在升级包里也拒绝覆盖（双保险，白名单本来就不会碰）
 RUNTIME_FILES = [
     "mcp_agent_config.json", "identity.json", "nodes.json", "peers.json",
-    "audit.log", "port.txt", "current_url.txt", "mailbox.key", "mailbox.json",
+    "audit.log", "audit.chain.jsonl",
+    "port.txt", "current_url.txt", "mailbox.key", "mailbox.json",
 ]
 
 
@@ -4525,7 +4900,7 @@ def cmd_ask(a):
         return 0
     print("")
     print("执行结果：")
-    client = MCPClient(me["url"], getattr(a, "timeout", 30),
+    client = MCPClient(_local_reach_url(me["url"]), getattr(a, "timeout", 30),
                        token=me.get("token") or "", insecure=True)
     failed = 0
     safe_exec = ("df ", "df", "uptime", "free", "ip route", "ip addr", "netstat",
@@ -5247,8 +5622,15 @@ def build_parser():
 
     common(sub.add_parser("tools", help="列副端工具清单")).set_defaults(func=cmd_tools)
     common(sub.add_parser("probe", help="连通性 + 握手 + 试调（只读）")).set_defaults(func=cmd_probe)
-    common(sub.add_parser("ping", help="轻探活：只 GET /，不握手不 exec（看门/脚本用）")
-           ).set_defaults(func=cmd_ping)
+    # ping 的 `--timeout` 默认压到 5 秒：`common()` 给的是 30，
+    # 而探活是给看门脚本/菜单用的——离线节点要等 30 秒才出结果，
+    # 一轮体检就废了。显式传 `--timeout N` 仍然以用户为准。
+    sp = common(sub.add_parser(
+        "ping", help="轻探活：只 GET /，不握手不 exec（看门/脚本用，默认 5 秒超时）"),
+        need_target=False)
+    sp.add_argument("target", nargs="?", default=None,
+                    help="副端名字/地址；省略则探本机节点")
+    sp.set_defaults(func=cmd_ping, timeout=5)
     sp = common(sub.add_parser("shell", help="v5.3: 交互式远程 shell（PTY，替代 ssh）"))
     sp.add_argument("--cwd", default="", help="远端起始目录")
     sp.add_argument("--insecure", action="store_true", help="跳过 HTTPS 证书校验")
@@ -5273,9 +5655,14 @@ def build_parser():
     sp.add_argument("--dir", help="副端安装目录（默认 /opt/<name>_mcp）")
     sp.set_defaults(func=cmd_doctor)
 
-    sp = common(sub.add_parser("exec", help="在副端执行 shell 命令"))
+    sp = common(sub.add_parser("exec", help="在副端执行 shell 命令（省略副端则跑本机）"),
+                need_target=False)
+    sp.add_argument("target", nargs="?", default=None,
+                    help="副端名字/地址；省略则在本机节点执行")
     sp.add_argument("command", nargs=argparse.REMAINDER, help="要执行的命令")
     sp.add_argument("--sudo", action="store_true", help="用 sudo 执行")
+    sp.add_argument("--local", action="store_true",
+                    help="强制在本机执行（`fleet exec --local \"ls\"`，不必知道副端名字）")
     sp.add_argument("--workdir", help="工作目录")
     sp.add_argument("--timeout-ms", type=int, help="命令超时（毫秒）")
     sp.set_defaults(func=cmd_exec)
@@ -5315,9 +5702,13 @@ def build_parser():
     sp.add_argument("--no-sync", action="store_true", help="不查地址目录")
     sp.set_defaults(func=cmd_cp)
 
-    sp = common(sub.add_parser("exec-async", help="后台启动命令，立即返回 job_id"))
+    sp = common(sub.add_parser("exec-async", help="后台启动命令，立即返回 job_id（省略副端则跑本机）"),
+                need_target=False)
+    sp.add_argument("target", nargs="?", default=None,
+                    help="副端名字/地址；省略则在本机节点执行")
     sp.add_argument("command", nargs=argparse.REMAINDER, help="要执行的命令")
     sp.add_argument("--sudo", action="store_true", help="用 sudo 执行")
+    sp.add_argument("--local", action="store_true", help="强制在本机执行")
     sp.add_argument("--workdir", help="工作目录")
     sp.set_defaults(func=cmd_exec_async)
 
@@ -5549,6 +5940,10 @@ def build_parser():
     # v4.1: fleet discover -- UDP 广播发现
     sp = sub.add_parser("discover", help="UDP 广播发现同网段 fleet 节点（v4.1 自研协议）")
     sp.add_argument("--deep", action="store_true", help="主动 ping 所有 254 个 IP（慢但全）")
+    # 这里原来漏了 set_defaults：`fleet discover` 会在 main() 里
+    # `a.func(a)` 处抛 AttributeError（菜单第 16 项同样中招），
+    # 命令在 help 里写着、实际却一按就崩。
+    sp.set_defaults(func=cmd_discover_proto)
 
     # ==========================================================================
     # v5.0.6: 中文交互菜单（手机/桌面通用，无参数时默认进入）
@@ -5877,11 +6272,19 @@ def _read_pid(d):
 
 
 def _local_health(me, timeout=2):
-    """本机节点 HTTP 是否活着。比 pid 判断更可信（pid 可能是僵尸）。"""
+    """本机节点 HTTP 是否活着。比 pid 判断更可信（pid 可能是僵尸）。
+
+    走 `_local_reach_url`：本机自检没理由绕局域网 IP 一圈。
+    这个坑很致命——agent 默认只绑 `127.0.0.1`（没配令牌时），
+    而 `local_node()` 拼出来的是 `_lan_ip()`，于是「节点明明在跑」却被判死，
+    `fleet start` 会以为没起来、再拉一个实例、端口冲突、最后报
+    「启动后没能响应健康检查」。用户看到的就是「fleet start 永远是失败的」。
+    """
     if not me:
         return False
     try:
-        http_probe(me["url"], timeout=timeout, token=me.get("token", ""), retries=0)
+        http_probe(_local_reach_url(me["url"]), timeout=timeout,
+                   token=me.get("token", ""), retries=0)
         return True
     except Exception:
         return False
@@ -5896,7 +6299,11 @@ def cmd_start(a):
                    "    只做控制端则不用装：fleet add --name x --url http://IP:3100/mcp --token T"
                    % _default_node_name())
     if _local_health(me):
-        print(ok("[+] ") + "本机节点已在运行：%s（%s）" % (me["name"], me["url"]))
+        print(ok("[+] ") + "本机节点已在运行：%s（%s）"
+              % (me["name"], _local_reach_url(me["url"])))
+        for line in _version_drift_lines(_running_agent_version(me),
+                                         me.get("dir"), VERSION):
+            print(line)
         return 0
     d = me["dir"]
     agent = os.path.join(d, "mcp_agent.py")
@@ -5914,7 +6321,7 @@ def cmd_start(a):
                 time.sleep(0.25)
                 if _local_health(me, timeout=1):
                     print(ok("[+] ") + "本机节点已启动（launchd %s）：%s  %s"
-                          % (detail, me["name"], me["url"]))
+                          % (detail, me["name"], _local_reach_url(me["url"])))
                     print(dim("    开机自启 + 崩溃重拉已生效；停止用 fleet stop"))
                     return 0
             print(err("[x] ") + "launchd 已注册但健康检查没通，看日志：")
@@ -5947,7 +6354,8 @@ def cmd_start(a):
     for _ in range(20):
         time.sleep(0.25)
         if _local_health(me, timeout=1):
-            print(ok("[+] ") + "本机节点已启动：%s  %s（pid %d）" % (me["name"], me["url"], p.pid))
+            print(ok("[+] ") + "本机节点已启动：%s  %s（pid %d）"
+                  % (me["name"], _local_reach_url(me["url"]), p.pid))
             print(dim("    日志：%s" % os.path.join(logdir, "node.log")))
             return 0
         if p.poll() is not None:
@@ -6004,8 +6412,25 @@ def cmd_stop(a):
             print(dim("    重新启动：fleet start"))
             return 0
 
-    pid = _read_pid(d) or _find_listener_pid(int(me["url"].rsplit(":", 1)[-1].split("/")[0]
-                                               or 3100))
+    # 端口：优先从 URL 里取，取不到再看 port.txt，最后才用默认值。
+    # 原来是一行 `int(url.rsplit(":",1)[-1].split("/")[0] or 3100)`：
+    # URL 不带端口（http://host/mcp）时它会拿 "host/mcp" 去 int()，直接 ValueError。
+    try:
+        port = int(urllib.parse.urlsplit(me["url"]).port or 0)
+    except Exception:
+        port = 0
+    if not port:
+        try:
+            port = int(open(os.path.join(d, "port.txt"), encoding="utf-8").read().strip())
+        except Exception:
+            port = 3100
+
+    # pidfile 里可能是一个**上次异常退出留下的死 pid**。它是「真值」，
+    # 所以不能写成 `_read_pid(d) or _find_listener_pid(port)` —— or 会短路，
+    # 按端口找进程根本不会执行，结果就是「节点明明在跑，stop 却说没在运行」。
+    pid = _read_pid(d)
+    if not pid or not _pid_alive(pid):
+        pid = _find_listener_pid(port)
     if not pid or not _pid_alive(pid):
         print(warn("[i] ") + "本机节点没有在运行。")
         return 0
@@ -6095,9 +6520,12 @@ def show_fleet_status():
         print(dim("    安装：sh scripts/install.sh --name %s" % _default_node_name()))
     else:
         up = _local_health(me, timeout=1.5)
+        # 显示**实际可达**的地址：agent 默认只绑 127.0.0.1，而 local_node()
+        # 拼出来的是局域网 IP。菜单是默认入口，挂一个连不上的地址在那里，
+        # 用户会以为节点坏了，或者照着这个地址去配别的东西。
         print("    %-14s %s  %s" % (me.get("name"),
                                     ok("运行中") if up else warn("未响应"),
-                                    me.get("url")))
+                                    _local_reach_url(me.get("url", ""))))
         print("    指纹 %s · 鉴权 %s" % (me.get("fingerprint") or "-",
                                         "已开启" if me.get("token") else "未开启"))
 
@@ -6133,10 +6561,10 @@ def show_fleet_status():
   【常用命令】
     fleet start / stop / restart         启停本机节点
     fleet status / nodes / doctor        节点状态、对端、体检
-    fleet ping <节点>                    一秒探活（只 GET /，不握手）
+    fleet ping [节点]                    一秒探活（只 GET /，不握手；省略即本机）
     fleet shell <节点>                   交互式 shell（PTY，可跑 vim/top，替代 ssh）
     fleet forward -L 8080:h:80 <节点>    端口转发（等价 ssh -L / -R）
-    fleet exec <节点> "<命令>"            在别的设备上执行
+    fleet exec [节点] "<命令>"           在别的设备上执行（省略即本机，退出码同 ssh）
     fleet cp ./f.py nas:/opt/f.py        推代码；反向即拉回来
     fleet scan [网段]                    主动找同网段节点（--add 直接登记）
     fleet tailnet [status|sync|up]       Tailscale 状态 / 地址自愈 / 起隧道
@@ -6160,6 +6588,18 @@ def show_fleet_status():
 """)
     print("=" * 66)
     return 0
+
+
+def _menu_args(argv):
+    """把菜单里的选择变成**真正的** argparse 命名空间。
+
+    原来每项都手搓 `argparse.Namespace(...)`，只要漏一个属性就是运行时
+    `AttributeError: 'Namespace' object has no attribute 'workdir'`——而菜单
+    恰恰是「不带参数运行 fleet」的第一入口，第一次用就崩：exec、msg send、
+    msg history、probe、doctor、health、tools、mesh 全部如此，且只在用户
+    真的选了那一项时才暴露。统一走 `build_parser()`，参数定义只有一处。
+    """
+    return build_parser().parse_args(argv)
 
 
 def cmd_menu(a):
@@ -6278,10 +6718,12 @@ def cmd_menu(a):
                 input("  地址不能为空，按回车..."); continue
             token = input("  令牌 (没有则留空): ").strip()
             no_test = input("  跳过连通测试? (y/N): ").strip().lower() == "y"
-            args = argparse.Namespace(name=name, url=url, ip=None, port=3100,
-                                      token=token, no_test=no_test, timeout=5,
-                                      force=False)
-            r = cmd_add(args)
+            argv = ["add", "--name", name, "--url", url, "--timeout", "5"]
+            if token:
+                argv += ["--token", token]
+            if no_test:
+                argv += ["--no-test"]
+            r = cmd_add(_menu_args(argv))
             if r == 0:
                 print(f"\n  已添加 {name}")
             else:
@@ -6293,7 +6735,7 @@ def cmd_menu(a):
             _banner()
             name = _pick_node("要删除的副端编号: ")
             if name:
-                args = argparse.Namespace(name=name)
+                args = _menu_args(["remove", name])
                 cmd_remove(args)
                 print(f"  已移除 {name}")
             input("  按回车继续...")
@@ -6308,8 +6750,10 @@ def cmd_menu(a):
                 input("  不能为空，按回车..."); continue
             token = input("  对方令牌 (没有则留空): ").strip() or None
             port = 3100
-            args = argparse.Namespace(target=target, port=port, token=token)
-            r = cmd_pair(args)
+            argv = ["pair", target, "--port", str(port)]
+            if token:
+                argv += ["--token", token]
+            r = cmd_pair(_menu_args(argv))
             if r == 0:
                 print("  配对成功！")
             else:
@@ -6321,7 +6765,7 @@ def cmd_menu(a):
             _banner()
             name = _pick_node("要体检的副端编号: ")
             if name:
-                args = argparse.Namespace(target=name, timeout=5)
+                args = _menu_args(["probe", name, "--timeout", "5"])
                 r = cmd_probe(args)
             input("\n  按回车继续...")
 
@@ -6330,14 +6774,14 @@ def cmd_menu(a):
             _banner()
             name = _pick_node("要体检的副端编号: ")
             if name:
-                args = argparse.Namespace(target=name, timeout=10, deep=False)
+                args = _menu_args(["doctor", name, "--timeout", "10"])
                 r = cmd_doctor(args)
             input("\n  按回车继续...")
 
         # ---- 7: health ----
         elif choice == "7":
             _banner()
-            args = argparse.Namespace(deep=False)
+            args = _menu_args(["health"])
             cmd_health(args)
             input("\n  按回车继续...")
 
@@ -6348,8 +6792,7 @@ def cmd_menu(a):
             if name:
                 cmd = input("  命令: ").strip()
                 if cmd:
-                    args = argparse.Namespace(target=name, command=[cmd], sudo=False,
-                                              timeout=None, work_dir=None, stdin=None)
+                    args = _menu_args(["exec", name, cmd])
                     r = cmd_exec(args)
             input("\n  按回车继续...")
 
@@ -6361,8 +6804,8 @@ def cmd_menu(a):
                 tool = input("  工具名: ").strip()
                 args_json = input("  参数 JSON (如 {\"path\":\"/\"}): ").strip() or "{}"
                 if tool:
-                    args = argparse.Namespace(target=name, tool=tool, args=args_json,
-                                              timeout=30, agent=None, port=3100)
+                    args = _menu_args(["call", name, "--tool", tool,
+                                       "--args", args_json])
                     r = cmd_call(args)
             input("\n  按回车继续...")
 
@@ -6371,7 +6814,7 @@ def cmd_menu(a):
             _banner()
             name = _pick_node("要列工具的副端编号: ")
             if name:
-                args = argparse.Namespace(target=name)
+                args = _menu_args(["tools", name])
                 r = cmd_tools(args)
             input("\n  按回车继续...")
 
@@ -6382,7 +6825,7 @@ def cmd_menu(a):
             if name:
                 text = input("  消息内容: ").strip()
                 if text:
-                    args = argparse.Namespace(target=name, text=text, file=None)
+                    args = _menu_args(["msg", name, "send", "--text", text])
                     r = cmd_msg(args)
             input("\n  按回车继续...")
 
@@ -6391,14 +6834,14 @@ def cmd_menu(a):
             _banner()
             name = _pick_node("要查看消息历史的副端编号: ")
             if name:
-                args = argparse.Namespace(target=name, limit=20, text="", file=None)
+                args = _menu_args(["msg", name, "history", "--lines", "20"])
                 r = cmd_msg(args)
             input("\n  按回车继续...")
 
         # ---- 13: mesh ----
         elif choice == "13":
             _banner()
-            args = argparse.Namespace(deep=False)
+            args = _menu_args(["mesh"])
             cmd_mesh(args)
             input("\n  按回车继续...")
 
@@ -6406,14 +6849,7 @@ def cmd_menu(a):
         elif choice == "14":
             _banner()
             name = input("  副端名字 (默认 pi): ").strip() or "pi"
-            args = argparse.Namespace(name=name, port=3100, prefix=None,
-                                      sudo_pass=None, tunnel=False, mode=None,
-                                      auth_token=None, allow_ips=None,
-                                      directory=None, directory_token=None,
-                                      no_keepalive=False, generate_token=False,
-                                      require_auth=False, mirror="auto",
-                                      offline=False, uninstall=False)
-            cmd_install_cmd(args)
+            cmd_install_cmd(_menu_args(["install-cmd", "--name", name]))
             input("\n  按回车继续...")
 
         # ---- 15: bootstrap ----
@@ -6432,23 +6868,19 @@ def cmd_menu(a):
         elif choice == "16":
             _banner()
             deep = input("  深度扫描（慢）? (y/N): ").strip().lower() == "y"
-            args = argparse.Namespace(deep=deep)
+            args = _menu_args(["discover"] + (["--deep"] if deep else []))
             cmd_discover_proto(args)
             input("\n  按回车继续...")
 
         elif choice == "17":
             _banner()
-            args = argparse.Namespace(json=False, timeout=30, self_url=None)
-            cmd_selfcheck(args)
+            cmd_selfcheck(_menu_args(["selfcheck"]))
             try:
                 yn = input("\n  尝试自动修复可修项? (y/N): ").strip().lower()
             except (EOFError, KeyboardInterrupt):
                 yn = ""
             if yn == "y":
-                args = argparse.Namespace(json=False, auto=True, attempts=2,
-                                          rollback=False, timeout=120,
-                                          self_url=None)
-                cmd_repair(args)
+                cmd_repair(_menu_args(["repair", "--auto", "--attempts", "2"]))
             input("\n  按回车继续...")
 
         elif choice == "18":
@@ -6458,19 +6890,14 @@ def cmd_menu(a):
 
         elif choice == "19":
             _banner()
-            args = argparse.Namespace(check=False, ref="main", force=False,
-                                      no_restart=False, json=False)
-            cmd_up(args)
+            cmd_up(_menu_args(["up"]))
             input("\n  按回车继续...")
 
         elif choice == "20":
             _banner()
             name = _pick_node("要连接哪台设备: ")
             if name:
-                args = argparse.Namespace(target=name, agent="auto", port=3100,
-                                          timeout=60, json=False, no_sync=False,
-                                          cwd="", insecure=False)
-                cmd_shell(args)
+                cmd_shell(_menu_args(["shell", name]))
 
         # ---- 21: forward ----
         elif choice == "21":
@@ -6493,12 +6920,9 @@ def cmd_menu(a):
                 direction = input("  方向 [L=本地监听/R=副端监听，默认 L]: ").strip().upper()
             except (EOFError, KeyboardInterrupt):
                 continue
-            args = argparse.Namespace(target=name, agent="auto", port=3100,
-                                      timeout=30, json=False, no_sync=False,
-                                      local=[spec] if direction != "R" else None,
-                                      remote=[spec] if direction == "R" else None,
-                                      bind="127.0.0.1", list=False, insecure=False)
-            cmd_forward(args)
+            argv = ["forward", name]
+            argv += (["--remote", spec] if direction == "R" else ["--local", spec])
+            cmd_forward(_menu_args(argv))
 
         else:
             print("  无效选择，按回车继续...")
@@ -6512,8 +6936,10 @@ def main():
     if not getattr(a, "cmd", None):
         # v5.0.6.3: 无参数显示本机状态 + 中文命令说明
         return show_fleet_status()
-    if a.cmd == "exec" and not a.command:
-        return die("命令为空")
+    # 注意：**不要**在这里拦 `exec` 的空命令。`fleet exec "df -h"` 里那个参数
+    # 会被 argparse 当成 target，command 自然是空的——用户在完全正确的手势下
+    # 会收到一句莫名其妙的「命令为空」。判定统一交给 cmd_exec 的
+    # `_pick_exec_target`（它知道哪些名字是副端、哪些其实是命令）。
     # 地址自动跟随：--no-sync 或 FLEET_NO_SYNC=1 关掉（离线/隔离网络里更省事）
     if getattr(a, "no_sync", False) or os.environ.get("FLEET_NO_SYNC") == "1":
         AUTO_SYNC = False

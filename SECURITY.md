@@ -83,7 +83,7 @@ MCP Fleet 让 AI Agent 在你的设备上执行命令、读写文件、管理服
 
 ### 第 5 层 · 审计与可观测
 
-- **哈希链审计**（`audit.log`）：每条记录含 `prev_hash`，`fleet audit verify` 可定位被篡改行；
+- **哈希链审计**（`audit.chain.jsonl`，人读副本 `audit.log`）：每条记录含 `prev_hash`，`fleet audit verify` 可定位被篡改行；
   记录时间、来源节点/指纹、工具、参数摘要（脱敏）、结果、耗时。
 - 审计轮转（大小上限 + 保留份数），日志权限 0600；关键安全事件（配对、指纹变化、
   鉴权失败、策略拒绝、重放）单独计数并可在 `fleet metrics` 查看。

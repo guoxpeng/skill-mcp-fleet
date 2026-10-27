@@ -139,7 +139,8 @@ X-Fleet-Sig:   base64(Ed25519("fleet1|METHOD|PATH|ts|nonce|sha256(body)"))
 │   ├── sent.jsonl     已投递
 │   ├── cursor.json    各 agent 已读位置
 │   └── salt.bin       邮箱密钥盐
-├── audit.log          哈希链审计（0600）
+├── audit.chain.jsonl  哈希链审计（JSONL，0600，fleet audit 校验）
+├── audit.log          人读审计（纯文本，超 5MB 轮转）
 ├── tasks/             自对话任务与计划（0600）
 ├── relay/             中继队列（启用时）
 └── install-manifest.json  安装器清单（卸载依据）
