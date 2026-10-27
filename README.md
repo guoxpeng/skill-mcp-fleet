@@ -152,11 +152,14 @@ fleet forward --list nas                      # 看副端当前隧道
   丢弃滚屏历史——TCP 丢一个字节，下载的文件就是坏的；
 - 验证方式：1MB / 5MB 随机二进制 + SHA256 比对，上行/下行/`-L`/`-R` 四个方向全覆盖。
   本机回环实测 `-L` 5MB ≈ 0.5s、`-R` 5MB ≈ 3s。
+- 顺带补上「长时间在线」的证据：`fleet health` 现在显示副端自报的**进程在线时长**
+  和主端**已观测多久**，并把 `first_seen / last_ok / up_count` 记在
+  `~/.mcp-fleet/seen.json`（掉线不清零）——只看当次 UP 看不出稳定性。
 
 ### 6.7 可复现的验证证据
 
 ```bash
-.venv/bin/python -m pytest tests/ -q        # 763 passed, 1 skipped
+.venv/bin/python -m pytest tests/ -q        # 775 passed, 1 skipped
 sh scripts/install.sh --dry-run --json --name demo   # 安装器零副作用预演
 bash scripts/demo.sh                        # 本机双节点 30 秒演示
 ```

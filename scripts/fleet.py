@@ -2056,12 +2056,71 @@ def cmd_exec_jobs(a):
     return 1 if iserr else 0
 
 
+def _seen_path():
+    return os.path.join(os.path.expanduser("~"), ".mcp-fleet", "seen.json")
+
+
+def _load_seen():
+    try:
+        with open(_seen_path(), encoding="utf-8") as f:
+            d = json.load(f)
+        return d if isinstance(d, dict) else {}
+    except Exception:
+        return {}
+
+
+def _save_seen(d):
+    try:
+        p = _seen_path()
+        os.makedirs(os.path.dirname(p), exist_ok=True)
+        tmp = p + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(d, f, ensure_ascii=False, indent=1, sort_keys=True)
+        os.replace(tmp, p)
+    except Exception:
+        pass                    # 记账失败不该影响体检本身
+
+
+def _node_uptime(url, token="", timeout=3):
+    """问副端要 uptime。拿不到就返回 None，不当作故障。
+
+    为什么单独问 /fleet/health：`initialize` 只回版本和工具数，
+    回答不了「这台机器到底连续跑了多久」——而「长时间在线」正是要看的那个东西。
+    """
+    base = (url or "").rstrip("/")
+    if base.endswith("/mcp"):
+        base = base[:-4]
+    if not base.startswith("http"):
+        return None
+    try:
+        d = _http_json(base + "/fleet/health", token, timeout=timeout, insecure=True)
+        return d if isinstance(d, dict) else None
+    except Exception:
+        return None
+
+
+def _fmt_age(sec):
+    try:
+        sec = int(sec)
+    except Exception:
+        return "?"
+    if sec < 60:
+        return "%ds" % sec
+    if sec < 3600:
+        return "%dm" % (sec // 60)
+    if sec < 86400:
+        return "%dh%02dm" % (sec // 3600, (sec % 3600) // 60)
+    return "%dd%02dh" % (sec // 86400, (sec % 86400) // 3600)
+
+
 def cmd_health(a):
     nodes = discover_nodes(a.agent)
     if not nodes:
         print(warn("没有发现任何副端。"))
         return 1
     rows, bad = [], 0
+    seen = _load_seen()
+    now = time.time()
     for name in sorted(nodes):
         url = nodes[name]["url"]
         ntok = nodes[name].get("token", "")
@@ -2071,6 +2130,12 @@ def cmd_health(a):
             info = http_probe(url, timeout=a.timeout, token=ntok)
             row.update(status="up", version=info.get("version"),
                        tools=info.get("tools"), ms=int((time.time() - t0) * 1000))
+            # 在线时长与「什么时候开始见到它」——这是长在线的证据，不是装饰
+            hp = _node_uptime(url, ntok)
+            if hp:
+                row["uptime_s"] = hp.get("uptime_s")
+                row["health"] = {k: hp.get(k) for k in
+                                 ("inbox", "outbox", "peers", "read_only")}
             if a.deep:
                 c = MCPClient(url, a.timeout, token=ntok)
                 c.handshake()
@@ -2083,7 +2148,22 @@ def cmd_health(a):
             row.update(status="down", error=str(e)[:80], ms=int((time.time() - t0) * 1000))
         if row["status"] != "up":
             bad += 1
+
+        # 记账：首次见到 / 最后一次可达 / 累计次数。掉线不清零，才能回答
+        # 「这台是不是长期在线」——只看当次 UP 是看不出稳定性的。
+        s = seen.setdefault(name, {})
+        s.setdefault("first_seen", int(now))
+        if row["status"] == "up":
+            s["last_ok"] = int(now)
+            s["up_count"] = int(s.get("up_count") or 0) + 1
+        else:
+            s["last_down"] = int(now)
+            s["down_count"] = int(s.get("down_count") or 0) + 1
+        row["first_seen"] = s.get("first_seen")
+        row["last_ok"] = s.get("last_ok")
+        row["up_count"] = s.get("up_count")
         rows.append(row)
+    _save_seen(seen)
 
     if a.json:
         print(json.dumps(rows, ensure_ascii=False, indent=2))
@@ -2094,15 +2174,28 @@ def cmd_health(a):
     for r in rows:
         if r["status"] == "up":
             extra = ("  deep=%s" % r["deep"]) if "deep" in r else ""
-            print("  %s %-*s  v%-6s %3s 工具  %5d ms%s"
+            up = r.get("uptime_s")
+            # 进程在线时长 + 本地观测到的连续可达天数，两个一起看才有意义：
+            # 前者说明服务没重启，后者说明链路一直通。
+            if up is not None:
+                watched = int(time.time() - (r.get("first_seen") or time.time()))
+                span = "  连续 %s（已观测 %s）" % (_fmt_age(up), _fmt_age(watched))
+            else:
+                span = ""
+            print("  %s %-*s  v%-6s %3s 工具  %5d ms%s%s"
                   % (ok("UP  "), w, r["name"], r.get("version") or "?", r.get("tools") or 0,
-                     r["ms"], extra))
+                     r["ms"], span, extra))
         elif r["status"] == "degraded":
             print("  %s %-*s  HTTP 通但工具调用失败" % (warn("DEGR"), w, r["name"]))
         else:
-            print("  %s %-*s  %s" % (err("DOWN"), w, r["name"], r.get("error", "")))
+            last = r.get("last_ok")
+            tail = ("（最后可达 %s 前）" % _fmt_age(time.time() - last)) if last else ""
+            print("  %s %-*s  %s%s" % (err("DOWN"), w, r["name"],
+                                       r.get("error", ""), tail))
     print()
     print(ok("全部在线。") if not bad else warn("%d 台异常。" % bad))
+    if any(r["status"] == "up" for r in rows):
+        print(dim("记账文件：%s（首次见到 / 最后可达 / 累计次数）" % _seen_path()))
     if bad:
         print(dim("逐台排查：python fleet.py doctor <名字>"))
     return 1 if bad else 0
