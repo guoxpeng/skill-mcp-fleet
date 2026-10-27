@@ -191,6 +191,28 @@ class MenuArgsTest(unittest.TestCase):
         self.assertIn("_menu_args(", body)
 
 
+class DoctorSummaryTest(unittest.TestCase):
+    """「10/12 通过」会让人去追那 2 项，而它们往往是故意的默认值。
+
+    本机回环不配令牌、内网不配 TLS，都是合理默认；把它们和真问题混在
+    同一个比例里，等于让用户去修不存在的故障。摘要要区分
+    「真问题」与「加固建议」，每项也要标 critical。
+    """
+
+    def test_summary_separates_advice(self):
+        import json
+        import mcp_agent as agent
+        text, _is_err = agent.t_fleet_doctor({})
+        rep = json.loads(text)
+        self.assertTrue(all("critical" in c for c in rep["checks"]),
+                        "每项检查都要标 critical，前端才能区分")
+        if any(not c["ok"] and not c["critical"] for c in rep["checks"]):
+            self.assertIn("加固建议", rep["summary"])
+        # 关键项全过时，整体必须判为 ok（不能因为没配 TLS 就报故障）
+        crit_ok = all(c["ok"] for c in rep["checks"] if c["critical"])
+        self.assertEqual(rep["ok"], crit_ok)
+
+
 class ExecExitCodeTest(unittest.TestCase):
     """`exit 42` 必须回 42，而不是笼统的 1。"""
 

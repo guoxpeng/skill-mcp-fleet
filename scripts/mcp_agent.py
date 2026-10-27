@@ -3892,13 +3892,17 @@ def t_fleet_doctor(a):
     """12 项自检：环境、身份、端口、磁盘、审计、策略、对端、TLS 等。"""
     import shutil
     checks = []
+    # 只有关键项失败才让自检整体失败；权限/鉴权/TLS/对端属于加固建议，
+    # 仍逐项展示，避免「内网未配 TLS」被误判为不可用。
+    CRITICAL = {"python", "identity", "policy", "audit", "disk", "port", "time"}
 
     def add(name, fn):
         try:
             ok, detail = fn()
         except Exception as e:
             ok, detail = False, "检查异常: %r" % (e,)
-        checks.append({"name": name, "ok": bool(ok), "detail": detail})
+        checks.append({"name": name, "ok": bool(ok), "detail": detail,
+                       "critical": name in CRITICAL})
 
     add("python", lambda: (sys.version_info >= (3, 6),
                            "%s.%s.%s" % sys.version_info[:3]))
@@ -3923,13 +3927,16 @@ def t_fleet_doctor(a):
                         "已配置" if CFG.get("tls_cert") else "未配置（局域网可接受）"))
     add("time", lambda: _doctor_time())
     add("read_only", lambda: (True, "只读" if CFG.get("read_only") else "可写"))
-    # 只有关键项失败才让自检整体失败；权限/鉴权/TLS/对端属于加固建议，
-    # 仍逐项展示，避免“内网未配 TLS”被误判为不可用。
-    critical = {"python", "identity", "policy", "audit", "disk", "port", "time"}
-    ok = all(c["ok"] for c in checks if c["name"] in critical)
-    return _json_text({"ok": ok, "checks": checks,
-                       "summary": "%d/%d 通过" % (sum(1 for c in checks if c["ok"]),
-                                                  len(checks))}), not ok
+    ok = all(c["ok"] for c in checks if c["name"] in CRITICAL)
+    # 「10/12 通过」会让人去追那 2 项——而它们多半是**故意的默认值**
+    # （本机回环不配令牌、内网不配 TLS）。把「没过」拆成「真问题」与
+    # 「加固建议」，用户才知道该不该动。
+    passed = sum(1 for c in checks if c["ok"])
+    advice = [c["name"] for c in checks if not c["ok"] and not c["critical"]]
+    summary = "%d/%d 通过" % (passed, len(checks))
+    if advice:
+        summary += "（%d 项加固建议未启用：%s）" % (len(advice), "、".join(advice))
+    return _json_text({"ok": ok, "checks": checks, "summary": summary}), not ok
 
 
 def _doctor_port():
