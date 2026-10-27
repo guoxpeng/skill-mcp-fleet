@@ -70,7 +70,7 @@ import urllib.request
 
 # ---------------------------------------------------------------- 基础
 
-VERSION = "1.2.0"
+VERSION = "1.2.1"
 PROTOCOL = "2024-11-05"
 HERE = os.path.dirname(os.path.abspath(__file__))
 # 登记表位置：
