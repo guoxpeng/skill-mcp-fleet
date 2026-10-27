@@ -1,4 +1,4 @@
-# MCP Fleet v5.2 · 让所有设备成为一支 AI 团队
+# MCP Fleet v5.3 · 让所有设备成为一支 AI 团队
 
 > **2026 华为开发者大赛 · 小红书 Skill 创新赛** ｜ 通用赛道 · 开发工具
 > 作者：guoxpeng ｜ 开源仓库：https://github.com/guoxpeng/skill-mcp-fleet ｜ 许可：MIT
@@ -24,7 +24,8 @@
 - 设备上的 Agent 之间可以发消息、谈验收标准、互相复核结果；
 - 整套系统**零第三方依赖、不依赖任何中心服务、一条命令安装**。
 
-v5.2 把这件事从"能连"推进到**"敢连、好连、会自己想、坏了能自修"**。
+v5.2 把这件事从"能连"推进到**"敢连、好连、会自己想、坏了能自修"**；
+v5.3 再进一步——**公网设备上用 `fleet shell` 直接替代 ssh，内网靠 Tailscale 补齐**。
 
 ## 二、v5.2 六大升级
 
@@ -115,10 +116,28 @@ fleet nodes
 - 普通用户文档：[5 分钟上手](references/quickstart.md)、[一页排障](references/troubleshooting.md)、
   [自修复](references/self-repair.md)、[真机测试结果](references/test-results.md)。
 
-### 6.5 可复现的验证证据
+### 6.5 v5.3：替代 ssh 与自升级
+
+目标很具体：**普通公网设备上，fleet 能替代 ssh；内网配合 Tailscale 达到同样的手感。**
+
+- **`fleet shell <节点>`**：远端 `pty.fork()` 起真终端登录 shell，本地 raw 模式直通。
+  `tty` 返回 `/dev/ttysNNN`，vim / top / less 正常；`SIGWINCH` 自动同步窗口大小。
+  传输仍是请求/响应，用长轮询（`wait` 最长 5s）避免空转，输出走 base64 防截断。
+- **`fleet up`**：检查远端版本，有新版才升级。git 仓库走 `fetch + merge --ff-only`，
+  非 git 安装走源码包（GitHub + 镜像回退）。**只升代码不碰数据**（白名单），
+  升级前备份到 `~/.mcp-fleet/up-backups/`，升级后 `--version` 自检，失败自动回滚；
+  远端版本坏了会记进 `up-state.json`，下次自动跳过。
+- **`fleet ping` / `cp` / `scan` / `tailnet` / `start|stop|restart`**：探活、双向搬文件、
+  扫同网段、地址漂移自愈、节点启停。
+- **macOS**：launchd plist 显式写 PATH（否则 Homebrew 的命令在 `exec` 里全部找不到）、
+  `stop` 走 `bootout + disable`（否则 KeepAlive 十秒内把进程拉回来）、
+  `start` 走 `bootstrap + kickstart`（否则不受 launchd 管、重启不自启）、
+  `_lan_ip` 按 en0 取址（否则开 Tailscale 出口节点后广播的是隧道地址）。
+
+### 6.6 可复现的验证证据
 
 ```bash
-.venv/bin/python -m pytest tests/ -q        # 626 passed, 1 skipped
+.venv/bin/python -m pytest tests/ -q        # 732 passed, 1 skipped
 sh scripts/install.sh --dry-run --json --name demo   # 安装器零副作用预演
 bash scripts/demo.sh                        # 本机双节点 30 秒演示
 ```

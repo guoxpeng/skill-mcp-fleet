@@ -17,6 +17,20 @@
     </array>
     <key>WorkingDirectory</key>
     <string>{{INSTALL_DIR}}</string>
+    <!-- launchd 的默认 PATH 只有 /usr/bin:/bin:/usr/sbin:/sbin，
+         Homebrew 装的 git/node/ffmpeg 全在 /opt/homebrew/bin。
+         不显式给 PATH，fleet exec 里跑这些命令会一律 command not found。 -->
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>{{LAUNCHD_PATH}}</string>
+        <key>HOME</key>
+        <string>{{LAUNCHD_HOME}}</string>
+        <key>LANG</key>
+        <string>en_US.UTF-8</string>
+        <key>LC_ALL</key>
+        <string>en_US.UTF-8</string>
+    </dict>
     <key>RunAtLoad</key>
     <true/>
     <key>KeepAlive</key>

@@ -5,6 +5,80 @@
 
 ---
 
+## [5.3.0] — 2026-10-27 · 替代 ssh：交互式 shell + 自升级 + macOS 深度适配
+
+这一版对准一个具体目标：**普通公网设备上，fleet 能替代 ssh；内网配合
+Tailscale 达到同样的手感**。此前 fleet 只有一次性 `exec`，跑不了 vim/top，
+所以「替代 ssh」一直名不副实。
+
+### 新增：`fleet shell`（PTY 交互式会话）
+- 远端用 `pty.fork()` 起**真终端**里的登录 shell，本地把 stdin 设 raw 模式，
+  按键原样送、输出原样刷。`tty` 会返回 `/dev/ttysNNN`，vim / top / less 正常工作。
+- 传输仍是请求/响应，所以拆成 `shell_open / write / read / resize / close / list`
+  六个工具；`read` 支持**长轮询**（`wait` 最长 5s），有数据立刻返回，
+  不用客户端 50ms 空转一次。
+- 输出走 base64：PTY 吐的是原始字节流，可能在多字节字符中间截断，
+  按文本传会乱码。
+- 输出缓冲 512KB 滚动 + **绝对 offset**，客户端落后太多时明确回 `truncated`
+  而不是悄悄丢数据；同时最多 8 个会话，防反复 open 撑爆内存。
+- `SIGWINCH` 自动同步窗口大小；远端 `exit` 后客户端立即返回（不卡在阻塞读）。
+- 工具总数 56 → **62**。
+
+### 新增：`fleet up`（本地脚本自升级）
+- `fleet up` 检查远端版本，**有新版才动**；`--check` 只看不升，
+  `--ref` 指定分支/标签，`--force` 同版本重装，`--no-restart` 不重启节点。
+- 两条路线：git 仓库走 `fetch` + `merge --ff-only`（可回滚到指定提交）；
+  非 git 安装走源码包（GitHub + jsdelivr + 三个镜像依次回退）。
+- **只升代码，不碰数据**：`CODE_FILES` 白名单，配置/身份/登记表/审计/邮箱
+  一律不覆盖。
+- 升级前整目录备份到 `~/.mcp-fleet/up-backups/`（**不在仓库内**——放旁边会
+  立刻变成未提交改动，把下一次升级永久挡住）；升级后跑一次 `--version` 自检，
+  不过就自动回滚。
+- 远端版本坏了会记录到 `up-state.json`，下次自动跳过，不再反复「升一遍回滚一遍」。
+- 工作区有未提交改动时拒绝升级（不替你 stash/reset），`--force` 才强推。
+- 版本比较按**数字三元组**：字符串比较会认为 `5.10.0 < 5.9.0`，升级功能直接失效。
+
+### macOS 适配（本次重点）
+- **launchd 的 PATH**：launchd 起的进程只有 `/usr/bin:/bin:/usr/sbin:/sbin`，
+  Homebrew 的 git/node/ffmpeg 全在 `/opt/homebrew/bin`——不补 PATH，
+  `fleet exec` 里跑这些命令一律 command not found。plist 现在显式写
+  `EnvironmentVariables`（PATH/HOME/LANG/LC_ALL）。PATH 只取固定白名单 +
+  存在性检查，**不继承安装者当时的临时环境**。
+- **`fleet stop` 真的能停了**：装了 launchd 服务后只 kill pid，KeepAlive 会在
+  10 秒内把进程拉回来。现在走 `bootout` + `disable`（并 enable 反向恢复）。
+- **`fleet start` 不再绕过 launchd**：发现 plist 就用 `bootstrap` + `kickstart`，
+  开机自启与崩溃重拉才真正生效；launchctl 失败才退回直接 spawn。
+- **`_lan_ip` 按 en0/en1 取址**：开了 Tailscale 出口节点时默认路由走 utun，
+  原实现会把隧道地址当成局域网地址广播出去，局域网里谁都连不上。
+- `fleet` 控制台在 macOS 上直接提示：没装 git（`xcode-select --install`）、
+  python 来自 Homebrew（升级大版本后路径会变）、节点没被 launchd 托管
+  （重启不会自启）。
+
+### 修复
+- **`MCPClient` 的连接不是线程安全的**：读线程和写线程共用一个
+  `http.client` 连接会抛 `CannotSendRequest: Request-sent`，交互式 shell 直接崩。
+  现在 `_post_once` 加锁串行化；`fleet shell` 另开一条写连接，避免长轮询把
+  按键延迟拖到 200ms。
+- **`fleet menu` 从来没绑定处理函数**：`menu` 子命令缺 `set_defaults(func=...)`，
+  执行直接 `AttributeError`。
+- `fleet shell` 在非终端 stdin（管道 / CI）下会抛 `termios.error` 并**泄漏远端会话**；
+  现在给出可读提示并主动关闭会话。
+
+### 版本号
+- 版本同源校验扩展到 **7 处**：新增 `scripts/install.sh` 与
+  `scripts/mcp_agent_config.example.json`。这两处是**功能性**的（前者拼 release
+  下载地址、后者是新装节点的初始 version），漂了不会报错，只会「装出来是旧版」。
+- 本版新增能力，按规则动次版本位：5.2.1 → 5.3.0。
+
+### 测试
+- 新增 `tests/test_upgrade_macos_521.py`（29 项）：版本数字比较、目录布局识别、
+  备份/替换/自检、坏版本状态、launchd 标签与域、plist 渲染与内置兜底一致性。
+- 新增 `tests/test_shell_530.py`（13 项）：真 tty、TERM、增量 offset、
+  resize、会话上限、幂等关闭、远端 exit 后标记结束。
+- 全量 **732 passed, 1 skipped**。
+
+---
+
 ## [5.2.1] — 2026-10-27 · 稳定性回归 + 丝滑度层 + 版本号三段式
 
 这一版把 `fix/fleet-p0-20261027` 分支上做过的稳定性修复重新移植回 v5.2 主线

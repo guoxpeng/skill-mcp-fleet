@@ -60,10 +60,12 @@ import os
 import re
 import shlex
 import shutil
+import signal
 import socket
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -72,7 +74,7 @@ import uuid
 
 # ---------------------------------------------------------------- 基础
 
-VERSION = "5.2.1"
+VERSION = "5.3.0"
 PROTOCOL = "2024-11-05"
 HERE = os.path.dirname(os.path.abspath(__file__))
 
@@ -380,6 +382,10 @@ class MCPClient:
         self.token = (token or "").strip()
         self._pool = None         # 直连 http 时的长连接（见 _PooledHTTP）
         self._ready = False       # 是否已 initialize（延迟握手，见 call()）
+        # http.client 的连接**不是线程安全的**：两个线程同时发请求会把状态机
+        # 打乱，抛 "CannotSendRequest: Request-sent"。交互式 shell 天然是两个
+        # 线程（读/写），所以这里必须串行化；需要并发的场景请各建一个客户端。
+        self._lock = threading.Lock()
 
     # -- 传输层 --------------------------------------------------
     def _post(self, payload, timeout=None, retry=False):
@@ -419,6 +425,10 @@ class MCPClient:
         return MCPError("HTTP %s %s\n     %s" % (code, reason, hint))
 
     def _post_once(self, payload, timeout=None):
+        with self._lock:
+            return self._post_locked(payload, timeout=timeout)
+
+    def _post_locked(self, payload, timeout=None):
         data = json.dumps(payload).encode("utf-8")
         headers = {"Content-Type": "application/json",
                    "Accept": "application/json, text/event-stream",
@@ -1151,9 +1161,181 @@ def cmd_probe(a):
     return 0
 
 
+def cmd_shell(a):
+    """v5.3: 交互式远程 shell（PTY）——这是「替代 ssh」的核心。
+
+    为什么不能拿 exec 拼：ssh 能跑 vim/top/less，是因为远端 stdin 是真终端。
+    exec 每次都是新的非交互进程，`tty` 会告诉你 "not a tty"，全屏程序直接罢工。
+    所以远端用 pty.fork 起一个登录 shell，这边把终端设成 raw 模式，
+    按键原样送过去、输出原样刷出来，中间的换行/信号/窗口大小都由远端处理。
+
+    传输仍然是请求/响应，所以读用长轮询（wait=0.2s）：一次请求最多等 200ms，
+    有数据立刻返回。这样既不会 50ms 打一次空转，也不会让按键延迟明显。
+    """
+    if os.name == "nt":
+        return die("Windows 暂不支持交互式 shell；请用 fleet exec / exec_async")
+
+    try:
+        import termios
+        import tty
+        import fcntl
+        import struct
+    except ImportError:
+        return die("当前系统缺少 termios，无法进入交互式 shell")
+
+    sync = False if getattr(a, "no_sync", False) else None
+    try:
+        url, meta = resolve_target(a.target, a.agent, a.port, sync=sync)
+    except Exception as e:
+        return die("连不上 %s：%s" % (a.target, e))
+
+    client = MCPClient(url, timeout=max(30, a.timeout), token=meta.get("token", ""),
+                       insecure=getattr(a, "insecure", False))
+    # 读和写各用一条连接：读线程会阻塞在长轮询上（最多 200ms），
+    # 共用一条连接的话按键就得排队等它回来，手感立刻变粘。
+    wclient = MCPClient(url, timeout=max(30, a.timeout), token=meta.get("token", ""),
+                        insecure=getattr(a, "insecure", False))
+
+    def winsize():
+        try:
+            sz = fcntl.ioctl(sys.stdout.fileno(), termios.TIOCGWINSZ, b"\0" * 8)
+            rows, cols = struct.unpack("HHHH", sz)[:2]
+            return max(20, cols), max(5, rows)
+        except Exception:
+            return 80, 24
+
+    cols, rows = winsize()
+    try:
+        text, is_err = client.call("shell_open", {
+            "cols": cols, "rows": rows,
+            "term": os.environ.get("TERM") or "xterm-256color",
+            "workDir": getattr(a, "cwd", "") or ""}, timeout=30)
+    except MCPError as e:
+        return die("打开会话失败：%s" % e)
+    if is_err:
+        print(err("[x] ") + text)
+        return 1
+    try:
+        sid = json.loads(text)["session_id"]
+    except Exception:
+        return die("副端返回异常：%s" % text[:200])
+
+    print(dim("已连接 %s（%s）· 退出：Ctrl-D 或 exit" % (a.target, url)))
+    print(dim("─" * 60))
+
+    stdin_fd = sys.stdin.fileno()
+    out = sys.stdout.buffer
+    stop = threading.Event()
+    offset = [0]
+    state = {"alive": True}
+
+    def pump():
+        """把远端输出刷到本地终端。"""
+        while not stop.is_set():
+            try:
+                t, e = client.call("shell_read", {"session_id": sid,
+                                                  "offset": offset[0], "wait": 0.2},
+                                   timeout=30)
+            except MCPError:
+                break
+            if e:
+                break
+            try:
+                d = json.loads(t)
+            except Exception:
+                break
+            offset[0] = d.get("offset", offset[0])
+            chunk = d.get("data_b64") or ""
+            if chunk:
+                try:
+                    out.write(base64.b64decode(chunk))
+                    out.flush()
+                except Exception:
+                    pass
+            if not d.get("alive", True):
+                state["alive"] = False
+                stop.set()
+                break
+
+    def on_resize(_signum, _frame):
+        c, r = winsize()
+        try:
+            wclient.call("shell_resize", {"session_id": sid, "cols": c, "rows": r},
+                         timeout=10)
+        except Exception:
+            pass
+
+    old_winch = None
+    try:
+        old_winch = signal.getsignal(signal.SIGWINCH)
+        signal.signal(signal.SIGWINCH, on_resize)
+    except Exception:
+        pass
+
+    reader = threading.Thread(target=pump, daemon=True)
+    old_attrs = None
+    try:
+        old_attrs = termios.tcgetattr(stdin_fd)
+    except Exception as e:
+        # stdin 不是终端（管道、/dev/null、CI）：raw 模式没法开，但会话已经建好了，
+        # 必须在这里关掉，否则远端会留一个孤儿 shell。
+        try:
+            wclient.call("shell_close", {"session_id": sid}, timeout=10)
+        except Exception:
+            pass
+        client.close()
+        wclient.close()
+        return die("当前 stdin 不是终端（%s），交互式 shell 需要真终端。"
+                   "非交互场景请用：fleet exec %s \"<命令>\"" % (e, a.target))
+    try:
+        reader.start()
+        tty.setraw(stdin_fd)
+        import select as _select
+        while state["alive"]:
+            # 不能直接阻塞在 os.read(stdin)：远端 `exit` 之后本地没人按键盘，
+            # 这里会一直卡着，用户以为连接没断。用 select 带超时轮询，
+            # 每 0.2 秒检查一次远端会话是否还活着。
+            r, _, _ = _select.select([stdin_fd], [], [], 0.2)
+            if not r:
+                continue
+            try:
+                data = os.read(stdin_fd, 4096)
+            except OSError:
+                break
+            if not data:
+                break
+            try:
+                wclient.call("shell_write", {
+                    "session_id": sid,
+                    "data_b64": base64.b64encode(data).decode("ascii")}, timeout=30)
+            except MCPError:
+                break
+    except KeyboardInterrupt:
+        pass
+    finally:
+        stop.set()
+        try:
+            termios.tcsetattr(stdin_fd, termios.TCSADRAIN, old_attrs)
+        except Exception:
+            pass
+        if old_winch is not None:
+            try:
+                signal.signal(signal.SIGWINCH, old_winch)
+            except Exception:
+                pass
+        try:
+            wclient.call("shell_close", {"session_id": sid}, timeout=10)
+        except Exception:
+            pass
+        client.close()
+        wclient.close()
+        print()
+        print(dim("会话已结束。"))
+    return 0
+
+
 def cmd_ping(a):
     """轻探活：只 GET /，不握手、不列工具、不 exec。
-
     给健康看门/脚本用。握手要三次往返，探活只需要知道「HTTP 层活着」；
     分清楚这一点，看门才能在 5 分钟一轮的频率下不把节点压垮。
     退出码：0 可达 / 1 不可达（脚本可直接判）。
@@ -2032,6 +2214,19 @@ def cmd_directory(a):
 # ---------------------------------------------------------------- 对等配对（v3.5）
 
 def _lan_ip():
+    """本机局域网 IPv4。
+
+    macOS 上不能只用「连 10.255.255.255 看源地址」这一招：开了 Tailscale
+    出口节点（exit node）或全局 VPN 时，默认路由会走 utun*，拿到的是隧道
+    地址，于是节点对外广播一个局域网里谁都连不上的 URL。
+    所以 darwin 先问 en0/en1（Wi-Fi / 有线），拿不到再退回路由探测。
+    """
+    if sys.platform == "darwin":
+        for iface in ("en0", "en1", "en2"):
+            rc, out = _sh(["ipconfig", "getifaddr", iface], timeout=5)
+            ip = (out or "").strip()
+            if rc == 0 and re.match(r"^\d+\.\d+\.\d+\.\d+$", ip) and not ip.startswith("127."):
+                return ip
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
         s.connect(("10.255.255.255", 1))
@@ -2966,6 +3161,464 @@ def cmd_update(a):
                 pass
 
 
+# ------------------------------------------------ 脚本自升级（fleet up）
+# 与 `fleet update` 的分工：
+#   fleet update  = 升级**节点运行时**（走安装器 + Release 包 + SHA256）
+#   fleet up      = 升级**本地源码**（走 git 或 tarball），装的是 CLI 本体
+# 为什么两个都要：`fleet` 是用户每天敲的那个命令，它必须能自己更新；
+# 而节点是常驻服务，升级要停服务、要校验、要回滚，风险等级不一样。
+REPO_SLUG = "guoxpeng/skill-mcp-fleet"
+
+# 只替换这些代码文件。**永不触碰**配置/身份/数据——升级不能把人家的节点升没了。
+CODE_FILES = [
+    "mcp_agent.py", "fleet_proto.py", "fleet_core.py", "fleet_agent.py",
+    "fleet_install.py", "fleet.py", "dashboard_html.py", "fleet_watch.py",
+    "install.sh", "mcp_agent_config.example.json",
+]
+# 这些即使出现在升级包里也拒绝覆盖（双保险，白名单本来就不会碰）
+RUNTIME_FILES = [
+    "mcp_agent_config.json", "identity.json", "nodes.json", "peers.json",
+    "audit.log", "port.txt", "current_url.txt", "mailbox.key", "mailbox.json",
+]
+
+
+def parse_version(s):
+    """'5.2.1' → (5, 2, 1)；不是三段式返回 None。
+
+    必须按数字比，不能按字符串比：字符串比较会认为 "5.10.0" < "5.9.0"，
+    于是「远端有新版」被判定成「本地更新」，升级功能直接失效。
+    """
+    m = re.match(r"^\s*v?(\d+)\.(\d+)\.(\d+)\s*$", s or "")
+    if not m:
+        return None
+    return tuple(int(x) for x in m.groups())
+
+
+def ver_cmp(a, b):
+    """比较两个版本串，返回 -1/0/1；任一侧非法返回 None。"""
+    ta, tb = parse_version(a), parse_version(b)
+    if ta is None or tb is None:
+        return None
+    return (ta > tb) - (ta < tb)
+
+
+def _code_dir(root):
+    """源码仓库里代码在 scripts/；安装后的节点目录里代码在顶层。"""
+    if os.path.isfile(os.path.join(root, "scripts", "mcp_agent.py")):
+        return os.path.join(root, "scripts")
+    if os.path.isfile(os.path.join(root, "mcp_agent.py")):
+        return root
+    return ""
+
+
+def _repo_root():
+    """fleet.py 所在目录的上一级（仓库根）；安装目录下则就是该目录本身。"""
+    d = HERE
+    if os.path.isdir(os.path.join(d, ".git")) or os.path.isfile(
+            os.path.join(d, "..", "SKILL.md")):
+        return os.path.dirname(d) if os.path.basename(d) == "scripts" else d
+    if os.path.isfile(os.path.join(d, "mcp_agent.py")):
+        return d
+    return os.path.dirname(d)
+
+
+def _git_run(root, *args, **kw):
+    """跑一条 git 命令，返回 (rc, stdout, stderr)。找不到 git 返回 rc=127。"""
+    exe = shutil.which("git")
+    if not exe:
+        hint = ("未安装 git。macOS 上执行：xcode-select --install"
+                if sys.platform == "darwin"
+                else "未安装 git（Debian/Ubuntu: apt install git；"
+                     "OpenWrt: opkg install git-http）")
+        return 127, "", hint
+    env = dict(os.environ)
+    # 避免 git 在无 tty 时卡住等密码 / 弹编辑器
+    env["GIT_TERMINAL_PROMPT"] = "0"
+    env["GIT_ASKPASS"] = env.get("GIT_ASKPASS", "true")
+    env.setdefault("GIT_PAGER", "cat")
+    try:
+        r = subprocess.run([exe] + list(args), cwd=root, capture_output=True,
+                           text=True, timeout=kw.get("timeout", 90), env=env)
+        return r.returncode, (r.stdout or "").strip(), (r.stderr or "").strip()
+    except subprocess.TimeoutExpired:
+        return 124, "", "超时"
+    except Exception as e:
+        return 1, "", str(e)
+
+
+def _is_git_repo(root):
+    return os.path.isdir(os.path.join(root, ".git")) and bool(shutil.which("git"))
+
+
+def _version_in_source(text):
+    """从 fleet.py 源码里抠出 VERSION。"""
+    m = re.search(r'^VERSION\s*=\s*"([^"]+)"', text or "", re.M)
+    return m.group(1) if m else ""
+
+
+def _mirror_urls(path, ref="main"):
+    """给同一个仓库文件生成多条下载地址（国内直连 GitHub 经常不通）。"""
+    raw = "https://raw.githubusercontent.com/%s/%s/%s" % (REPO_SLUG, ref, path)
+    return [
+        raw,
+        "https://cdn.jsdelivr.net/gh/%s@%s/%s" % (REPO_SLUG, ref, path),
+        "https://ghfast.top/" + raw,
+        "https://ghproxy.net/" + raw,
+        "https://gh-proxy.com/" + raw,
+    ]
+
+
+def _http_get(url, timeout=20, limit=4 * 1024 * 1024):
+    req = urllib.request.Request(url, headers={"User-Agent": "mcp-fleet-up/%s" % VERSION})
+    with _opener_for(url).open(req, timeout=timeout) as resp:
+        return _read_capped(resp, limit)
+
+
+def _remote_version_git(root, ref):
+    """git 路线：fetch 后直接读 FETCH_HEAD 里的 fleet.py，返回 (版本, sha, 说明)。
+
+    这里**不能**用 `--depth=1`：浅拉取会给 FETCH_HEAD 造一个没有共同祖先的
+    历史，紧接着的 `merge --ff-only` 必然报 "refusing to merge unrelated
+    histories"，升级 100% 失败。仓库总共 1MB 出头，全量 fetch 的代价可以忽略。
+    """
+    rc, _, err = _git_run(root, "fetch", "--quiet", "origin", ref, timeout=120)
+    if rc != 0:
+        return "", "", err or ("git fetch 失败（rc=%d）" % rc)
+    # 浅克隆（`git clone --depth=1`，慢网/CI 常见）的仓库没有共同祖先，
+    # 后面的 `merge --ff-only` 一定失败。这里先补全历史，一次修好不再复发。
+    rc_s, shallow, _ = _git_run(root, "rev-parse", "--is-shallow-repository")
+    if rc_s == 0 and shallow.strip() == "true":
+        _git_run(root, "fetch", "--quiet", "--unshallow", "origin", ref, timeout=300)
+        _git_run(root, "fetch", "--quiet", "origin", ref, timeout=120)
+    rc, sha, _ = _git_run(root, "rev-parse", "FETCH_HEAD")
+    sha = sha.strip()
+    if rc != 0 or not sha:
+        return "", "", "拿不到 FETCH_HEAD"
+    rel = os.path.relpath(os.path.join(HERE, "fleet.py"), root).replace(os.sep, "/")
+    rc, blob, err = _git_run(root, "show", "%s:%s" % (sha, rel))
+    if rc != 0:
+        return "", sha, "远端没有 %s（%s）" % (rel, err)
+    ver = _version_in_source(blob)
+    return ver, sha, "" if ver else "远端 fleet.py 里没有 VERSION"
+
+
+def _remote_version_http(ref):
+    """非 git 路线：先按 commit sha 取（不受 CDN 旧缓存影响），再按 ref 取。"""
+    path = "scripts/fleet.py"
+    candidates = []
+    try:
+        api = "https://api.github.com/repos/%s/commits/%s" % (REPO_SLUG, ref)
+        data = json.loads(_http_get(api, timeout=15, limit=512 * 1024).decode("utf-8"))
+        sha = (data.get("sha") or "").strip()
+        if sha and all(c in "0123456789abcdef" for c in sha.lower()):
+            candidates.extend(_mirror_urls(path, sha))
+    except Exception:
+        pass
+    candidates.extend(_mirror_urls(path, ref))
+    last = ""
+    for url in candidates:
+        try:
+            body = _http_get(url, timeout=20, limit=2 * 1024 * 1024)
+            ver = _version_in_source(body.decode("utf-8", "ignore"))
+            if ver:
+                return ver, "", ""
+            last = "下载到的 fleet.py 里没有 VERSION"
+        except Exception as e:
+            last = str(e)
+    return "", "", last or "所有下载地址都失败"
+
+
+def _up_state_path():
+    return os.path.join(os.path.expanduser("~"), ".mcp-fleet", "up-state.json")
+
+
+def _load_up_state():
+    try:
+        with open(_up_state_path(), encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def _save_up_state(state):
+    path = _up_state_path()
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(state, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, path)
+    except Exception:
+        pass
+
+
+def _backup_code_dir(cdir, stamp, tag=""):
+    """把当前代码目录整份复制到仓库**外面**的备份区，返回备份路径。
+
+    为什么不能放在代码目录旁边：备份目录会立刻出现在 `git status` 里，
+    下一次 `fleet up` 就会被「工作区有未提交改动」挡住，永远升不了级；
+    而且整目录复制会把自己也复制进去，越滚越大。
+    所以统一放到 ~/.mcp-fleet/up-backups/ 下，与仓库彻底隔离。
+    """
+    base = os.path.join(os.path.expanduser("~"), ".mcp-fleet", "up-backups")
+    name = "%s-%s" % (tag or os.path.basename(os.path.dirname(cdir)), stamp)
+    dst = os.path.join(base, name)
+    try:
+        if os.path.isdir(dst):
+            shutil.rmtree(dst, ignore_errors=True)
+        os.makedirs(base, exist_ok=True)
+        shutil.copytree(cdir, dst, symlinks=True,
+                        ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
+        return dst
+    except Exception:
+        return ""
+
+
+def _install_from_dir(src_dir, cdir):
+    """把 src_dir 里的代码文件原子替换进 cdir。返回 (替换数, 跳过数, 错误)。"""
+    done = skipped = 0
+    for name in CODE_FILES:
+        if name in RUNTIME_FILES:
+            skipped += 1
+            continue
+        src = os.path.join(src_dir, name)
+        if not os.path.isfile(src):
+            skipped += 1
+            continue
+        dst = os.path.join(cdir, name)
+        tmp = dst + ".new"
+        try:
+            shutil.copy2(src, tmp)
+            os.replace(tmp, dst)      # 原子替换：断电也不会留半个文件
+            done += 1
+        except Exception as e:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            return done, skipped, "替换 %s 失败：%s" % (name, e)
+    return done, skipped, ""
+
+
+def _verify_code(cdir, expect):
+    """升级后用子进程跑一次 --version，确认新代码真的能跑。"""
+    target = os.path.join(cdir, "fleet.py")
+    if not os.path.isfile(target):
+        return False, "找不到 %s" % target
+    try:
+        r = subprocess.run([sys.executable, target, "--version"],
+                           capture_output=True, text=True, timeout=60)
+    except Exception as e:
+        return False, "自检无法执行：%s" % e
+    out = ((r.stdout or "") + (r.stderr or "")).strip()
+    if r.returncode != 0:
+        return False, "新版本 --version 退出码 %d：%s" % (r.returncode, out[:200])
+    if expect and expect not in out:
+        return False, "自检版本不符：期望 %s，实际 %s" % (expect, out[:120])
+    return True, out
+
+
+def cmd_up(a):
+    """v5.2.1: 从 git 拉最新代码升级本地脚本。
+
+    三条硬规则：
+      1. 只升代码，不碰配置/身份/数据（CODE_FILES 白名单）。
+      2. 升级前整目录备份，升级后跑一次 --version 自检；自检不过自动回滚。
+      3. 有未提交改动就拒绝升级，而不是替用户 stash/reset —— 那是开发者的代码，
+         不是我们能替他决定去留的东西（--force 才强推）。
+    """
+    root = _repo_root()
+    cdir = _code_dir(root)
+    if not cdir:
+        return die("找不到源码目录（既没有 scripts/mcp_agent.py 也没有 mcp_agent.py）")
+    ref = (getattr(a, "ref", "") or "main").strip()
+    check_only = bool(getattr(a, "check", False))
+    force = bool(getattr(a, "force", False))
+    restart = not bool(getattr(a, "no_restart", False))
+
+    print("=" * 60)
+    print("  MCP Fleet 自升级 · 当前 v%s" % VERSION)
+    print("=" * 60)
+    print(dim("    代码目录: %s" % cdir))
+    print(dim("    目标分支: %s" % ref))
+
+    is_git = _is_git_repo(root)
+    print(dim("    升级方式: %s" % ("git（可回滚到指定提交）" if is_git
+                                    else "下载源码包（非 git 安装）")))
+
+    # 1) 问远端
+    remote_ver, remote_sha, why = ("", "", "")
+    if is_git:
+        remote_ver, remote_sha, why = _remote_version_git(root, ref)
+        if not remote_ver:
+            # git 路线失败（常见于没配 remote / 无外网），退回 HTTP 探一下版本
+            print(warn("    git 取版本失败：%s" % why))
+            remote_ver, _, why = _remote_version_http(ref)
+    else:
+        remote_ver, _, why = _remote_version_http(ref)
+
+    if not remote_ver:
+        print(err("[x] ") + "取不到远端版本：%s" % why)
+        print(dim("    可能原因：没联网、GitHub 不可达、分支名不对。"))
+        print(dim("    手动升级：git pull  或  sh scripts/install.sh --offline ."))
+        return 1
+
+    cmp = ver_cmp(VERSION, remote_ver)
+    if cmp is None:
+        return die("版本号不是三段式，无法比较：本地 %r 远端 %r" % (VERSION, remote_ver))
+
+    print(dim("    远端版本: v%s%s" % (remote_ver,
+                                      ("  (%s)" % remote_sha[:8]) if remote_sha else "")))
+    if cmp == 0 and not force:
+        print(ok("[+] ") + "已是最新（v%s），不用升级。" % VERSION)
+        if getattr(a, "json", False):
+            print(json.dumps({"current": VERSION, "remote": remote_ver,
+                              "updated": False}, ensure_ascii=False))
+        return 0
+    if cmp > 0 and not force:
+        print(warn("[!] ") + "本地 v%s 比远端 v%s 还新（可能你在自己开发）。"
+              % (VERSION, remote_ver))
+        print(dim("    确实要用远端覆盖本地，加 --force。"))
+        return 0
+
+    if check_only:
+        print()
+        print(ok("有新版：v%s → v%s" % (VERSION, remote_ver)))
+        print(dim("    执行升级：fleet up"))
+        if getattr(a, "json", False):
+            print(json.dumps({"current": VERSION, "remote": remote_ver,
+                              "updated": False, "available": True},
+                             ensure_ascii=False))
+        return 0
+
+    # 2.5) 上次这个版本升级失败过？别再自动重试一遍折磨用户
+    state = _load_up_state()
+    if (not force and state.get("bad_version") == remote_ver
+            and state.get("bad_sha") in ("", None, remote_sha)):
+        print(warn("[!] ") + "远端 v%s 上次升级后自检失败，已自动跳过。" % remote_ver)
+        why2 = (state.get("reason") or "未知").replace("\n", " ")
+        print(dim("    原因：%s" % (why2[:120] + ("…" if len(why2) > 120 else ""))))
+        print(dim("    等上游修好，或确认要重试：fleet up --force"))
+        return 1
+
+    # 2) 未提交改动保护（仅 git 路线）
+    if is_git:
+        rc, dirty, _ = _git_run(root, "status", "--porcelain")
+        if rc == 0 and dirty.strip() and not force:
+            print(err("[x] ") + "工作区有未提交改动，拒绝升级（避免覆盖你的代码）：")
+            for line in dirty.strip().splitlines()[:10]:
+                print("      " + line)
+            print(dim("    先提交/暂存，或加 --force 用远端覆盖。"))
+            return 1
+
+    # 3) 备份
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    backup = _backup_code_dir(cdir, stamp)
+    if not backup:
+        return die("备份失败（%s 不可写？），已中止升级" % cdir)
+    print(dim("    已备份: %s" % backup))
+
+    old_head = ""
+    if is_git:
+        rc, old_head, _ = _git_run(root, "rev-parse", "HEAD")
+
+    # 4) 落地
+    if is_git:
+        rc, out, err2 = _git_run(root, "merge", "--ff-only", "FETCH_HEAD", timeout=120)
+        if rc != 0:
+            print(err("[x] ") + "git 合并失败（本地有分叉提交？）：%s" % (err2 or out))
+            print(dim("    代码未改动。需要强推可执行：git reset --hard origin/%s" % ref))
+            return 1
+    else:
+        import tarfile
+        tmpdir = tempfile.mkdtemp(prefix="fleet-up-")
+        try:
+            tar_path = os.path.join(tmpdir, "src.tar.gz")
+            url = "https://github.com/%s/archive/refs/heads/%s.tar.gz" % (REPO_SLUG, ref)
+            got = False
+            for cand in [url, "https://ghfast.top/" + url, "https://ghproxy.net/" + url]:
+                try:
+                    data = _http_get(cand, timeout=60, limit=40 * 1024 * 1024)
+                    with open(tar_path, "wb") as f:
+                        f.write(data)
+                    got = True
+                    break
+                except Exception:
+                    continue
+            if not got:
+                return die("源码包下载失败（GitHub 及镜像都不通）")
+            with tarfile.open(tar_path, "r:gz") as tf:
+                # 只允许普通文件，防止畸形包用绝对路径/软链写到目录外
+                for m in tf.getmembers():
+                    if m.name.startswith("/") or ".." in m.name.split("/"):
+                        return die("源码包含非法路径：%s" % m.name)
+                try:
+                    # Python 3.12+ 默认会对不安全成员告警；显式 data 过滤更稳。
+                    # 3.6–3.11 没有 filter 参数，TypeError 回退。
+                    tf.extractall(tmpdir, filter="data")
+                except TypeError:
+                    tf.extractall(tmpdir)
+            subs = [d for d in os.listdir(tmpdir)
+                    if os.path.isdir(os.path.join(tmpdir, d))]
+            if not subs:
+                return die("源码包结构异常（没有顶层目录）")
+            src_cdir = _code_dir(os.path.join(tmpdir, subs[0]))
+            if not src_cdir:
+                return die("源码包里找不到代码文件")
+            done, skipped, err3 = _install_from_dir(src_cdir, cdir)
+            if err3:
+                return die(err3)
+            print(dim("    已替换 %d 个代码文件（跳过 %d）" % (done, skipped)))
+        finally:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+    # 5) 自检 + 自动回滚
+    okv, detail = _verify_code(cdir, remote_ver)
+    if not okv:
+        print(err("[x] ") + "新版本自检失败，正在回滚…（%s）" % detail)
+        if is_git and old_head:
+            _git_run(root, "reset", "--hard", old_head)
+        else:
+            _install_from_dir(backup, cdir)
+        ok2, d2 = _verify_code(cdir, VERSION)
+        print((ok("[+] ") if ok2 else err("[x] ")) +
+              ("已回滚到 v%s（%s）" % (VERSION, d2) if ok2
+               else "回滚后仍异常：%s，请手工处理 %s" % (d2, backup)))
+        if ok2:
+            st = _load_up_state()
+            st["bad_version"] = remote_ver
+            st["bad_sha"] = remote_sha
+            st["reason"] = detail[:300]
+            st["at"] = time.strftime("%Y-%m-%d %H:%M:%S")
+            _save_up_state(st)
+            print(dim("    已记录：v%s 自检不通过，下次 fleet up 会自动跳过。" % remote_ver))
+        return 1
+
+    print(ok("[+] ") + "升级完成：v%s → v%s" % (VERSION, remote_ver))
+    print(dim("    备份保留在 %s（确认无误后可删）" % backup))
+    st = _load_up_state()
+    if st.pop("bad_version", None):
+        _save_up_state(st)
+
+    # 6) 节点在跑就重启，让新代码真正生效
+    if restart:
+        me = local_node()
+        if me and _local_health(me, timeout=1.5):
+            print(dim("    本机节点在运行，重启以加载新代码…"))
+            rc = cmd_restart(None)
+            if rc != 0:
+                print(warn("    节点重启失败，稍后手动：fleet restart"))
+        elif me:
+            print(dim("    本机节点未运行；下次 fleet 会自动拉起。"))
+
+    if getattr(a, "json", False):
+        print(json.dumps({"current": VERSION, "remote": remote_ver,
+                          "updated": True, "backup": backup},
+                         ensure_ascii=False))
+    return 0
+
+
 def cmd_identity(a):
     """v5.2: 身份备份/恢复（加密导出，避免重新配对全网）。"""
     action = getattr(a, "action", "show") or "show"
@@ -3755,6 +4408,10 @@ def build_parser():
     common(sub.add_parser("probe", help="连通性 + 握手 + 试调（只读）")).set_defaults(func=cmd_probe)
     common(sub.add_parser("ping", help="轻探活：只 GET /，不握手不 exec（看门/脚本用）")
            ).set_defaults(func=cmd_ping)
+    sp = common(sub.add_parser("shell", help="v5.3: 交互式远程 shell（PTY，替代 ssh）"))
+    sp.add_argument("--cwd", default="", help="远端起始目录")
+    sp.add_argument("--insecure", action="store_true", help="跳过 HTTPS 证书校验")
+    sp.set_defaults(func=cmd_shell)
     sp = common(sub.add_parser("doctor", help="完整链路体检；不带 target 时做本机自检"),
                 need_target=False)
     sp.add_argument("target", nargs="?", default=None,
@@ -3969,6 +4626,14 @@ def build_parser():
     sp.add_argument("--offline", action="store_true",
                     help="不联网，使用节点目录里的本地安装器")
     sp.set_defaults(func=cmd_update)
+    sp = sub.add_parser("up", help="v5.2.1: 从 git 升级本地脚本（有新版才动，失败自动回滚）")
+    sp.add_argument("--check", action="store_true", help="只检查有没有新版，不改文件")
+    sp.add_argument("--ref", default="main", help="分支或标签（默认 main）")
+    sp.add_argument("--force", action="store_true",
+                    help="同版本也重装；工作区有改动也用远端覆盖")
+    sp.add_argument("--no-restart", action="store_true", help="升级后不重启本机节点")
+    sp.add_argument("--json", action="store_true", help="输出 JSON")
+    sp.set_defaults(func=cmd_up)
     sp = sub.add_parser("identity", help="v5.2: 身份查看/加密导出/恢复")
     sp.add_argument("action", nargs="?", default="show",
                     choices=["show", "export", "import"])
@@ -4038,6 +4703,7 @@ def build_parser():
     # ==========================================================================
     sp = sub.add_parser("menu", help="中文交互菜单（无参数时默认进入）")
     sp.add_argument("--no-clear", action="store_true", help="不清屏（调试用）")
+    sp.set_defaults(func=cmd_menu)
 
     return p
 
@@ -4194,6 +4860,149 @@ def _default_node_name():
         return "mynode"
 
 
+# ------------------------------------------------ macOS / launchd 适配
+# 为什么单独做一层：macOS 上用 launchd 装节点后，`fleet stop` 直接 kill pid 会
+# 被 KeepAlive 立刻拉回来（用户看到的是「停不掉」）；而 `fleet start` 手动
+# spawn 出来的进程又不受 launchd 管，重启机器就没了。
+# 所以只要发现 plist，就必须走 launchctl，而不是自己 fork。
+
+def _sh(argv, timeout=30):
+    """跑一条外部命令，返回 (rc, stdout+stderr)。不抛异常。"""
+    try:
+        r = subprocess.run(argv, capture_output=True, text=True, timeout=timeout)
+        return r.returncode, ((r.stdout or "") + (r.stderr or "")).strip()
+    except Exception as e:
+        return 1, str(e)
+
+
+def _launchd_dirs():
+    return [os.path.expanduser("~/Library/LaunchAgents"),
+            "/Library/LaunchDaemons",
+            "/Library/LaunchAgents"]
+
+
+def _launchd_plist(name=""):
+    """找本机节点对应的 launchd plist；没有返回空串。
+
+    只认 label 含 mcpfleet 的 plist，避免误抓别的服务。
+    """
+    if sys.platform != "darwin":
+        return ""
+    hits = []
+    for d in _launchd_dirs():
+        try:
+            entries = os.listdir(d)
+        except OSError:
+            continue
+        for f in entries:
+            if f.endswith(".plist") and "mcpfleet" in f.lower():
+                hits.append(os.path.join(d, f))
+    if not hits:
+        return ""
+    if name:
+        low = name.lower()
+        for p in hits:
+            if low in os.path.basename(p).lower():
+                return p
+    return sorted(hits)[0]
+
+
+def _plist_label(path):
+    """从 plist 里读 Label（不引 plistlib 也能读，简单正则足够）。"""
+    try:
+        with open(path, encoding="utf-8") as f:
+            text = f.read()
+    except OSError:
+        return ""
+    m = re.search(r"<key>Label</key>\s*<string>([^<]+)</string>", text)
+    return m.group(1).strip() if m else ""
+
+
+def _launchd_domain(plist):
+    """LaunchAgents 属于 gui/<uid>，LaunchDaemons 属于 system。"""
+    if "/LaunchDaemons/" in plist:
+        return "system"
+    return "gui/%d" % os.getuid()
+
+
+def _launchd_start(plist):
+    """注册并启动。返回 (ok, 说明)。
+
+    优先用 bootstrap/kickstart（10.11+ 的正式接口），失败再退回 load -w。
+    先 enable：上次 `fleet stop` 会把它 disable 掉，不 enable 是拉不起来的。
+    """
+    label = _plist_label(plist)
+    domain = _launchd_domain(plist)
+    if not label:
+        return False, "plist 里没有 Label"
+    _sh(["launchctl", "enable", "%s/%s" % (domain, label)])
+    rc, out = _sh(["launchctl", "bootstrap", domain, plist], timeout=60)
+    if rc != 0:
+        rc2, out2 = _sh(["launchctl", "load", "-w", plist], timeout=60)
+        if rc2 != 0:
+            return False, out or out2
+    _sh(["launchctl", "kickstart", "-k", "%s/%s" % (domain, label)], timeout=30)
+    return True, label
+
+
+def _launchd_stop(plist):
+    """停掉并**禁止自动拉起**。返回 (ok, 说明)。
+
+    只 kill 进程没用：KeepAlive=true 会在 10 秒内重启它。
+    必须先 bootout（或 unload -w）把服务本身摘掉，再 disable 记住「别再起来」。
+    """
+    label = _plist_label(plist)
+    domain = _launchd_domain(plist)
+    if not label:
+        return False, "plist 里没有 Label"
+    rc, out = _sh(["launchctl", "bootout", "%s/%s" % (domain, label)], timeout=30)
+    if rc != 0:
+        rc, out = _sh(["launchctl", "unload", "-w", plist], timeout=30)
+    _sh(["launchctl", "disable", "%s/%s" % (domain, label)])
+    return True, label
+
+
+def _launchd_status(plist):
+    """返回 (已注册, 进程是否活着, 原文)。"""
+    label = _plist_label(plist)
+    if not label:
+        return False, False, ""
+    rc, out = _sh(["launchctl", "list"], timeout=15)
+    for line in (out or "").splitlines():
+        parts = line.split()
+        if len(parts) >= 3 and parts[2] == label:
+            pid = parts[0]
+            return True, pid not in ("-", "0"), line.strip()
+    return False, False, ""
+
+
+def _macos_advice(me=None):
+    """macOS 专属的「为什么不好使」提示。只列真的会咬人的那几条。
+
+    这些都是实测踩过的：不是理论风险，是用户会直接来问「为什么不行」的那种。
+    """
+    tips = []
+    if sys.platform != "darwin":
+        return tips
+    if not shutil.which("git"):
+        tips.append(("warn", "没装 git，fleet up 用不了。装：xcode-select --install"))
+    py = (sys.executable or "")
+    if py.startswith(("/opt/homebrew", "/usr/local/Cellar")):
+        tips.append(("info", "当前 python 来自 Homebrew（%s）。brew 升级大版本后路径会变，"
+                             "节点可能起不来；届时重跑 fleet start 或重装即可。" % py))
+    if me:
+        plist = _launchd_plist(me.get("name", ""))
+        if plist:
+            reg, alive, _line = _launchd_status(plist)
+            if not reg:
+                tips.append(("warn", "装了 launchd 服务但当前未注册；fleet start 可恢复开机自启。"))
+        else:
+            tips.append(("info", "本机节点不是由 launchd 托管的：重启机器后不会自动起来。"
+                                 "要开机自启请用安装器重装（sh scripts/install.sh ...）。"))
+    return tips
+
+
+
 def _node_pid_path(d):
     return os.path.join(d, "run", "node.pid")
 
@@ -4241,6 +5050,26 @@ def cmd_start(a):
     agent = os.path.join(d, "mcp_agent.py")
     if not os.path.isfile(agent):
         return die("找不到 %s（节点目录不完整，建议重装）" % agent)
+
+    # macOS：装了 launchd 服务就必须走 launchctl。
+    # 自己 fork 一个进程虽然也能起来，但它不受 launchd 管：
+    # 重启机器不会自启、崩溃不会重拉，还和 KeepAlive 抢同一个端口。
+    plist = _launchd_plist(me.get("name", ""))
+    if plist:
+        okv, detail = _launchd_start(plist)
+        if okv:
+            for _ in range(24):
+                time.sleep(0.25)
+                if _local_health(me, timeout=1):
+                    print(ok("[+] ") + "本机节点已启动（launchd %s）：%s  %s"
+                          % (detail, me["name"], me["url"]))
+                    print(dim("    开机自启 + 崩溃重拉已生效；停止用 fleet stop"))
+                    return 0
+            print(err("[x] ") + "launchd 已注册但健康检查没通，看日志：")
+            print("    tail -30 %s" % os.path.join(d, "agent.log"))
+            return 1
+        print(warn("[!] ") + "launchctl 启动失败（%s），退回直接启动。" % detail)
+
     # 监听地址：有令牌才敢对外，否则只绑本机（与安装器的安全默认一致）
     host = "0.0.0.0" if me.get("token") else "127.0.0.1"
     try:
@@ -4301,6 +5130,28 @@ def cmd_stop(a):
     if not me:
         return die("本机没有节点。")
     d = me["dir"]
+
+    # macOS：先摘 launchd 服务，否则 KeepAlive 会在 10 秒内把进程重新拉起来，
+    # 用户看到的现象就是「fleet stop 说停了，过一会儿又活了」。
+    plist = _launchd_plist(me.get("name", ""))
+    if plist:
+        registered, alive, line = _launchd_status(plist)
+        okv, detail = _launchd_stop(plist)
+        if not okv:
+            print(warn("[!] ") + "launchctl 停止失败（%s），退回按 pid 停止。" % detail)
+        else:
+            for _ in range(20):
+                time.sleep(0.2)
+                if not _local_health(me, timeout=1):
+                    break
+            try:
+                os.unlink(_node_pid_path(d))
+            except Exception:
+                pass
+            print(ok("[+] ") + "本机节点已停止（launchd %s，已禁止自动拉起）" % detail)
+            print(dim("    重新启动：fleet start"))
+            return 0
+
     pid = _read_pid(d) or _find_listener_pid(int(me["url"].rsplit(":", 1)[-1].split("/")[0]
                                                or 3100))
     if not pid or not _pid_alive(pid):
@@ -4398,6 +5249,10 @@ def show_fleet_status():
         print("    指纹 %s · 鉴权 %s" % (me.get("fingerprint") or "-",
                                         "已开启" if me.get("token") else "未开启"))
 
+    # macOS 上真正会咬人的那几条，直接说清楚，别让人去猜
+    for level, text in _macos_advice(me):
+        print(("    " + warn("[!] ") if level == "warn" else "    " + dim("· ")) + text)
+
     # 对端：一眼看到连了几台
     online, total, rows = _peer_summary(timeout=2)
     print("\n  【对端】已连接 %s / %d 台" % (ok(str(online)) if online else warn(str(online)), total))
@@ -4427,13 +5282,15 @@ def show_fleet_status():
     fleet start / stop / restart         启停本机节点
     fleet status / nodes / doctor        节点状态、对端、体检
     fleet ping <节点>                    一秒探活（只 GET /，不握手）
+    fleet shell <节点>                   交互式 shell（PTY，可跑 vim/top，替代 ssh）
     fleet exec <节点> "<命令>"            在别的设备上执行
     fleet cp ./f.py nas:/opt/f.py        推代码；反向即拉回来
     fleet scan [网段]                    主动找同网段节点（--add 直接登记）
     fleet tailnet [status|sync|up]       Tailscale 状态 / 地址自愈 / 起隧道
     fleet selfcheck                      只读自检（可机读故障列表）
     fleet repair [--auto]                自修复：先给计划；--auto 有界自动修复
-    fleet update [--rollback]            升级 / 回滚（SHA256 校验）
+    fleet up [--check]                   升级本地脚本（git 有新版才动，失败自动回滚）
+    fleet update [--rollback]            升级 / 回滚本机节点服务
     fleet ask "<自然语言>" [--run]        生成计划 + 只读诊断
     fleet prompt [主题]                  查看内置提示词（可直接粘给 AI）
     fleet invite --qr / join <URI>       邀请配对
@@ -4518,6 +5375,7 @@ def cmd_menu(a):
 
   【远程操控】
    [8] 执行命令（exec）          [9] 调用工具（call）
+  [20] 交互式 shell（替代 ssh）
   [10] 列远端工具清单（tools）
 
   【消息与拓扑】
@@ -4532,13 +5390,14 @@ def cmd_menu(a):
   【自愈与提示词】
   [17] 本机自检 / 自修复（selfcheck + repair）
   [18] 查看 AI 提示词（prompt）
+  [19] 升级本地脚本（up）
 
   [0] 退出""")
         print("")
         print("  提示词速用：fleet prompt self_repair  然后原样粘给 AI 客户端。")
         print()
         try:
-            choice = input("  请选择 (0-16): ").strip()
+            choice = input("  请选择 (0-20): ").strip()
         except (EOFError, KeyboardInterrupt):
             print("\n  再见！")
             return 0
@@ -4743,6 +5602,22 @@ def cmd_menu(a):
             _banner()
             print(prompt_text())
             input("\n  按回车继续...")
+
+        elif choice == "19":
+            _banner()
+            args = argparse.Namespace(check=False, ref="main", force=False,
+                                      no_restart=False, json=False)
+            cmd_up(args)
+            input("\n  按回车继续...")
+
+        elif choice == "20":
+            _banner()
+            name = _pick_node("要连接哪台设备: ")
+            if name:
+                args = argparse.Namespace(target=name, agent="auto", port=3100,
+                                          timeout=60, json=False, no_sync=False,
+                                          cwd="", insecure=False)
+                cmd_shell(args)
 
         else:
             print("  无效选择，按回车继续...")

@@ -20,3 +20,6 @@ agent/
 tasks/
 scripts/agent/
 scripts/tasks/
+
+# WorkBuddy 本地项目记忆（不随代码发布）
+.workbuddy-ai/

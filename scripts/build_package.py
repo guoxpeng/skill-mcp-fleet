@@ -26,7 +26,7 @@ import zipfile
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
-DEFAULT_VERSION = "5.2.1"
+DEFAULT_VERSION = "5.3.0"
 MAX_FILES = 30
 MAX_BYTES = 40 * 1024 * 1024
 SKILL_NAME = "mcp-fleet"
@@ -36,12 +36,16 @@ SKILL_NAME = "mcp-fleet"
 VERSION_RE = re.compile(r"^\d+\.\d+\.\d+$")
 
 # 版本号散落在多处，必须同源。任何一处漂移都算校验失败。
+# 注意 install.sh 与 example json 里的版本是**功能性**的：前者拼 release 下载地址，
+# 后者是新装节点的初始 version。它们漂了不会报错，只会「装出来是旧版」——最难查。
 VERSION_SOURCES = [
     ("scripts/fleet.py", re.compile(r'^VERSION = "([^"]+)"', re.M)),
     ("scripts/fleet_core.py", re.compile(r'^VERSION = "([^"]+)"', re.M)),
     ("scripts/fleet_agent.py", re.compile(r'^VERSION = "([^"]+)"', re.M)),
     ("scripts/fleet_install.py", re.compile(r'^VERSION = "([^"]+)"', re.M)),
     ("scripts/mcp_agent.py", re.compile(r'"version": "([^"]+)",', re.M)),
+    ("scripts/install.sh", re.compile(r'^VERSION="([^"]+)"', re.M)),
+    ("scripts/mcp_agent_config.example.json", re.compile(r'"version": "([^"]+)"', re.M)),
 ]
 
 # 提交包白名单：按顺序收集，超过 MAX_FILES 时先丢 references 之外的大文件。

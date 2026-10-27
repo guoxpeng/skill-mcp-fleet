@@ -104,7 +104,7 @@ for _stream in (sys.stdout, sys.stderr):
 DEFAULT_CONFIG = {
     "name": "node",             # 副端标识（显示在状态页与 serverInfo）
     "tool_prefix": "",          # 工具名前缀，如 "nas_"；留空则用裸名（exec/read/...）
-    "version": "5.2.1",
+    "version": "5.3.0",
     "sudo_password": "",        # 留空且非 root 时会尝试免密 sudo
     "work_dir": "/",            # 默认工作目录
     "command_timeout": 120,     # 秒
@@ -820,6 +820,262 @@ def t_exec_jobs(a):
             sz = len(j["buf"])
         lines.append("%s  %s  %d字节  %s" % (j["id"], st, sz, j["cmd"]))
     return "\n".join(lines), False
+
+
+# ---------------------------------------------------------------------------
+# 交互式 shell（v5.3）：PTY 会话，主端 `fleet shell` 用它替代 ssh
+# ---------------------------------------------------------------------------
+# 为什么必须用 PTY 而不是管道：ssh 能跑 vim/top/less，是因为远端的 stdin
+# 是一个真终端。用管道接 bash 的话，这些程序会直接报 "not a tty"，
+# 于是「替代 ssh」就成了空话。
+#
+# 传输层仍然是请求/响应，所以做成「写一段 + 拉增量」：
+#   shell_open  → session_id
+#   shell_write → 键盘输入（base64，避免二进制/编码问题）
+#   shell_read  → 从 offset 起的新增输出（服务端可短等，省掉忙轮询）
+#   shell_close → 结束会话
+# 输出用 base64 传输，因为 PTY 吐的是原始字节流，可能在多字节字符中间截断。
+SHELLS = {}
+SHELLS_LOCK = threading.Lock()
+SHELL_BUF_MAX = 512 * 1024     # 单会话保留最近 512KB 输出
+SHELL_TTL = 8 * 3600           # 已结束会话保留 8 小时
+SHELL_MAX = 8                  # 同时最多 8 个会话，防内存被撑爆
+
+
+def _shell_sweep():
+    now = time.time()
+    with SHELLS_LOCK:
+        for sid in [k for k, s in SHELLS.items()
+                    if s.get("end") and now - s["end"] > SHELL_TTL]:
+            s = SHELLS.pop(sid)
+            try:
+                os.close(s["fd"])
+            except Exception:
+                pass
+
+
+def _shell_reader(sess):
+    """后台线程：把 PTY 的输出搬进环形缓冲区。"""
+    fd = sess["fd"]
+    while True:
+        try:
+            chunk = os.read(fd, 65536)
+        except OSError:
+            break
+        except Exception:
+            break
+        if not chunk:
+            break
+        with sess["lock"]:
+            sess["buf"] += chunk
+            sess["total"] += len(chunk)
+            if len(sess["buf"]) > SHELL_BUF_MAX:
+                # 只留最近的一段；base 记录「缓冲区第一个字节的绝对偏移」
+                sess["buf"] = sess["buf"][-SHELL_BUF_MAX:]
+                sess["base"] = sess["total"] - len(sess["buf"])
+    with sess["lock"]:
+        sess["end"] = time.time()
+        try:
+            sess["exit"] = os.waitpid(sess["pid"], os.WNOHANG)[1]
+        except Exception:
+            sess["exit"] = None
+
+
+def _b64d(s):
+    import base64
+    try:
+        return base64.b64decode((s or "").encode("ascii"), validate=False)
+    except Exception:
+        return b""
+
+
+def _b64e(b):
+    import base64
+    return base64.b64encode(b).decode("ascii")
+
+
+def t_shell_open(a):
+    if _is_windows():
+        return "Windows 端暂不支持交互式 shell（PTY），请用 exec / exec_async", True
+    _shell_sweep()
+    with SHELLS_LOCK:
+        alive = [k for k, s in SHELLS.items() if not s.get("end")]
+        if len(alive) >= SHELL_MAX:
+            return ("会话数已达上限 %d；先 shell_close 掉不用的：%s"
+                    % (SHELL_MAX, ", ".join(sorted(alive)))), True
+    import pty
+    import fcntl
+    import termios
+    import struct
+
+    shell = a.get("shell") or os.environ.get("SHELL") or "/bin/bash"
+    if not os.path.isfile(shell):
+        shell = "/bin/sh"
+    cols = max(20, min(500, int(a.get("cols") or 80)))
+    rows = max(5, min(200, int(a.get("rows") or 24)))
+    wd = a.get("workDir") or CFG.get("work_dir") or os.path.expanduser("~")
+
+    pid, fd = pty.fork()
+    if pid == 0:                                    # 子进程：变成登录 shell
+        try:
+            if os.path.isdir(wd):
+                os.chdir(wd)
+            env = dict(os.environ)
+            env["TERM"] = a.get("term") or "xterm-256color"
+            env.pop("COLUMNS", None)
+            env.pop("LINES", None)
+            os.execvpe(shell, [shell, "-l"], env)
+        finally:
+            os._exit(127)
+    # 父进程：设窗口大小，起读线程
+    try:
+        fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", rows, cols, 0, 0))
+    except Exception:
+        pass
+    sid = "sh-" + uuid.uuid4().hex[:8]
+    sess = {"id": sid, "fd": fd, "pid": pid, "buf": b"", "base": 0, "total": 0,
+            "lock": threading.Lock(), "start": time.time(), "end": None,
+            "exit": None, "shell": shell, "cols": cols, "rows": rows}
+    with SHELLS_LOCK:
+        SHELLS[sid] = sess
+    threading.Thread(target=_shell_reader, args=(sess,), daemon=True).start()
+    return json.dumps({"session_id": sid, "shell": shell, "cols": cols,
+                       "rows": rows, "pid": pid}, ensure_ascii=False), False
+
+
+def _get_shell(a):
+    sid = (a.get("session_id") or "").strip()
+    with SHELLS_LOCK:
+        sess = SHELLS.get(sid)
+    if not sess:
+        return None, ("未知 session_id：%s（可能已过期或已关闭）" % (sid or "(空)"))
+    return sess, ""
+
+
+def t_shell_write(a):
+    sess, err = _get_shell(a)
+    if not sess:
+        return err, True
+    data = _b64d(a.get("data_b64") or a.get("data") or "")
+    if not data:
+        return "没有数据", True
+    if sess.get("end"):
+        return "会话已结束，不能再写入", True
+    try:
+        os.write(sess["fd"], data)
+    except OSError as e:
+        return "写入失败：%r（会话可能已退出）" % (e,), True
+    return "ok", False
+
+
+def t_shell_read(a):
+    """读增量输出。
+
+    wait 秒内没有新数据也直接返回（长轮询），省掉客户端 50ms 一次的忙轮询。
+    返回的 offset 是**绝对偏移**，客户端下次带回来即可，不用自己算。
+    """
+    sess, err = _get_shell(a)
+    if not sess:
+        return err, True
+    try:
+        offset = int(a.get("offset") or 0)
+    except Exception:
+        offset = 0
+    try:
+        wait = float(a.get("wait") or 0)
+    except Exception:
+        wait = 0.0
+    wait = max(0.0, min(5.0, wait))
+    deadline = time.time() + wait
+    while True:
+        with sess["lock"]:
+            total, base, buf = sess["total"], sess["base"], sess["buf"]
+            ended = bool(sess.get("end"))
+            exit_code = sess.get("exit")
+        if offset < base:
+            # 客户端落后太多，旧内容已被裁掉：从缓冲区开头续上，并明确告知
+            offset = base
+            truncated = True
+        else:
+            truncated = False
+        if total > offset:
+            start = offset - base
+            chunk = buf[start:start + 262144]
+            return json.dumps({
+                "data_b64": _b64e(chunk),
+                "offset": offset + len(chunk),
+                "alive": not ended,
+                "exit": exit_code,
+                "truncated": truncated,
+            }, ensure_ascii=False), False
+        if ended:
+            return json.dumps({"data_b64": "", "offset": offset, "alive": False,
+                               "exit": exit_code, "truncated": truncated},
+                              ensure_ascii=False), False
+        if time.time() >= deadline:
+            return json.dumps({"data_b64": "", "offset": offset, "alive": True,
+                               "exit": None, "truncated": truncated},
+                              ensure_ascii=False), False
+        time.sleep(0.03)
+
+
+def t_shell_resize(a):
+    sess, err = _get_shell(a)
+    if not sess:
+        return err, True
+    try:
+        import fcntl
+        import struct
+        import termios
+        cols = max(20, min(500, int(a.get("cols") or 80)))
+        rows = max(5, min(200, int(a.get("rows") or 24)))
+        fcntl.ioctl(sess["fd"], termios.TIOCSWINSZ,
+                    struct.pack("HHHH", rows, cols, 0, 0))
+        sess["cols"], sess["rows"] = cols, rows
+    except Exception as e:
+        return "调整窗口失败：%r" % (e,), True
+    return "ok", False
+
+
+def t_shell_close(a):
+    sess, err = _get_shell(a)
+    if not sess:
+        return err, False          # 关闭不存在的会话不算错误（幂等）
+    try:
+        os.kill(sess["pid"], signal.SIGHUP)
+    except Exception:
+        pass
+    time.sleep(0.05)
+    try:
+        os.kill(sess["pid"], signal.SIGKILL)
+    except Exception:
+        pass
+    try:
+        os.close(sess["fd"])
+    except Exception:
+        pass
+    with SHELLS_LOCK:
+        SHELLS.pop(sess["id"], None)
+    return "已关闭 %s" % sess["id"], False
+
+
+def t_shell_list(a):
+    _shell_sweep()
+    with SHELLS_LOCK:
+        items = list(SHELLS.values())
+    if not items:
+        return "当前没有交互式会话", False
+    lines = []
+    for s in sorted(items, key=lambda x: x["start"]):
+        with s["lock"]:
+            total = s["total"]
+        age = int(time.time() - s["start"])
+        lines.append("%s  %-12s %dx%d  %ds  %d字节  %s"
+                     % (s["id"], os.path.basename(s["shell"]), s["cols"],
+                        s["rows"], age, total,
+                        "已结束" if s.get("end") else "运行中"))
+    return "\n".join(lines), False
+
 
 
 # ---------------------------------------------------------------------------
@@ -2730,6 +2986,35 @@ BASE_TOOLS = [
      {"type": "object", "properties": {"job_id": {"type": "string"}}, "required": ["job_id"]}),
     ("exec_jobs", "列出当前所有后台任务（job_id / 状态 / 输出大小）。",
      {"type": "object", "properties": {}}),
+    # ---- 交互式 shell（v5.3）：替代 ssh 的核心 ----
+    ("shell_open", "打开一个真正的 PTY 交互式 shell（可跑 vim/top/less）。返回 session_id。",
+     {"type": "object", "properties": {
+         "shell": {"type": "string", "description": "shell 路径，默认 $SHELL 或 /bin/bash"},
+         "cols": {"type": "number", "description": "列数，默认 80"},
+         "rows": {"type": "number", "description": "行数，默认 24"},
+         "term": {"type": "string", "description": "TERM 环境变量，默认 xterm-256color"},
+         "workDir": {"type": "string", "description": "起始目录"}}}),
+    ("shell_write", "把键盘输入写进交互式会话（data_b64 为 base64 编码的原始字节）。",
+     {"type": "object", "properties": {
+         "session_id": {"type": "string"},
+         "data_b64": {"type": "string", "description": "base64 编码的输入字节"}},
+      "required": ["session_id", "data_b64"]}),
+    ("shell_read", "从 offset 起取会话新增输出；wait 秒内无数据也返回（长轮询）。",
+     {"type": "object", "properties": {
+         "session_id": {"type": "string"},
+         "offset": {"type": "number", "description": "上次返回的 offset，首次传 0"},
+         "wait": {"type": "number", "description": "最长等待秒数，默认 0（上限 5）"}},
+      "required": ["session_id"]}),
+    ("shell_resize", "调整交互式会话的终端窗口大小。",
+     {"type": "object", "properties": {
+         "session_id": {"type": "string"},
+         "cols": {"type": "number"}, "rows": {"type": "number"}},
+      "required": ["session_id"]}),
+    ("shell_close", "关闭交互式会话（幂等，会话不存在也返回成功）。",
+     {"type": "object", "properties": {"session_id": {"type": "string"}},
+      "required": ["session_id"]}),
+    ("shell_list", "列出本机所有交互式会话。",
+     {"type": "object", "properties": {}}),
     ("search", "P2: 在指定目录下搜索文件内容(grep)或文件名(find)，结构化输出。",
      {"type": "object", "properties": {
          "filePath": {"type": "string", "description": "搜索目录"},
@@ -2801,6 +3086,9 @@ BASE_FUNCS = {
     "exec_async": t_exec_async, "exec_poll": t_exec_poll,
     "exec_result": t_exec_result, "exec_kill": t_exec_kill,
     "exec_jobs": t_exec_jobs,
+    "shell_open": t_shell_open, "shell_write": t_shell_write,
+    "shell_read": t_shell_read, "shell_resize": t_shell_resize,
+    "shell_close": t_shell_close, "shell_list": t_shell_list,
     "search": t_search, "upload": t_upload, "download": t_download,
     "ps": t_ps, "kill": t_kill, "net_check": t_net_check,
     "msg_send": t_msg_send, "msg_recv": t_msg_recv, "msg_history": t_msg_history,
@@ -3490,7 +3778,8 @@ def call_tool(name, args, _bypass_assisted=False):
                 "请先向用户说明影响；获得明确同意后，带 confirm=true 重新调用。" % (reason, rule_id)}],
                 "isError": True}
     # P1-2: 审计危险工具（v5.2 改为哈希链，失败自动降级旧日志）
-    _dangerous = {"exec", "exec_async", "write", "edit", "docker_restart", "systemctl"}
+    _dangerous = {"exec", "exec_async", "write", "edit", "docker_restart", "systemctl",
+                  "shell_open", "shell_write", "shell_resize"}
     if _bare in _dangerous:
         _audit_log(name, args)
     _t0 = time.time()

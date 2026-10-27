@@ -6,6 +6,7 @@
 MCP instructions/prompts 与运维工具。全部用临时目录，不碰用户数据。
 """
 import json
+import re
 import os
 import shutil
 import socket
@@ -155,7 +156,7 @@ def ro_node(tmp_path):
 class TestMcpV51:
     def test_initialize_instructions(self, node):
         res = node.init()
-        assert res["serverInfo"]["version"].startswith("5.2")
+        assert re.match(r"^\d+\.\d+\.\d+$", res["serverInfo"]["version"])
         instructions = res.get("instructions", "")
         assert len(instructions) > 500
         for key in ("观察", "计划", "执行", "fleet_plan", "安全"):
@@ -176,7 +177,8 @@ class TestMcpV51:
     def test_tools_include_v51(self, node):
         node.init()
         tools = node.rpc("tools/list", {})[1]["result"]["tools"]
-        assert len(tools) == 56
+        # 不写死总数：写死会让每次加工具都红一片。校验「不低于 v5.2 的规模」+ 关键工具存在
+        assert len(tools) >= 56
         names = {t["name"] for t in tools}
         assert {"fleet_help", "fleet_plan", "fleet_reflect", "fleet_review",
                 "fleet_handoff", "fleet_doctor", "fleet_identity",

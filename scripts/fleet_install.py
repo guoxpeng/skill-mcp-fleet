@@ -55,7 +55,7 @@ import sys
 import time
 import urllib.request
 
-VERSION = "5.2.1"
+VERSION = "5.3.0"
 
 # 节点程序（安装时必须拷到安装目录，mcp_agent.py 从自己所在目录读配置）
 NODE_FILES = ["mcp_agent.py", "fleet_proto.py", "dashboard_html.py", "fleet.py"]
@@ -753,6 +753,35 @@ def resolve_paths(opts, platform=None):
     }
 
 
+def _launchd_path():
+    """给 launchd 用的 PATH：在系统默认目录之外补上 Homebrew / MacPorts。
+
+    launchd 起的进程不继承登录 shell 的 PATH，只有 /usr/bin:/bin:/usr/sbin:/sbin。
+    Apple Silicon 的 Homebrew 在 /opt/homebrew/bin、Intel 在 /usr/local/bin，
+    两者都不在默认值里，于是 `fleet exec "git status"` 会莫名 command not found。
+
+    这里**只取固定白名单**，不继承执行安装时的 PATH —— 否则会把安装者当时的
+    临时环境（虚拟环境、IDE 内置 bin、沙箱路径）永久写进别人的服务配置里。
+    """
+    candidates = [
+        "/opt/homebrew/bin", "/opt/homebrew/sbin",     # Apple Silicon Homebrew
+        "/usr/local/bin", "/usr/local/sbin",           # Intel Homebrew
+        "/opt/local/bin", "/opt/local/sbin",           # MacPorts
+        "/usr/bin", "/bin", "/usr/sbin", "/sbin",      # 系统默认
+    ]
+    home = os.path.expanduser("~")
+    candidates += [os.path.join(home, ".local", "bin"), os.path.join(home, "bin")]
+    seen, out = set(), []
+    for d in candidates:
+        if d in seen:
+            continue
+        seen.add(d)
+        # 系统四个目录必然存在；其余按存在性收，避免写一堆无效路径
+        if d in ("/usr/bin", "/bin", "/usr/sbin", "/sbin") or os.path.isdir(d):
+            out.append(d)
+    return os.pathsep.join(out)
+
+
 def _template_vars(opts, platform, paths):
     """把通用变量映射成模板占位符字典（适配器再追加自己的变量）。"""
     opts = opts or {}
@@ -778,6 +807,13 @@ def _template_vars(opts, platform, paths):
     if is_root and user and user != "root":
         username_block = ("    <key>UserName</key>\n    <string>%s</string>"
                           % _xml_escape(user))
+
+    # launchd 默认 PATH 只有 /usr/bin:/bin:/usr/sbin:/sbin。Homebrew 的工具
+    # （git/node/ffmpeg/python）在 /opt/homebrew/bin（Apple Silicon）或
+    # /usr/local/bin（Intel），不在里面 —— 结果就是节点自己活着，但 fleet exec
+    # 里跑 brew 装的命令一律 command not found。这里显式补全。
+    launchd_path = _launchd_path()
+    launchd_home = home if not (is_root and user in ("", "root")) else "/var/root"
 
     copy_prefix = opts.get("_copy_prefix", "scripts/")
     copy_node_line = "COPY %s %s %s ./" % (
@@ -813,6 +849,8 @@ def _template_vars(opts, platform, paths):
         "HOME_LINE": protect_home,
         "WATCHDOG_LINE": "",
         "USERNAME_BLOCK": username_block,
+        "LAUNCHD_PATH": launchd_path,
+        "LAUNCHD_HOME": launchd_home,
         "EXTRA_ARGS": (" " + " ".join(_shell_quote(a) for a in extra)) if extra else "",
         "EXTRA_ARGS_WIN": extra_win,
         "EXTRA_PLIST_ARGS": "".join(
@@ -847,7 +885,7 @@ _TOKEN_RE = re.compile(r"\{\{([A-Z0-9_]+)\}\}")
 _BUILTIN_TEMPLATES = {
     'Dockerfile': '# MCP Fleet 节点镜像（纯标准库，无需 pip 依赖）\n# 构建（仓库根目录）：docker build -f scripts/service-templates/Dockerfile -t mcp-fleet:{{VERSION}} .\n# 运行：docker run -d --name mcp-fleet -p 3100:3100 --restart unless-stopped \\\n#         --security-opt no-new-privileges:true --cap-drop ALL mcp-fleet:{{VERSION}}\nFROM python:3.12-alpine\n\n# tini 做 PID 1：正确转发信号给 python（否则 docker stop 等 10s 才 SIGKILL）\n# curl 供健康检查与人工排障；纯标准库运行不需要 pip\nRUN apk add --no-cache tini curl\n\nWORKDIR /app\n{{COPY_NODE_LINE}}\nCOPY {{COPY_CONFIG_LINE}} ./mcp_agent_config.example.json\n\nEXPOSE {{PORT}}\n# 容器内以 root 运行（exec 工具需要），加固靠 no-new-privileges/cap-drop/read-only\nHEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \\\n  CMD python3 -c "import sys,urllib.request;sys.exit(0 if urllib.request.urlopen(\'http://127.0.0.1:{{PORT}}/health\',timeout=3).status==200 else 1)"\n\nENTRYPOINT ["/sbin/tini", "--"]\nCMD ["python3", "-u", "/app/mcp_agent.py", "--host", "0.0.0.0", "--port", "{{PORT}}"]\n',
     'check-deps.sh': '#!/bin/sh\n# MCP Fleet 离线包依赖检查（POSIX sh；只检查，不自动安装）\n# 用法：sh check-deps.sh\n# 退出码：0 = 依赖齐全；1 = 缺少必需依赖（会打印对应安装命令）\nset -u\nMISSING=0\n\nhave() { command -v "$1" >/dev/null 2>&1; }\n\nsay() { printf \'%s\\n\' "$*"; }\n\nos_hint() {\n    if [ -n "${PREFIX:-}" ] && printf \'%s\' "$PREFIX" | grep -q com.termux; then\n        say "  pkg update && pkg install python"\n    elif [ -f /etc/openwrt_release ]; then\n        say "  opkg update && opkg install python3-light python3-urllib"\n    elif [ -f /etc/alpine-release ]; then\n        say "  apk add python3"\n    elif [ -f /etc/debian_version ]; then\n        say "  apt-get update && apt-get install -y python3"\n    elif [ -f /etc/redhat-release ]; then\n        say "  dnf install -y python3"\n    elif [ "$(uname -s 2>/dev/null)" = "Darwin" ]; then\n        say "  xcode-select --install   # 或 brew install python3"\n    else\n        say "  请用系统包管理器安装 Python 3.6+"\n    fi\n}\n\nsay "MCP Fleet 依赖检查"\nsay "------------------"\n\nif have python3; then\n    if python3 -c \'import sys;raise SystemExit(0 if sys.version_info>=(3,6) else 1)\' 2>/dev/null; then\n        say "[ok] python3: $(python3 -V 2>&1)"\n    else\n        say "[!!] python3 版本过低（需要 3.6+）：$(python3 -V 2>&1)"\n        os_hint\n        MISSING=1\n    fi\nelse\n    say "[!!] 缺少 python3"\n    os_hint\n    MISSING=1\nfi\n\nif have tar; then say "[ok] tar"; else say "[!!] 缺少 tar（解包离线包需要）"; MISSING=1; fi\n\n# 下载工具仅在在线安装时需要\nif have curl || have wget; then\n    say "[ok] curl/wget"\nelse\n    say "[!!] 缺少 curl 或 wget（联网安装需要）"\n    MISSING=1\nfi\n\n# 校验工具：sha256sum / shasum / openssl / python3 任一即可\nif have sha256sum || have shasum || have openssl; then\n    say "[ok] SHA256 校验工具"\nelif have python3; then\n    say "[ok] SHA256 校验工具（python3 兜底）"\nelse\n    say "[!!] 缺少 SHA256 校验工具"\n    MISSING=1\nfi\n\nif [ "$MISSING" -eq 0 ]; then\n    say "------------------"\n    say "依赖齐全，可以安装：sh install.sh --offline <本目录> --name <名字> --port <端口>"\n    exit 0\nfi\nsay "------------------"\nsay "请先补齐上面的依赖再安装。"\nexit 1\n',
-    'com.mcpfleet.node.plist': '<?xml version="1.0" encoding="UTF-8"?>\n<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">\n<!-- MCP Fleet 节点 {{DISPLAY_NAME}}（launchd：RunAtLoad 开机自启 + KeepAlive 崩溃重拉） -->\n<plist version="1.0">\n<dict>\n    <key>Label</key>\n    <string>{{LAUNCHD_LABEL}}</string>\n    <key>ProgramArguments</key>\n    <array>\n        <string>{{PYTHON}}</string>\n        <string>-u</string>\n        <string>{{AGENT_PATH}}</string>\n        <string>--host</string>\n        <string>{{HOST}}</string>\n        <string>--port</string>\n        <string>{{PORT}}</string>{{EXTRA_PLIST_ARGS}}\n    </array>\n    <key>WorkingDirectory</key>\n    <string>{{INSTALL_DIR}}</string>\n    <key>RunAtLoad</key>\n    <true/>\n    <key>KeepAlive</key>\n    <true/>\n    <key>ThrottleInterval</key>\n    <integer>10</integer>\n    <key>ProcessType</key>\n    <string>Background</string>\n    <key>Umask</key>\n    <integer>63</integer>\n    <key>StandardOutPath</key>\n    <string>{{LOG_DIR}}/agent.log</string>\n    <key>StandardErrorPath</key>\n    <string>{{LOG_DIR}}/agent.log</string>\n{{USERNAME_BLOCK}}\n</dict>\n</plist>\n',
+    'com.mcpfleet.node.plist': '<?xml version="1.0" encoding="UTF-8"?>\n<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">\n<!-- MCP Fleet 节点 {{DISPLAY_NAME}}（launchd：RunAtLoad 开机自启 + KeepAlive 崩溃重拉） -->\n<plist version="1.0">\n<dict>\n    <key>Label</key>\n    <string>{{LAUNCHD_LABEL}}</string>\n    <key>ProgramArguments</key>\n    <array>\n        <string>{{PYTHON}}</string>\n        <string>-u</string>\n        <string>{{AGENT_PATH}}</string>\n        <string>--host</string>\n        <string>{{HOST}}</string>\n        <string>--port</string>\n        <string>{{PORT}}</string>{{EXTRA_PLIST_ARGS}}\n    </array>\n    <key>WorkingDirectory</key>\n    <string>{{INSTALL_DIR}}</string>\n    <!-- launchd 的默认 PATH 只有 /usr/bin:/bin:/usr/sbin:/sbin，\n         Homebrew 装的 git/node/ffmpeg 全在 /opt/homebrew/bin。\n         不显式给 PATH，fleet exec 里跑这些命令会一律 command not found。 -->\n    <key>EnvironmentVariables</key>\n    <dict>\n        <key>PATH</key>\n        <string>{{LAUNCHD_PATH}}</string>\n        <key>HOME</key>\n        <string>{{LAUNCHD_HOME}}</string>\n        <key>LANG</key>\n        <string>en_US.UTF-8</string>\n        <key>LC_ALL</key>\n        <string>en_US.UTF-8</string>\n    </dict>\n    <key>RunAtLoad</key>\n    <true/>\n    <key>KeepAlive</key>\n    <true/>\n    <key>ThrottleInterval</key>\n    <integer>10</integer>\n    <key>ProcessType</key>\n    <string>Background</string>\n    <key>Umask</key>\n    <integer>63</integer>\n    <key>StandardOutPath</key>\n    <string>{{LOG_DIR}}/agent.log</string>\n    <key>StandardErrorPath</key>\n    <string>{{LOG_DIR}}/agent.log</string>\n{{USERNAME_BLOCK}}\n</dict>\n</plist>\n',
     'fleet-compose.yml': '# MCP Fleet 节点 {{DISPLAY_NAME}} —— Docker / docker compose 部署\n# 用法（在本目录）：docker compose -f fleet-compose.yml up -d\n# 开机自启由 restart: unless-stopped 保证（宿主机 Docker 服务自启即可）\nservices:\n  fleet:\n    build:\n      context: .\n      dockerfile: Dockerfile\n    image: {{IMAGE_TAG}}\n    container_name: {{UNIT_LABEL}}\n    restart: unless-stopped\n    ports:\n      - "{{PORT}}:{{PORT}}"\n    volumes:\n      - "{{DATA_DIR}}:/data"\n      - "{{INSTALL_DIR}}:/app"\n    working_dir: /app\n    environment:\n      - MCP_FLEET_NAME={{DISPLAY_NAME}}\n      - MCP_FLEET_PORT={{PORT}}\n      - MCP_FLEET_DATA=/data\n    command: ["python3", "-u", "/app/mcp_agent.py", "--host", "{{HOST}}", "--port", "{{PORT}}"]\n    # ---- 容器加固 ----\n    security_opt:\n      - no-new-privileges:true\n    cap_drop:\n      - ALL\n    read_only: true\n    tmpfs:\n      - /tmp:rw,noexec,nosuid,size=64m\n    healthcheck:\n      test: ["CMD", "python3", "-c", "import sys,urllib.request;sys.exit(0 if urllib.request.urlopen(\'http://127.0.0.1:{{PORT}}/health\',timeout=3).status==200 else 1)"]\n      interval: 30s\n      timeout: 5s\n      retries: 3\n      start_period: 15s\n    logging:\n      driver: json-file\n      options:\n        max-size: "10m"\n        max-file: "3"\n',
     'fleet.nohup': '#!/bin/sh\n# MCP Fleet 节点 {{DISPLAY_NAME}} 控制脚本（无服务管理器时的降级方案）\n# 用法：sh {{CTL_PATH}} start|stop|restart|status|log\nset -eu\nNAME="{{UNIT_LABEL}}"\nDIR="{{INSTALL_DIR}}"\nPY={{CMD_PYTHON}}\nAGENT={{CMD_AGENT}}\nPORT="{{PORT}}"\nPIDF="{{PID_FILE}}"\nLOG="{{LOG_DIR}}/agent.log"\n\nstart() {\n    if status >/dev/null 2>&1; then\n        echo "[$NAME] 已在运行 (pid $(cat "$PIDF"))"\n        return 0\n    fi\n    mkdir -p "$(dirname "$PIDF")" "$(dirname "$LOG")"\n    cd "$DIR"\n    nohup "$PY" -u "$AGENT" --host {{HOST}} --port "$PORT"{{EXTRA_ARGS}} >>"$LOG" 2>&1 &\n    echo $! > "$PIDF"\n    echo "[$NAME] 已启动 (pid $(cat "$PIDF"))，日志: $LOG"\n}\n\nstop() {\n    if [ -f "$PIDF" ]; then\n        PID="$(cat "$PIDF" 2>/dev/null || echo)"\n        if [ -n "$PID" ] && kill -0 "$PID" 2>/dev/null; then\n            kill "$PID" 2>/dev/null || true\n            sleep 1\n            kill -9 "$PID" 2>/dev/null || true\n            echo "[$NAME] 已停止 (pid $PID)"\n        fi\n        rm -f "$PIDF"\n    else\n        echo "[$NAME] 未运行"\n    fi\n}\n\nstatus() {\n    if [ -f "$PIDF" ]; then\n        PID="$(cat "$PIDF" 2>/dev/null || echo)"\n        if [ -n "$PID" ] && kill -0 "$PID" 2>/dev/null; then\n            echo "[$NAME] 运行中 (pid $PID)"\n            return 0\n        fi\n    fi\n    echo "[$NAME] 未运行"\n    return 1\n}\n\ncase "${1:-status}" in\n    start) start ;;\n    stop) stop ;;\n    restart) stop; start ;;\n    status) status ;;\n    log) tail -n "${2:-40}" "$LOG" ;;\n    *) echo "用法: sh $0 {start|stop|restart|status|log [n]}"; exit 2 ;;\nesac\n',
     'fleet.openrc': '#!/sbin/openrc-run\n# MCP Fleet 节点 {{DISPLAY_NAME}}（OpenRC：Alpine / Gentoo）\n# 安装：install -m755 fleet.openrc /etc/init.d/{{UNIT_LABEL}} && rc-update add {{UNIT_LABEL}} default\nname="{{UNIT_LABEL}}"\ndescription="MCP Fleet 节点 {{DISPLAY_NAME}}（HTTP {{PORT}}）"\ncommand={{CMD_PYTHON}}\ncommand_args="-u {{CMD_AGENT}} --host {{HOST}} --port {{PORT}}{{EXTRA_ARGS}}"\ndirectory="{{INSTALL_DIR}}"\ncommand_user="{{SERVICE_USER}}"\ncommand_background="yes"\npidfile="/run/{{UNIT_LABEL}}.pid"\noutput_log="{{LOG_DIR}}/agent.log"\nerror_log="{{LOG_DIR}}/agent.err.log"\n\n# supervise-daemon = OpenRC 的 Restart=always 等价物（崩溃 3 秒后重拉，无限次）\nsupervisor="supervise-daemon"\nrespawn_delay=3\nrespawn_max=0\n\ndepend() {\n    need net\n    after firewall\n}\n',
