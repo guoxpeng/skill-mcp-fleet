@@ -1,7 +1,7 @@
 {
   "name": "node",
   "tool_prefix": "",
-  "version": "5.3.0",
+  "version": "5.4.0",
   "sudo_password": "",
   "work_dir": "/",
   "command_timeout": 120,

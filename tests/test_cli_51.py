@@ -209,11 +209,32 @@ class TestPromptAndRepairCLI:
         assert "fleet_selfcheck" in out and "fleet_repair_loop" in out
 
     def test_no_arg_menu_has_prompts(self, monkeypatch, capsys):
+        """有对端时，无参数进入的是**完整控制台**，要能看到自检/提示词入口。
+
+        这里必须把登记表也钉住：不钉的话，本机登记表恰好为空时会走
+        「第一次使用」引导（只有三步上手），断言就成了「取决于这台机器装过什么」。
+        """
         monkeypatch.setattr(fleet, "local_node", lambda *a, **k: None)
+        monkeypatch.setattr(fleet, "load_registry",
+                            lambda *a, **k: {"nodes": {"nas": {"url": "http://x"}}})
+        monkeypatch.setattr(fleet, "_peer_summary", lambda *a, **k: (0, 1, []))
+        monkeypatch.setattr(fleet, "_tailscale_status", lambda *a, **k: (None, "x"))
         assert fleet.show_fleet_status() == 0
         out = capsys.readouterr().out
         assert "fleet selfcheck" in out and "fleet prompt" in out
         assert "自检修复" in out
+
+    def test_empty_state_goes_to_first_run_guide(self, monkeypatch, capsys):
+        """既没本机节点也没对端时，不该甩一张 20 条的菜单，只给三步上手。"""
+        monkeypatch.setattr(fleet, "local_node", lambda *a, **k: None)
+        monkeypatch.setattr(fleet, "load_registry", lambda *a, **k: {"nodes": {}})
+        assert fleet.show_fleet_status() == 0
+        out = capsys.readouterr().out
+        assert "第一次使用" in out
+        assert "fleet invite" in out
+        assert "fleet exec" in out
+        # 空白状态给整张菜单只会劝退，不该出现
+        assert "【常用命令】" not in out
 
     def test_repair_auto_calls_loop(self, monkeypatch):
         called = {}

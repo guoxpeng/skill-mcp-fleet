@@ -104,7 +104,7 @@ for _stream in (sys.stdout, sys.stderr):
 DEFAULT_CONFIG = {
     "name": "node",             # 副端标识（显示在状态页与 serverInfo）
     "tool_prefix": "",          # 工具名前缀，如 "nas_"；留空则用裸名（exec/read/...）
-    "version": "5.3.0",
+    "version": "5.4.0",
     "sudo_password": "",        # 留空且非 root 时会尝试免密 sudo
     "work_dir": "/",            # 默认工作目录
     "command_timeout": 120,     # 秒
@@ -1076,6 +1076,366 @@ def t_shell_list(a):
                         "已结束" if s.get("end") else "运行中"))
     return "\n".join(lines), False
 
+
+# ---------------------------------------------------------------------------
+# 端口转发（v5.4）：请求/响应传输之上的 TCP 隧道
+# ---------------------------------------------------------------------------
+# 这是「替代 ssh」的第二块拼图。ssh 除了给终端，还给 -L / -R：
+#   -L 8080:db.internal:3306   → 本地 8080 接到远端的 db.internal:3306
+#   -R 9000:127.0.0.1:3000     → 远端 9000 接回本地的 3000
+#
+# 没有它，访问远端内网里只有那台机器能碰的数据库/面板/私有 API，还是得回去用
+# ssh，于是「完全替代」就是空话。
+#
+# 传输仍然是请求/响应，所以模型是「远端持有 socket，主端按需拉取」：
+#   tunnel_open   → 从本机连出去（-L 用）
+#   tunnel_listen → 在本机监听，新连接自动变成 conn 会话（-R 用）
+#   tunnel_read   → 从 offset 起取新增字节（长轮询）
+#   tunnel_write  → 写入对端 socket
+#   tunnel_close  → 关闭（幂等）
+# 缓冲区/偏移量的设计跟交互式 shell 完全一致，包括 base64 传输：socket 吐的是
+# 原始字节，HTTP 正文里直接塞二进制会坏掉。
+TUNNELS = {}
+TUNNELS_LOCK = threading.Lock()
+TUN_BUF_MAX = 512 * 1024       # 单条连接保留最近 512KB 未读数据
+TUN_TTL = 3600                 # 已结束的连接保留 1 小时（供主端收尾读取）
+TUN_IDLE = 1800                # 30 分钟没读没写就回收：主端崩了不留孤儿 socket
+TUN_MAX = 64                   # 同时最多 64 条，防止被撑爆
+TUN_CHUNK = 262144             # 单次 read 最多返回 256KB
+
+
+def _tun_sweep():
+    """回收过期/空闲连接。"""
+    now = time.time()
+    dead = []
+    with TUNNELS_LOCK:
+        for tid, s in list(TUNNELS.items()):
+            if s["kind"] == "listen":
+                continue
+            if s.get("end"):
+                if now - s["end"] > TUN_TTL:
+                    dead.append(tid)
+            elif now - s.get("last", now) > TUN_IDLE:
+                dead.append(tid)
+    for tid in dead:
+        _tun_kill(tid)
+
+
+def _tun_kill(tid):
+    with TUNNELS_LOCK:
+        s = TUNNELS.pop(tid, None)
+    if not s:
+        return
+    cond = s.get("cond")
+    if cond is not None:
+        # 叫醒可能正卡在「缓冲区满、等主端来取」的读线程
+        try:
+            with cond:
+                s["dead"] = True
+                cond.notify_all()
+        except Exception:
+            pass
+    for key in ("sock", "lsock"):
+        so = s.get(key)
+        if so is not None:
+            try:
+                so.close()
+            except Exception:
+                pass
+
+
+def _tun_reader(sess):
+    """后台线程：把 socket 收到的字节搬进缓冲区。
+
+    和交互式 shell 不同，这里**不能丢数据**：终端丢的是滚屏历史，TCP 丢的
+    是字节流，丢了就是文件损坏、协议解析失败。所以缓冲区满时读线程挂起等
+    主端来取（背压），而不是把旧内容裁掉。
+    """
+    so = sess["sock"]
+    cond = sess["cond"]
+    while True:
+        try:
+            chunk = so.recv(65536)
+        except (OSError, socket.timeout):
+            break
+        except Exception:
+            break
+        if not chunk:
+            break
+        with cond:
+            while len(sess["buf"]) >= TUN_BUF_MAX and not sess["dead"]:
+                cond.wait(0.5)
+            if sess["dead"]:
+                break
+            sess["buf"] += chunk
+            sess["total"] += len(chunk)
+    with sess["lock"]:
+        sess["end"] = time.time()
+    try:
+        with cond:
+            cond.notify_all()
+    except Exception:
+        pass
+
+
+def _tun_accepter(sess):
+    """后台线程：listener 上来的新连接，各建一个 conn 会话（-R 用）。"""
+    ls = sess["lsock"]
+    while True:
+        try:
+            conn, peer = ls.accept()
+        except Exception:
+            break
+        if sess.get("end"):
+            try:
+                conn.close()
+            except Exception:
+                pass
+            break
+        try:
+            conn.settimeout(None)
+        except Exception:
+            pass
+        sub = _tun_new_conn(conn, "%s:%s" % (peer[0], peer[1]))
+        with sess["lock"]:
+            sess["pending"].append(sub["id"])
+    with sess["lock"]:
+        sess["end"] = time.time()
+
+
+def _tun_new_conn(so, peer):
+    tid = "tn-" + uuid.uuid4().hex[:8]
+    sess = {"id": tid, "kind": "conn", "sock": so, "peer": peer,
+            "buf": b"", "base": 0, "total": 0, "lock": threading.Lock(),
+            "cond": threading.Condition(), "dead": False,
+            "start": time.time(), "last": time.time(), "end": None}
+    with TUNNELS_LOCK:
+        TUNNELS[tid] = sess
+    threading.Thread(target=_tun_reader, args=(sess,), daemon=True).start()
+    return sess
+
+
+def _tun_count():
+    with TUNNELS_LOCK:
+        return len([1 for s in TUNNELS.values() if s["kind"] == "conn"
+                    and not s.get("end")])
+
+
+def _get_tun(a, key="tunnel_id"):
+    tid = (a.get(key) or "").strip()
+    with TUNNELS_LOCK:
+        sess = TUNNELS.get(tid)
+    if not sess:
+        return None, ("未知 %s：%s（可能已过期或已关闭）" % (key, tid or "(空)"))
+    return sess, ""
+
+
+def t_tunnel_open(a):
+    """从**副端本机**连出去：-L 的远端半截。"""
+    _tun_sweep()
+    if _tun_count() >= TUN_MAX:
+        return ("隧道数已达上限 %d，先关掉不用的（tunnel_list 看）" % TUN_MAX), True
+    host = (a.get("host") or "127.0.0.1").strip()
+    try:
+        port = int(a.get("port") or 0)
+    except Exception:
+        return "port 不是数字", True
+    if not (0 < port < 65536):
+        return "port 超出范围（1-65535）", True
+    try:
+        timeout = float(a.get("timeoutMs") or 10000) / 1000.0
+    except Exception:
+        timeout = 10.0
+    timeout = max(1.0, min(60.0, timeout))
+    try:
+        so = socket.create_connection((host, port), timeout=timeout)
+        so.settimeout(None)
+        so.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+    except Exception as e:
+        return ("副端连不上 %s:%d —— %s\n"
+                "（注意 host 是从**副端**看出去的地址，不是主端的）"
+                % (host, port, e)), True
+    sess = _tun_new_conn(so, "%s:%d" % (host, port))
+    return json.dumps({"tunnel_id": sess["id"], "target": sess["peer"],
+                       "kind": "conn"}, ensure_ascii=False), False
+
+
+def t_tunnel_listen(a):
+    """在**副端本机**监听：-R 的远端半截。"""
+    _tun_sweep()
+    host = (a.get("host") or "127.0.0.1").strip()
+    try:
+        port = int(a.get("port") or 0)
+    except Exception:
+        return "port 不是数字", True
+    if not (0 <= port < 65536):
+        return "port 超出范围（0-65535）", True
+    ls = socket.socket(socket.AF_INET6 if ":" in host else socket.AF_INET,
+                       socket.SOCK_STREAM)
+    try:
+        ls.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        ls.bind((host, port))
+        ls.listen(16)
+    except Exception as e:
+        try:
+            ls.close()
+        except Exception:
+            pass
+        return "监听 %s:%d 失败：%s" % (host, port, e), True
+    tid = "tl-" + uuid.uuid4().hex[:8]
+    sess = {"id": tid, "kind": "listen", "lsock": ls, "pending": [],
+            "lock": threading.Lock(), "start": time.time(),
+            "last": time.time(), "end": None,
+            "bound": "%s:%d" % (host, ls.getsockname()[1])}
+    with TUNNELS_LOCK:
+        TUNNELS[tid] = sess
+    threading.Thread(target=_tun_accepter, args=(sess,), daemon=True).start()
+    return json.dumps({"tunnel_id": tid, "bound": sess["bound"],
+                       "kind": "listen"}, ensure_ascii=False), False
+
+
+def t_tunnel_accept(a):
+    """取 listener 上的新连接（长轮询）。返回 tunnel_id 列表。"""
+    sess, err = _get_tun(a)
+    if not sess:
+        return err, True
+    if sess["kind"] != "listen":
+        return "%s 不是 listener" % sess["id"], True
+    try:
+        wait = float(a.get("wait") or 0)
+    except Exception:
+        wait = 0.0
+    wait = max(0.0, min(5.0, wait))
+    deadline = time.time() + wait
+    while True:
+        with sess["lock"]:
+            got, sess["pending"] = sess["pending"], []
+            ended = bool(sess.get("end"))
+        if got or ended or time.time() >= deadline:
+            return json.dumps({"tunnels": got, "alive": not ended},
+                              ensure_ascii=False), False
+        time.sleep(0.03)
+
+
+def t_tunnel_read(a):
+    """读增量。语义与 shell_read 一致：绝对偏移 + 长轮询。"""
+    sess, err = _get_tun(a)
+    if not sess:
+        return err, True
+    if sess["kind"] != "conn":
+        return "%s 是 listener，不能读；用 tunnel_accept" % sess["id"], True
+    try:
+        offset = int(a.get("offset") or 0)
+    except Exception:
+        offset = 0
+    try:
+        wait = float(a.get("wait") or 0)
+    except Exception:
+        wait = 0.0
+    wait = max(0.0, min(5.0, wait))
+    deadline = time.time() + wait
+    while True:
+        with sess["lock"]:
+            total, base, buf = sess["total"], sess["base"], sess["buf"]
+            # 已经取走的字节必须从缓冲区里丢掉。否则缓冲区只增不减：读线程
+            # 一旦撞到 TUN_BUF_MAX 就永远卡在背压上，连接表现为「传到一半不动」。
+            # 这里**每次取完就丢**，不设阈值——设阈值的话，缓冲区小于阈值时
+            # 就永远达不到条件，等于没回收（8KB 缓冲 + 256KB 阈值就是这么卡死的）。
+            if offset > base:
+                drop = offset - base
+                sess["buf"] = buf[drop:]
+                sess["base"] = base + drop
+                base = sess["base"]
+                buf = sess["buf"]
+            ended = bool(sess.get("end"))
+            sess["last"] = time.time()
+        if offset < base:
+            offset = base
+            truncated = True
+        else:
+            truncated = False
+        if total > offset:
+            start = offset - base
+            chunk = buf[start:start + TUN_CHUNK]
+            # 取走一段后叫醒可能正卡在背压上的读线程，让它继续收
+            try:
+                with sess["cond"]:
+                    sess["cond"].notify_all()
+            except Exception:
+                pass
+            return json.dumps({
+                "data_b64": _b64e(chunk), "offset": offset + len(chunk),
+                "alive": True, "truncated": truncated}, ensure_ascii=False), False
+        if ended:
+            return json.dumps({"data_b64": "", "offset": offset, "alive": False,
+                               "truncated": truncated}, ensure_ascii=False), False
+        if time.time() >= deadline:
+            return json.dumps({"data_b64": "", "offset": offset, "alive": True,
+                               "truncated": truncated}, ensure_ascii=False), False
+        time.sleep(0.03)
+
+
+def t_tunnel_write(a):
+    sess, err = _get_tun(a)
+    if not sess:
+        return err, True
+    if sess["kind"] != "conn":
+        return "%s 是 listener，不能写" % sess["id"], True
+    data = _b64d(a.get("data_b64") or "")
+    if not data:
+        return "没有数据", True
+    if sess.get("end"):
+        return "连接已断开，不能再写入", True
+    try:
+        sess["sock"].sendall(data)
+    except Exception as e:
+        return "写入失败：%r（连接可能已断开）" % (e,), True
+    with sess["lock"]:
+        sess["last"] = time.time()
+    return "ok", False
+
+
+def t_tunnel_close(a):
+    sess, err = _get_tun(a)
+    if not sess:
+        return err, False          # 幂等
+    if sess["kind"] == "listen":
+        with sess["lock"]:
+            sess["end"] = time.time()
+            pend = sess["pending"]
+            sess["pending"] = []
+    else:
+        pend = []
+    for tid in pend:
+        _tun_kill(tid)
+    _tun_kill(sess["id"])
+    return "已关闭 %s" % sess["id"], False
+
+
+def t_tunnel_list(a):
+    _tun_sweep()
+    with TUNNELS_LOCK:
+        items = list(TUNNELS.values())
+    if not items:
+        return "当前没有隧道", False
+    now = time.time()
+    lines = []
+    for s in sorted(items, key=lambda x: x["start"]):
+        if s["kind"] == "listen":
+            with s["lock"]:
+                n = len(s["pending"])
+            lines.append("%s  监听  %-22s 待接 %d  %ds  %s"
+                         % (s["id"], s.get("bound", "?"), n,
+                            int(now - s["start"]),
+                            "已结束" if s.get("end") else "运行中"))
+        else:
+            with s["lock"]:
+                total = s["total"]
+            lines.append("%s  连接  %-22s %d字节  空闲%ds  %s"
+                         % (s["id"], s.get("peer", "?"), total,
+                            int(now - s.get("last", now)),
+                            "已断开" if s.get("end") else "运行中"))
+    return "\n".join(lines), False
 
 
 # ---------------------------------------------------------------------------
@@ -3015,6 +3375,38 @@ BASE_TOOLS = [
       "required": ["session_id"]}),
     ("shell_list", "列出本机所有交互式会话。",
      {"type": "object", "properties": {}}),
+    # ---- 端口转发（v5.4）：替代 ssh -L / -R ----
+    ("tunnel_open", "从副端本机连出去，建立一条 TCP 隧道（主端 -L 的远端半截）。",
+     {"type": "object", "properties": {
+         "host": {"type": "string", "description": "目标主机（从副端视角），默认 127.0.0.1"},
+         "port": {"type": "number", "description": "目标端口"},
+         "timeoutMs": {"type": "number", "description": "连接超时毫秒，默认 10000"}},
+      "required": ["port"]}),
+    ("tunnel_listen", "在副端本机监听端口，新连接自动成为可读写的隧道（主端 -R 用）。",
+     {"type": "object", "properties": {
+         "host": {"type": "string", "description": "绑定地址，默认 127.0.0.1"},
+         "port": {"type": "number", "description": "端口，0 表示随机"}}}),
+    ("tunnel_accept", "取 listener 上刚到的连接（长轮询），返回 tunnel_id 列表。",
+     {"type": "object", "properties": {
+         "tunnel_id": {"type": "string"},
+         "wait": {"type": "number", "description": "最长等待秒数，默认 0（上限 5）"}},
+      "required": ["tunnel_id"]}),
+    ("tunnel_read", "从 offset 起取隧道新增字节（base64）；wait 秒内无数据也返回。",
+     {"type": "object", "properties": {
+         "tunnel_id": {"type": "string"},
+         "offset": {"type": "number", "description": "上次返回的 offset，首次传 0"},
+         "wait": {"type": "number", "description": "最长等待秒数，默认 0（上限 5）"}},
+      "required": ["tunnel_id"]}),
+    ("tunnel_write", "往隧道对端写字节（data_b64 为 base64）。",
+     {"type": "object", "properties": {
+         "tunnel_id": {"type": "string"},
+         "data_b64": {"type": "string", "description": "base64 编码的字节"}},
+      "required": ["tunnel_id", "data_b64"]}),
+    ("tunnel_close", "关闭隧道（幂等，不存在也返回成功）。",
+     {"type": "object", "properties": {"tunnel_id": {"type": "string"}},
+      "required": ["tunnel_id"]}),
+    ("tunnel_list", "列出本机所有隧道（连接与监听）。",
+     {"type": "object", "properties": {}}),
     ("search", "P2: 在指定目录下搜索文件内容(grep)或文件名(find)，结构化输出。",
      {"type": "object", "properties": {
          "filePath": {"type": "string", "description": "搜索目录"},
@@ -3089,6 +3481,10 @@ BASE_FUNCS = {
     "shell_open": t_shell_open, "shell_write": t_shell_write,
     "shell_read": t_shell_read, "shell_resize": t_shell_resize,
     "shell_close": t_shell_close, "shell_list": t_shell_list,
+    "tunnel_open": t_tunnel_open, "tunnel_listen": t_tunnel_listen,
+    "tunnel_accept": t_tunnel_accept, "tunnel_read": t_tunnel_read,
+    "tunnel_write": t_tunnel_write, "tunnel_close": t_tunnel_close,
+    "tunnel_list": t_tunnel_list,
     "search": t_search, "upload": t_upload, "download": t_download,
     "ps": t_ps, "kill": t_kill, "net_check": t_net_check,
     "msg_send": t_msg_send, "msg_recv": t_msg_recv, "msg_history": t_msg_history,
@@ -3779,7 +4175,9 @@ def call_tool(name, args, _bypass_assisted=False):
                 "isError": True}
     # P1-2: 审计危险工具（v5.2 改为哈希链，失败自动降级旧日志）
     _dangerous = {"exec", "exec_async", "write", "edit", "docker_restart", "systemctl",
-                  "shell_open", "shell_write", "shell_resize"}
+                  "shell_open", "shell_write", "shell_resize",
+                  # 隧道能绕过防火墙把内网服务接出去，必须留审计痕迹
+                  "tunnel_open", "tunnel_listen", "tunnel_write"}
     if _bare in _dangerous:
         _audit_log(name, args)
     _t0 = time.time()

@@ -18,6 +18,8 @@ mcp-fleet 统一命令行 —— 节点之间互相操控（不分主副，谁�
   probe <target>                连通性 + 握手 + 列工具 + 试调 exec（只读诊断）
   doctor <target>               完整链路体检（逐项打分，失败给排查方向）
   exec <target> <命令...>       在副端执行 shell 命令
+  shell <target>                交互式 shell（PTY，可跑 vim/top，替代 ssh）
+  forward <target> -L 8080:h:80 端口转发（等价 ssh -L / -R）
   call <target> --tool T [--args JSON]   调任意工具
   health [--deep]               批量体检所有副端
   install-cmd                   打印「把一台 Linux 设备变成副端」的安装命令
@@ -74,7 +76,7 @@ import uuid
 
 # ---------------------------------------------------------------- 基础
 
-VERSION = "5.3.0"
+VERSION = "5.4.0"
 PROTOCOL = "2024-11-05"
 HERE = os.path.dirname(os.path.abspath(__file__))
 
@@ -1331,6 +1333,400 @@ def cmd_shell(a):
         wclient.close()
         print()
         print(dim("会话已结束。"))
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# 端口转发（v5.4）：ssh -L / -R 的等价物
+# ---------------------------------------------------------------------------
+def _parse_fwd(spec, default_bind, is_local):
+    """解析转发规格。
+
+      -L 8080:db.internal:3306          本地 8080 → 副端视角的 db.internal:3306
+      -L 127.0.0.1:8080:db.internal:3306  同上，但只绑回环
+      -R 9000:127.0.0.1:3000            副端 9000 → 本地 3000
+
+    返回 {bind, port, host, hport}；host/hport 永远是「另一端要连的目标」。
+    """
+    raw = (spec or "").strip()
+    if not raw:
+        raise ValueError("转发规格为空")
+    parts = raw.split(":")
+    if len(parts) == 3:
+        bind, port, host, hport = default_bind, parts[0], parts[1], parts[2]
+    elif len(parts) == 4:
+        bind, port, host, hport = parts
+    elif raw.count(":") > 4:
+        # ::1 / 2001:db8::1 这类地址一拆就散了，先说清楚不支持，别让人对着
+        # 「看不懂的转发规格」自己猜
+        raise ValueError(
+            "绑定地址不支持 IPv6 字面量（%s）。\n"
+            "     改用 IPv4：%s 127.0.0.1:<端口>:<目标主机>:<目标端口>"
+            % (raw, "-L" if is_local else "-R"))
+    else:
+        raise ValueError(
+            "看不懂的转发规格：%s\n"
+            "     正确写法：%s <端口>:<目标主机>:<目标端口>\n"
+            "     或        %s <绑定地址>:<端口>:<目标主机>:<目标端口>"
+            % (raw, "-L" if is_local else "-R", "-L" if is_local else "-R"))
+    if ":" in bind:
+        raise ValueError("绑定地址不支持 IPv6 字面量（%s），请用 IPv4 或留空" % bind)
+    try:
+        port = int(port)
+    except Exception:
+        raise ValueError("端口不是数字：%s" % parts[1])
+    if not (0 < port < 65536):
+        raise ValueError("端口超出范围（1-65535）：%d" % port)
+    if not host:
+        host = "127.0.0.1"
+    try:
+        hport = int(hport)
+    except Exception:
+        raise ValueError("目标端口不是数字：%s" % parts[-1])
+    if not (0 < hport < 65536):
+        raise ValueError("目标端口超出范围（1-65535）：%d" % hport)
+    return {"bind": bind or default_bind, "port": port, "host": host,
+            "hport": hport, "spec": raw}
+
+
+def _fwd_label(f):
+    return "%s:%d → %s:%d" % (f["bind"], f["port"], f["host"], f["hport"])
+
+
+def _pump_remote_to_sock(client, tid, sock, gstop, lst, stats):
+    """把隧道里的字节刷到本地 socket。
+
+    gstop 是整个转发器的总开关（Ctrl-C），lst 是**这一条连接**的开关。
+    两者必须分开：一条连接正常结束就把 gstop 置位的话，整个转发器会跟着退出。
+    """
+    offset = 0
+    while not gstop.is_set() and not lst.is_set():
+        try:
+            text, is_err = client.call(
+                "tunnel_read", {"tunnel_id": tid, "offset": offset, "wait": 0.2},
+                timeout=30)
+        except MCPError:
+            break
+        if is_err:
+            break
+        try:
+            d = json.loads(text)
+        except Exception:
+            break
+        offset = d.get("offset", offset)
+        chunk = d.get("data_b64") or ""
+        if chunk:
+            try:
+                raw = base64.b64decode(chunk)
+                sock.sendall(raw)
+                stats["rx"] += len(raw)
+            except Exception:
+                break
+        if not d.get("alive", True):
+            break
+    lst.set()
+    try:
+        sock.shutdown(socket.SHUT_WR)
+    except Exception:
+        pass
+
+
+def _pump_sock_to_remote(client, tid, sock, gstop, lst, stats):
+    """把本地 socket 收到的字节写进隧道。"""
+    while not gstop.is_set() and not lst.is_set():
+        try:
+            data = sock.recv(65536)
+        except Exception:
+            break
+        if not data:
+            break
+        try:
+            _, is_err = client.call(
+                "tunnel_write", {"tunnel_id": tid,
+                                 "data_b64": base64.b64encode(data).decode("ascii")},
+                timeout=30)
+        except MCPError:
+            break
+        if is_err:
+            break
+        stats["tx"] += len(data)
+    lst.set()
+    try:
+        sock.shutdown(socket.SHUT_RD)
+    except Exception:
+        pass
+
+
+def cmd_forward(a):
+    """v5.4: 端口转发 —— 没有它，「替代 ssh」还是半句话。
+
+    ssh 除了给终端，还给 -L / -R：远端内网里只有那台机器能碰的数据库、面板、
+    私有 API，全靠它接出来。fleet 之前的工具都是「一次请求一次响应」，
+    拿不到一条能持续双向流动的连接，所以这块一直是缺的。
+
+    实现上仍然是请求/响应，只是把「持续」拆成了「按需拉增量」：
+    副端持有 socket 并缓冲最近 512KB，主端长轮询（wait=0.2s）把新增字节拉回来。
+    代价是每次往返多一个 RTT 的延迟，好处是不需要任何新协议、任何端口映射。
+    """
+    if os.name == "nt":
+        return die("Windows 暂不支持端口转发（缺 select/信号支持），请在 macOS/Linux 上用")
+
+    sync = False if getattr(a, "no_sync", False) else None
+    try:
+        url, meta = resolve_target(a.target, a.agent, a.port, sync=sync)
+    except Exception as e:
+        return die("连不上 %s：%s" % (a.target, e))
+
+    token = meta.get("token", "")
+    insecure = getattr(a, "insecure", False)
+
+    if getattr(a, "list", False):
+        c = MCPClient(url, timeout=30, token=token, insecure=insecure)
+        try:
+            text, is_err = c.call("tunnel_list", {}, timeout=30)
+        except MCPError as e:
+            return die("查询失败：%s" % e)
+        finally:
+            c.close()
+        print(text if not is_err else err(text))
+        return 0 if not is_err else 1
+
+    default_bind = getattr(a, "bind", "") or "127.0.0.1"
+    locals_, remotes = [], []
+    try:
+        for spec in (getattr(a, "local", None) or []):
+            locals_.append(_parse_fwd(spec, default_bind, True))
+        for spec in (getattr(a, "remote", None) or []):
+            remotes.append(_parse_fwd(spec, "127.0.0.1", False))
+    except ValueError as e:
+        return die(str(e))
+    if not locals_ and not remotes:
+        return die("至少要给一个 -L 或 -R。例：\n"
+                   "     fleet forward -L 8080:127.0.0.1:80 %s\n"
+                   "     fleet forward -R 9000:127.0.0.1:3000 %s"
+                   % (a.target, a.target))
+
+    stop = threading.Event()
+    listeners = []        # 本地监听 socket（-L）
+    remote_ls = []        # 副端 listener 的 tunnel_id（-R）
+    clients = []          # 需要收尾关闭的客户端
+    threads = []
+    lock = threading.Lock()
+    stats = {"conn": 0, "tx": 0, "rx": 0}
+    local_ports = []      # 实际绑定的端口（port=0 时有用）
+
+    # ---- -L：本地监听，每条进来的连接开一条隧道 ----
+    def serve_local(f):
+        ls = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        ls.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            ls.bind((f["bind"], f["port"]))
+            ls.listen(32)
+        except Exception as e:
+            ls.close()
+            print(err("[x] ") + "绑定 %s:%d 失败：%s" % (f["bind"], f["port"], e))
+            return None
+        real = ls.getsockname()[1]
+        local_ports.append(real)
+        print(ok("[L] ") + "%s:%d → %s（经 %s）:%d"
+              % (f["bind"], real, f["host"], a.target, f["hport"]))
+
+        def accept_loop():
+            while not stop.is_set():
+                try:
+                    conn, peer = ls.accept()
+                except Exception:
+                    break
+                threading.Thread(target=handle_local, args=(conn, peer, f),
+                                 daemon=True).start()
+
+        def handle_local(conn, peer, f):
+            # 每条连接两条 HTTP 通道：读线程会卡在长轮询上，共用一个的话
+            # 写方向要排队等 200ms，回显类协议立刻变卡。
+            rc = MCPClient(url, timeout=30, token=token, insecure=insecure)
+            wc = MCPClient(url, timeout=30, token=token, insecure=insecure)
+            with lock:
+                clients.extend([rc, wc])
+                stats["conn"] += 1
+            try:
+                text, is_err = rc.call("tunnel_open",
+                                       {"host": f["host"], "port": f["hport"]},
+                                       timeout=40)
+                if is_err:
+                    print(err("[x] ") + "%s:%d 连不上 %s:%d：%s"
+                          % (peer[0], peer[1], f["host"], f["hport"], text))
+                    conn.close()
+                    return
+                tid = json.loads(text)["tunnel_id"]
+            except Exception as e:
+                print(err("[x] ") + "开隧道失败：%s" % e)
+                conn.close()
+                return
+            print(dim("  + %s:%d ↔ %s" % (peer[0], peer[1], tid)))
+            st = {"tx": 0, "rx": 0}
+            lst = threading.Event()
+            t1 = threading.Thread(target=_pump_remote_to_sock,
+                                  args=(rc, tid, conn, stop, lst, st), daemon=True)
+            t2 = threading.Thread(target=_pump_sock_to_remote,
+                                  args=(wc, tid, conn, stop, lst, st), daemon=True)
+            t1.start()
+            t2.start()
+            t1.join()
+            # 远端先结束：叫醒可能还卡在 recv 上的另一半，别把线程留在那
+            try:
+                conn.shutdown(socket.SHUT_RD)
+            except Exception:
+                pass
+            t2.join(timeout=3)
+            try:
+                wc.call("tunnel_close", {"tunnel_id": tid}, timeout=10)
+            except Exception:
+                pass
+            try:
+                conn.close()
+            except Exception:
+                pass
+            rc.close()
+            wc.close()
+            with lock:
+                stats["tx"] += st["tx"]
+                stats["rx"] += st["rx"]
+            print(dim("  - %s:%d 关闭（↑%d ↓%d 字节）"
+                      % (peer[0], peer[1], st["tx"], st["rx"])))
+
+        threading.Thread(target=accept_loop, daemon=True).start()
+        return ls
+
+    # ---- -R：副端监听，新连接接回本地 ----
+    def serve_remote(f):
+        ctl = MCPClient(url, timeout=30, token=token, insecure=insecure)
+        with lock:
+            clients.append(ctl)
+        try:
+            text, is_err = ctl.call(
+                "tunnel_listen", {"host": f["bind"], "port": f["port"]}, timeout=40)
+        except MCPError as e:
+            print(err("[x] ") + "副端监听失败：%s" % e)
+            return None
+        if is_err:
+            print(err("[x] ") + "副端监听 %s:%d 失败：%s"
+                  % (f["bind"], f["port"], text))
+            return None
+        d = json.loads(text)
+        lid = d["tunnel_id"]
+        remote_ls.append(lid)
+        print(ok("[R] ") + "副端 %s → 本地 %s:%d"
+              % (d.get("bound", "?"), f["host"], f["hport"]))
+
+        def accept_loop():
+            while not stop.is_set():
+                try:
+                    text, is_err = ctl.call(
+                        "tunnel_accept", {"tunnel_id": lid, "wait": 0.2}, timeout=30)
+                except MCPError:
+                    break
+                if is_err:
+                    break
+                try:
+                    ids = json.loads(text).get("tunnels") or []
+                except Exception:
+                    break
+                for tid in ids:
+                    threading.Thread(target=handle_remote, args=(tid, f),
+                                     daemon=True).start()
+                if not json.loads(text).get("alive", True):
+                    break
+
+        def handle_remote(tid, f):
+            try:
+                conn = socket.create_connection((f["host"], f["hport"]), timeout=10)
+                conn.settimeout(None)
+            except Exception as e:
+                print(err("[x] ") + "本地 %s:%d 连不上：%s" % (f["host"], f["hport"], e))
+                try:
+                    ctl.call("tunnel_close", {"tunnel_id": tid}, timeout=10)
+                except Exception:
+                    pass
+                return
+            rc = MCPClient(url, timeout=30, token=token, insecure=insecure)
+            wc = MCPClient(url, timeout=30, token=token, insecure=insecure)
+            with lock:
+                clients.extend([rc, wc])
+                stats["conn"] += 1
+            print(dim("  + %s ↔ 本地 %s:%d" % (tid, f["host"], f["hport"])))
+            st = {"tx": 0, "rx": 0}
+            lst = threading.Event()
+            t1 = threading.Thread(target=_pump_remote_to_sock,
+                                  args=(rc, tid, conn, stop, lst, st), daemon=True)
+            t2 = threading.Thread(target=_pump_sock_to_remote,
+                                  args=(wc, tid, conn, stop, lst, st), daemon=True)
+            t1.start()
+            t2.start()
+            t1.join()
+            try:
+                conn.shutdown(socket.SHUT_RD)
+            except Exception:
+                pass
+            t2.join(timeout=3)
+            try:
+                wc.call("tunnel_close", {"tunnel_id": tid}, timeout=10)
+            except Exception:
+                pass
+            try:
+                conn.close()
+            except Exception:
+                pass
+            rc.close()
+            wc.close()
+            with lock:
+                stats["tx"] += st["tx"]
+                stats["rx"] += st["rx"]
+            print(dim("  - %s 关闭（↑%d ↓%d 字节）" % (tid, st["tx"], st["rx"])))
+
+        threading.Thread(target=accept_loop, daemon=True).start()
+        return ctl
+
+    for f in locals_:
+        ls = serve_local(f)
+        if ls:
+            listeners.append(ls)
+    for f in remotes:
+        c = serve_remote(f)
+        if c:
+            pass          # 已在 clients 里，统一收尾
+
+    if not listeners and not remote_ls:
+        return die("所有转发都没起来")
+
+    print(dim("─" * 60))
+    print(dim("转发已就绪，Ctrl-C 结束。本地可先用 lsof -i :<端口> 确认监听"))
+    try:
+        while not stop.is_set():
+            time.sleep(0.5)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        stop.set()
+        for ls in listeners:
+            try:
+                ls.close()
+            except Exception:
+                pass
+        for lid in remote_ls:
+            try:
+                MCPClient(url, timeout=10, token=token,
+                          insecure=insecure).call("tunnel_close",
+                                                  {"tunnel_id": lid}, timeout=10)
+            except Exception:
+                pass
+        for c in clients:
+            try:
+                c.close()
+            except Exception:
+                pass
+        print()
+        print(dim("已断开全部转发（累计 %d 条连接，↑%d ↓%d 字节）"
+                  % (stats["conn"], stats["tx"], stats["rx"])))
     return 0
 
 
@@ -4412,6 +4808,17 @@ def build_parser():
     sp.add_argument("--cwd", default="", help="远端起始目录")
     sp.add_argument("--insecure", action="store_true", help="跳过 HTTPS 证书校验")
     sp.set_defaults(func=cmd_shell)
+    sp = common(sub.add_parser(
+        "forward", help="v5.4: 端口转发（等价 ssh -L / -R）"))
+    sp.add_argument("-L", "--local", action="append", metavar="[绑定:]端口:主机:端口",
+                    help="本地监听并转发到副端可达的地址，可重复")
+    sp.add_argument("-R", "--remote", action="append", metavar="[绑定:]端口:主机:端口",
+                    help="副端监听并转发回本地可达的地址，可重复")
+    sp.add_argument("--bind", default="127.0.0.1",
+                    help="-L 的默认绑定地址（默认只绑回环，要用 0.0.0.0 显式给）")
+    sp.add_argument("--list", action="store_true", help="列出副端当前的隧道")
+    sp.add_argument("--insecure", action="store_true", help="跳过 HTTPS 证书校验")
+    sp.set_defaults(func=cmd_forward)
     sp = common(sub.add_parser("doctor", help="完整链路体检；不带 target 时做本机自检"),
                 need_target=False)
     sp.add_argument("target", nargs="?", default=None,
@@ -5283,6 +5690,7 @@ def show_fleet_status():
     fleet status / nodes / doctor        节点状态、对端、体检
     fleet ping <节点>                    一秒探活（只 GET /，不握手）
     fleet shell <节点>                   交互式 shell（PTY，可跑 vim/top，替代 ssh）
+    fleet forward -L 8080:h:80 <节点>    端口转发（等价 ssh -L / -R）
     fleet exec <节点> "<命令>"            在别的设备上执行
     fleet cp ./f.py nas:/opt/f.py        推代码；反向即拉回来
     fleet scan [网段]                    主动找同网段节点（--add 直接登记）
@@ -5375,7 +5783,7 @@ def cmd_menu(a):
 
   【远程操控】
    [8] 执行命令（exec）          [9] 调用工具（call）
-  [20] 交互式 shell（替代 ssh）
+  [20] 交互式 shell（替代 ssh） [21] 端口转发（-L / -R）
   [10] 列远端工具清单（tools）
 
   【消息与拓扑】
@@ -5397,7 +5805,7 @@ def cmd_menu(a):
         print("  提示词速用：fleet prompt self_repair  然后原样粘给 AI 客户端。")
         print()
         try:
-            choice = input("  请选择 (0-20): ").strip()
+            choice = input("  请选择 (0-21): ").strip()
         except (EOFError, KeyboardInterrupt):
             print("\n  再见！")
             return 0
@@ -5618,6 +6026,34 @@ def cmd_menu(a):
                                           timeout=60, json=False, no_sync=False,
                                           cwd="", insecure=False)
                 cmd_shell(args)
+
+        # ---- 21: forward ----
+        elif choice == "21":
+            _banner()
+            print("\n  端口转发（等价 ssh -L / -R）")
+            print("  " + "-" * 40)
+            print("  格式：[绑定地址:]端口:目标主机:目标端口")
+            print("  例：8080:127.0.0.1:80   或   127.0.0.1:8080:db.internal:3306")
+            print()
+            name = _pick_node("要经哪台设备转发: ")
+            if not name:
+                continue
+            try:
+                spec = input("  转发规格: ").strip()
+            except (EOFError, KeyboardInterrupt):
+                continue
+            if not spec:
+                continue
+            try:
+                direction = input("  方向 [L=本地监听/R=副端监听，默认 L]: ").strip().upper()
+            except (EOFError, KeyboardInterrupt):
+                continue
+            args = argparse.Namespace(target=name, agent="auto", port=3100,
+                                      timeout=30, json=False, no_sync=False,
+                                      local=[spec] if direction != "R" else None,
+                                      remote=[spec] if direction == "R" else None,
+                                      bind="127.0.0.1", list=False, insecure=False)
+            cmd_forward(args)
 
         else:
             print("  无效选择，按回车继续...")

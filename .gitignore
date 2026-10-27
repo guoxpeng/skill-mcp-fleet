@@ -23,3 +23,7 @@ scripts/tasks/
 
 # WorkBuddy 本地项目记忆（不随代码发布）
 .workbuddy-ai/
+
+# 运行期配置（含 token，绝不入库）
+scripts/mcp_agent_config.json
+scripts/mailbox.key

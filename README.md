@@ -1,4 +1,4 @@
-# MCP Fleet v5.3 · 让所有设备成为一支 AI 团队
+# MCP Fleet v5.4 · 让所有设备成为一支 AI 团队
 
 > **2026 华为开发者大赛 · 小红书 Skill 创新赛** ｜ 通用赛道 · 开发工具
 > 作者：guoxpeng ｜ 开源仓库：https://github.com/guoxpeng/skill-mcp-fleet ｜ 许可：MIT
@@ -25,7 +25,8 @@
 - 整套系统**零第三方依赖、不依赖任何中心服务、一条命令安装**。
 
 v5.2 把这件事从"能连"推进到**"敢连、好连、会自己想、坏了能自修"**；
-v5.3 再进一步——**公网设备上用 `fleet shell` 直接替代 ssh，内网靠 Tailscale 补齐**。
+v5.3 用 `fleet shell` 给了终端，v5.4 用 `fleet forward` 给了端口转发——
+**公网设备上 fleet 至此可以完全替代 ssh，内网靠 Tailscale 达到同样手感**。
 
 ## 二、v5.2 六大升级
 
@@ -134,10 +135,28 @@ fleet nodes
   `start` 走 `bootstrap + kickstart`（否则不受 launchd 管、重启不自启）、
   `_lan_ip` 按 en0 取址（否则开 Tailscale 出口节点后广播的是隧道地址）。
 
-### 6.6 可复现的验证证据
+### 6.6 v5.4：端口转发（`ssh -L / -R` 的等价物）
+
+5.3 给了终端，但 ssh 还有一半用处是端口转发：远端内网里只有那台机器能碰的数据库、
+面板、私有 API，全靠它接出来。
 
 ```bash
-.venv/bin/python -m pytest tests/ -q        # 732 passed, 1 skipped
+fleet forward -L 8080:db.internal:3306 nas   # 本地 8080 → 副端视角的 db:3306
+fleet forward -R 9000:127.0.0.1:3000 nas     # 副端 9000 → 本地 3000
+fleet forward --list nas                      # 看副端当前隧道
+```
+
+- 副端新增 7 个工具（`tunnel_open/listen/accept/read/write/close/list`），总数 62 → **69**；
+- 一条命令可叠加多个 `-L` / `-R`；`-L` 默认只绑回环，要暴露到局域网需显式 `--bind 0.0.0.0`；
+- 实现要点是**不丢字节**：缓冲区满时读线程挂起等主端取（背压），而不是像终端那样
+  丢弃滚屏历史——TCP 丢一个字节，下载的文件就是坏的；
+- 验证方式：1MB / 5MB 随机二进制 + SHA256 比对，上行/下行/`-L`/`-R` 四个方向全覆盖。
+  本机回环实测 `-L` 5MB ≈ 0.5s、`-R` 5MB ≈ 3s。
+
+### 6.7 可复现的验证证据
+
+```bash
+.venv/bin/python -m pytest tests/ -q        # 763 passed, 1 skipped
 sh scripts/install.sh --dry-run --json --name demo   # 安装器零副作用预演
 bash scripts/demo.sh                        # 本机双节点 30 秒演示
 ```
