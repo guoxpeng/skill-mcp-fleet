@@ -246,7 +246,7 @@ mcp-fleet/
 │   ├── fleet_proto.py                # v4.1 自研通讯协议层
 │   ├── fleet.py                      # 主端统一 CLI
 │   ├── fleet_chat.py                 # AI 间消息 CLI
-│   ├── fleet_watch.py                # 保活守护
+│   ├── fleet_watch.py                # 保活守护（仓库独立版；生产 cron 跑 goal 版看门，状态文件独立）
 │   ├── fleet-directory.py            # 地址目录服务
 │   ├── install.sh                    # 一键安装脚本
 │   ├── install-fleet-node.sh         # 节点安装辅助

@@ -16,7 +16,9 @@
 #      --mode    <模式>    auto(默认) | systemd | nohup
 #      --auth-token <串>   可选：访问令牌。设了之后所有请求都要带
 #                          Authorization: Bearer <串>。公网隧道场景必填
-#                          （--tunnel 时若为空会自动生成一个）
+#                          （--tunnel 时若为空会自动生成一个）。
+#                          对外绑定安装无令牌会拒绝：优先用 --generate-token
+#                          让副端现场生成，避免令牌进 shell 历史
 #      --allow-ips <列表>  可选：来源 IP 白名单，逗号分隔，支持 CIDR
 #                          例：--allow-ips '192.168.1.0/24,10.8.0.2'
 #      --directory <URL>   可选：地址目录地址。副端会把当前隧道地址上报过去，
@@ -37,7 +39,7 @@
 #      --print-frps        只打印 VPS 端 frps 的一键配置，不安装
 #      --require-auth      把「必须鉴权」写进配置：没有 auth_token 时副端拒绝启动
 #                          （公网/隧道场景建议加；内网也推荐）
-#      --generate-token    若还没有 auth_token，自动生成一个强随机值写进配置
+#      --generate-token    若还没有 auth_token，自动生成一个强随机值写进配置（推荐）
 #      --uninstall         卸载（停服务 + 删单元 + 删目录）
 #
 #  依赖：python3 + curl（只用标准库，无需 pip）。脚本会自动识别
@@ -5067,6 +5069,17 @@ if [ "$UNINSTALL" != "1" ]; then
   sleep 1
 fi
 
+# ---------- SEC-01：对外绑定必须带鉴权 ----------
+# systemd 单元与 nohup 守护壳（_supervisor.sh）都恒绑 0.0.0.0，无令牌
+# 安装等于把 root shell 裸奔上网。重装时配置里已有令牌也算数（不强制重设）。
+_EXIST_TOK="$(python3 -c "import json;print(json.load(open('$DIR/mcp_agent_config.json')).get('auth_token',''))" 2>/dev/null || echo '')"
+if [ -z "$AUTH_TOKEN" ] && [ "$GEN_TOKEN" != "1" ] && [ -z "$_EXIST_TOK" ]; then
+  die "拒绝安装：本次安装对外绑定 0.0.0.0，必须给 --auth-token 或 --generate-token（重装且配置已有令牌时不受此限）"
+fi
+if [ -n "$AUTH_TOKEN" ] && [ "${#AUTH_TOKEN}" -lt 20 ]; then
+  die "拒绝安装：--auth-token 太短（${#AUTH_TOKEN} 字符），请用 20 字符以上强随机串，或改用 --generate-token"
+fi
+
 # ---------- 安装 / 启动 ----------
 if [ "$MODE" = "systemd" ]; then
   log "写入 systemd 单元: /etc/systemd/system/${UNIT}.service"
@@ -5079,6 +5092,7 @@ Wants=network-online.target
 [Service]
 Type=simple
 WorkingDirectory=$DIR
+UMask=0077
 ExecStart=$PY3 -u $DIR/mcp_agent.py --host 0.0.0.0 --port $PORT
 Restart=always
 RestartSec=3
