@@ -31,3 +31,6 @@ scripts/mailbox.key
 audit.chain.jsonl
 scripts/audit.chain.jsonl
 peers.json.bak
+# 会话录制（asciinema cast，运行期数据）
+recordings/
+scripts/recordings/

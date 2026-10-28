@@ -1,4 +1,4 @@
-# MCP Fleet v5.2.5 · 让所有设备成为一支 AI 团队
+# MCP Fleet v5.2.6 · 让所有设备成为一支 AI 团队
 
 > **2026 华为开发者大赛 · 小红书 Skill 创新赛** ｜ 通用赛道 · 开发工具
 > 作者：guoxpeng ｜ 开源仓库：https://github.com/guoxpeng/skill-mcp-fleet ｜ 许可：MIT
@@ -135,7 +135,31 @@ fleet nodes
   `start` 走 `bootstrap + kickstart`（否则不受 launchd 管、重启不自启）、
   `_lan_ip` 按 en0 取址（否则开 Tailscale 出口节点后广播的是隧道地址）。
 
-### 6.6 端口转发（`ssh -L / -R` 的等价物）
+### 6.6 连接管理（v5.2.6）
+
+ssh 的连接管理是三件散装工具：`who`、`ss -tp`、`pkill`，而且**断线就全丢**。
+这一版把它们收成一条线，并补上 ssh 做不到的那条。
+
+```bash
+fleet sessions                 # 一张表：shell / 隧道 / 后台任务，带时长、空闲、字节、是否在录
+fleet shell                    # 进去之后按 Ctrl-] 是「挂起」，不是断开
+fleet attach sh-1a2b3c4d       # 接管回来，顺带重放最近 512KB 屏幕
+fleet kill sh-1a2b3c4d         # 按前缀自动判断类型，不用记是 shell 还是隧道
+fleet recordings               # 有哪些录像
+fleet replay sh-1a2b3c4d       # 回放（asciinema v2 cast）
+```
+
+- **看得见**：以前要敲 `shell_list` + `tunnel_list` + `exec_jobs` 三次再自己拼。
+  每条会话带归属（`谁@哪台机器`）与标签，多端连同一台机器不用靠时间猜。
+- **接得回**：Ctrl-] 挂起后远端 shell 继续跑、录制继续写；`attach` 回来时
+  屏幕恢复成离开时的样子。空闲回收 30 分钟 → 2 小时（`shell_idle_sec` 可配）。
+- **查得到**：默认开录，格式是 asciinema v2 cast，`asciinema play` 直接能放。
+  **只录输出不录键盘**——录制的目的是「屏幕上出现了什么」，而键盘里可能有密码。
+  单会话 64MB 封顶。
+- 三个真会翻车的细节：多字节字符跨 `os.read` 边界（增量解码器）、
+  默认 8KB 缓冲丢最后几十秒（改行缓冲）、录制目录不可写时不能拖垮会话本身。
+
+### 6.7 端口转发（`ssh -L / -R` 的等价物）
 
 5.3 给了终端，但 ssh 还有一半用处是端口转发：远端内网里只有那台机器能碰的数据库、
 面板、私有 API，全靠它接出来。
@@ -156,7 +180,7 @@ fleet forward --list nas                      # 看副端当前隧道
   和主端**已观测多久**，并把 `first_seen / last_ok / up_count` 记在
   `~/.mcp-fleet/seen.json`（掉线不清零）——只看当次 UP 看不出稳定性。
 
-### 6.7 可复现的验证证据
+### 6.8 可复现的验证证据
 
 ```bash
 .venv/bin/python -m pytest tests/ -q        # 815 passed, 1 skipped
@@ -186,12 +210,12 @@ bash scripts/demo.sh                        # 本机双节点 30 秒演示
 
 ```bash
 python3 scripts/build_package.py
-# → dist/mcp-fleet-v5.2.5.zip + SHA256SUMS + MANIFEST.json
+# → dist/mcp-fleet-v5.2.6.zip + SHA256SUMS + MANIFEST.json
 ```
 
 - 提交包文件数 **≤ 30**、大小 **≤ 40 MB**，由脚本自动裁剪并以清单/SHA256 固化。
 - 纯标准库、零第三方运行时依赖、MIT 许可、可离线部署。
-- 版本：代码 `SERVER_VERSION=5.2.5` ＝ git tag `v5.2.5` ＝ GitHub Release。
+- 版本：代码 `SERVER_VERSION=5.2.6` ＝ git tag `v5.2.6` ＝ GitHub Release。
   完整演进见 `CHANGELOG.md`。
 - **版本号一律三段式 `X.Y.Z`**：默认只动补丁位（修 bug、稳定性、性能），
   新增能力才动次版本位，破坏性变更才动主版本位。构建脚本会做三段式校验与

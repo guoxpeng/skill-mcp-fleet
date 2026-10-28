@@ -49,7 +49,7 @@ try:                     # POSIX 才有的跨进程文件锁；Windows 下降级
 except ImportError:      # pragma: no cover - 仅在 Windows 上走这里
     fcntl = None
 
-VERSION = "5.2.5"
+VERSION = "5.2.6"
 
 #: 落盘文件默认权限（仅属主可读写）
 FILE_MODE = 0o600

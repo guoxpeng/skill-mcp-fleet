@@ -76,7 +76,7 @@ import uuid
 
 # ---------------------------------------------------------------- 基础
 
-VERSION = "5.2.5"
+VERSION = "5.2.6"
 PROTOCOL = "2024-11-05"
 HERE = os.path.dirname(os.path.abspath(__file__))
 
@@ -1336,6 +1336,20 @@ def cmd_probe(a):
     return 0
 
 
+#: 挂起键：Ctrl-]（0x1d）。ssh 用 `~.` 是「断开」，tmux 用 `Ctrl-b d` 是「挂起」。
+#: 我们只留一个键，语义是**挂起**（远端继续跑，录制不停），因为那才是断线重连的前提。
+DETACH_BYTE = b"\x1d"
+
+
+def _client_owner():
+    """谁开的这条会话。写进 sessions 表，多端连同一台机器时能分辨。"""
+    try:
+        import getpass
+        return ("%s@%s" % (getpass.getuser(), socket.gethostname()))[:64]
+    except Exception:
+        return ""
+
+
 def cmd_shell(a):
     """v5.3: 交互式远程 shell（PTY）——这是「替代 ssh」的核心。
 
@@ -1346,6 +1360,9 @@ def cmd_shell(a):
 
     传输仍然是请求/响应，所以读用长轮询（wait=0.2s）：一次请求最多等 200ms，
     有数据立刻返回。这样既不会 50ms 打一次空转，也不会让按键延迟明显。
+
+    v5.2.6：`--attach` 接管一个已经在跑的会话（断线/换终端后回来），
+    Ctrl-] 挂起而不关闭——ssh 断线就全没了，这一条是它做不到的。
     """
     if os.name == "nt":
         return die("Windows 暂不支持交互式 shell；请用 fleet exec / exec_async")
@@ -1359,10 +1376,19 @@ def cmd_shell(a):
         return die("当前系统缺少 termios，无法进入交互式 shell")
 
     sync = False if getattr(a, "no_sync", False) else None
-    try:
-        url, meta = resolve_target(a.target, a.agent, a.port, sync=sync)
-    except Exception as e:
-        return die("连不上 %s：%s" % (a.target, e))
+    target = (getattr(a, "target", "") or "").strip()
+    if target:
+        try:
+            url, meta = resolve_target(target, a.agent, a.port, sync=sync)
+        except Exception as e:
+            return die("连不上 %s：%s" % (target, e))
+    else:
+        # `fleet attach <sid>` / `fleet shell`（省略副端）都落到本机节点
+        got = _local_endpoint()
+        if not got:
+            return die("本机没有安装节点，也没指定副端")
+        url, meta = got
+    label = target or (meta.get("name") or "本机")
 
     client = MCPClient(url, timeout=max(30, a.timeout), token=meta.get("token", ""),
                        insecure=getattr(a, "insecure", False))
@@ -1380,29 +1406,60 @@ def cmd_shell(a):
             return 80, 24
 
     cols, rows = winsize()
-    try:
-        text, is_err = client.call("shell_open", {
-            "cols": cols, "rows": rows,
-            "term": os.environ.get("TERM") or "xterm-256color",
-            "workDir": getattr(a, "cwd", "") or ""}, timeout=30)
-    except MCPError as e:
-        return die("打开会话失败：%s" % e)
-    if is_err:
-        print(err("[x] ") + text)
-        return 1
-    try:
-        sid = json.loads(text)["session_id"]
-    except Exception:
-        return die("副端返回异常：%s" % text[:200])
-
-    print(dim("已连接 %s（%s）· 退出：Ctrl-D 或 exit" % (a.target, url)))
-    print(dim("─" * 60))
+    attach_sid = (getattr(a, "attach", "") or "").strip()
+    if attach_sid:
+        # 接管已有会话：不再 open 一个，直接拿它的 id 开始读写。
+        # offset 从 0 开始 —— 远端缓冲区里还留着最近 512KB 输出，
+        # 第一次 read 会把这段重放回来，屏幕上就恢复成「离开时的样子」。
+        sid = attach_sid
+        try:
+            text, is_err = client.call("shell_read", {"session_id": sid,
+                                                      "offset": 0, "wait": 0},
+                                       timeout=30)
+        except MCPError as e:
+            client.close()
+            wclient.close()
+            return die("接管 %s 失败：%s" % (sid, e))
+        if is_err:
+            client.close()
+            wclient.close()
+            print(err("[x] ") + text)
+            print(dim("    fleet sessions %s 看还有哪些会话" % label))
+            return 1
+        print(dim("已接管 %s @ %s（%s）· 挂起：Ctrl-] · 退出：exit"
+                  % (sid, label, url)))
+        print(dim("─" * 60))
+    else:
+        try:
+            text, is_err = client.call("shell_open", {
+                "cols": cols, "rows": rows,
+                "term": os.environ.get("TERM") or "xterm-256color",
+                "workDir": getattr(a, "cwd", "") or "",
+                "label": getattr(a, "label", "") or "",
+                "owner": _client_owner(),
+                "record": getattr(a, "record", None)}, timeout=30)
+        except MCPError as e:
+            return die("打开会话失败：%s" % e)
+        if is_err:
+            print(err("[x] ") + text)
+            return 1
+        try:
+            info = json.loads(text)
+            sid = info["session_id"]
+        except Exception:
+            return die("副端返回异常：%s" % text[:200])
+        rec = info.get("recording") or ""
+        print(dim("已连接 %s（%s）· 挂起：Ctrl-] · 退出：Ctrl-D 或 exit"
+                  % (label, url)))
+        if rec:
+            print(dim("录制中：%s（fleet replay %s 回放）" % (rec, sid)))
+        print(dim("─" * 60))
 
     stdin_fd = sys.stdin.fileno()
     out = sys.stdout.buffer
     stop = threading.Event()
     offset = [0]
-    state = {"alive": True}
+    state = {"alive": True, "detached": False}
 
     def pump():
         """把远端输出刷到本地终端。"""
@@ -1461,7 +1518,7 @@ def cmd_shell(a):
         client.close()
         wclient.close()
         return die("当前 stdin 不是终端（%s），交互式 shell 需要真终端。"
-                   "非交互场景请用：fleet exec %s \"<命令>\"" % (e, a.target))
+                   "非交互场景请用：fleet exec %s \"<命令>\"" % (e, label))
     try:
         reader.start()
         tty.setraw(stdin_fd)
@@ -1502,6 +1559,19 @@ def cmd_shell(a):
                 break
             if not data:
                 break
+            if DETACH_BYTE in data:
+                # 挂起而不是断开：把挂起键自己抠掉，其余按键照常送过去
+                data = data.replace(DETACH_BYTE, b"")
+                state["detached"] = True
+                if data:
+                    try:
+                        wclient.call("shell_write", {
+                            "session_id": sid,
+                            "data_b64": base64.b64encode(data).decode("ascii")},
+                            timeout=30)
+                    except MCPError:
+                        pass
+                break
             try:
                 wclient.call("shell_write", {
                     "session_id": sid,
@@ -1521,15 +1591,291 @@ def cmd_shell(a):
                 signal.signal(signal.SIGWINCH, old_winch)
             except Exception:
                 pass
-        try:
-            wclient.call("shell_close", {"session_id": sid}, timeout=10)
-        except Exception:
-            pass
+        if state.get("detached"):
+            # 挂起：**不能** shell_close，否则远端 shell 被杀，断线重连就没意义了
+            print()
+            print(dim("已挂起 %s（远端还在跑，录制没停）" % sid))
+            _t = (" " + label) if target else ""
+            print(dim("  回来：fleet attach %s%s" % (sid, _t)))
+            print(dim("  关掉：fleet kill %s%s" % (sid, _t)))
+        else:
+            try:
+                wclient.call("shell_close", {"session_id": sid}, timeout=10)
+            except Exception:
+                pass
+            print()
+            print(dim("会话已结束。"))
         client.close()
         wclient.close()
-        print()
-        print(dim("会话已结束。"))
     return 0
+
+
+# ---------------------------------------------------------------------------
+# 连接管理（v5.2.6）：sessions / attach / kill / recordings / replay
+# ---------------------------------------------------------------------------
+# ssh 的「连接管理」其实是三件散装工具：`who` 看谁在线、`ss -tp` 看连接、
+# `pkill` 断连接；断线就全丢。这里合成一条线：看得到 → 接管得回来 →
+# 关得掉 → 有录像可查。
+
+def _conn_endpoint(a):
+    """连接管理类命令的公共前置：有 target 就连副端，没有就连本机。"""
+    target = (getattr(a, "target", "") or "").strip()
+    if target:
+        url, meta = resolve_target(target, a.agent, a.port)
+        return url, meta, target
+    got = _local_endpoint()
+    if not got:
+        return None, None, ""
+    url, meta = got
+    return url, meta, (meta.get("name") or "本机")
+
+
+def _human_bytes(n):
+    try:
+        n = float(n)
+    except Exception:
+        return "-"
+    for unit in ("B", "KB", "MB", "GB"):
+        if n < 1024 or unit == "GB":
+            return ("%d%s" % (n, unit)) if unit == "B" else ("%.1f%s" % (n, unit))
+        n /= 1024.0
+    return "%d" % n
+
+
+def cmd_sessions(a):
+    """列出一台机器上所有「外面挂进来的连接」。"""
+    url, meta, label = _conn_endpoint(a)
+    if not url:
+        return die("本机没有安装节点，也没指定副端")
+    c = MCPClient(url, max(a.timeout, 60), token=meta.get("token", ""),
+                  connect_timeout=_connect_timeout(a))
+    try:
+        c.handshake()
+        text, is_err = c.call("sessions", {}, timeout=max(a.timeout, 60))
+    except MCPError as e:
+        return die("取会话表失败：%s" % e)
+    finally:
+        try:
+            c.close()
+        except Exception:
+            pass
+    if is_err:
+        return die(text)
+    try:
+        data = json.loads(text)
+    except ValueError:
+        return die("副端返回异常：%s" % text[:200])
+    if getattr(a, "json", False):
+        print(json.dumps(data, ensure_ascii=False, indent=2))
+        return 0
+    rows = data.get("sessions") or []
+    if not rows:
+        print("%s：当前没有任何连接。" % label)
+        print(dim("  开一条：fleet shell %s" % (a.target or "")))
+        return 0
+    print("%s  %s" % (ok(label), dim("共 %d 条连接" % len(rows))))
+    print(dim("  KIND           ID        LABEL                 AGE      IDLE     OUT      IN       REC"))
+    for r in rows:
+        alive = r.get("alive", True)
+        kind = r.get("kind", "?")
+        rec = "rec" if r.get("recording") else "-"
+        line = "  %-14s %-9s %-21s %-8s %-8s %-8s %-8s %s" % (
+            kind, r.get("id", ""), (r.get("label") or "")[:21],
+            r.get("age_h", "-"), r.get("idle_h", "-"),
+            _human_bytes(r.get("bytes_out", 0)), _human_bytes(r.get("bytes_in", 0)),
+            rec)
+        print(line if alive else dim(line + "  (已结束)"))
+    print("")
+    print(dim("  接管：fleet attach <ID> [副端]    断开：fleet kill <ID> [副端]"))
+    if any(r.get("recording") for r in rows):
+        print(dim("  回放：fleet replay <ID> [副端]"))
+    return 0
+
+
+def cmd_attach(a):
+    """接管一个已经在跑的会话。"""
+    sid = (getattr(a, "session_id", "") or "").strip()
+    if not sid:
+        return die("要接管的会话 id（fleet sessions 第一列，形如 sh-1a2b3c4d）")
+    a.attach = sid
+    return cmd_shell(a)
+
+
+def cmd_kill(a):
+    """按 id 断开任意连接（shell / 隧道 / 后台任务）。"""
+    sid = (getattr(a, "session_id", "") or "").strip()
+    if not sid:
+        return die("要断开的连接 id（fleet sessions 第一列）")
+    url, meta, label = _conn_endpoint(a)
+    if not url:
+        return die("本机没有安装节点，也没指定副端")
+    c = MCPClient(url, max(a.timeout, 60), token=meta.get("token", ""),
+                  connect_timeout=_connect_timeout(a))
+    try:
+        c.handshake()
+        text, is_err = c.call("session_kill",
+                              {"id": sid, "kind": getattr(a, "kind", "") or ""},
+                              timeout=max(a.timeout, 60))
+    except MCPError as e:
+        return die("断开失败：%s" % e)
+    finally:
+        try:
+            c.close()
+        except Exception:
+            pass
+    if is_err:
+        return die(text)
+    if text.startswith("未知"):
+        # shell_close 是幂等的（对端返回成功），但用户敲 kill 时想知道的
+        # 恰恰是「到底断掉没有」——把它当成成功会让人以为清理干净了。
+        print(warn("[!] 没有这条连接：%s @ %s" % (sid, label)))
+        print(dim("    fleet sessions %s 看现在有哪些" % (a.target or "")))
+        return 1
+    print("%s %s" % (ok("已断开"), dim("%s @ %s" % (sid, label))))
+    return 0
+
+
+def cmd_recordings(a):
+    """列出一台机器上的录制文件。"""
+    url, meta, label = _conn_endpoint(a)
+    if not url:
+        return die("本机没有安装节点，也没指定副端")
+    c = MCPClient(url, max(a.timeout, 60), token=meta.get("token", ""),
+                  connect_timeout=_connect_timeout(a))
+    try:
+        c.handshake()
+        text, is_err = c.call("recording_list", {}, timeout=max(a.timeout, 60))
+    except MCPError as e:
+        return die("取录制列表失败：%s" % e)
+    finally:
+        try:
+            c.close()
+        except Exception:
+            pass
+    if is_err:
+        return die(text)
+    data = json.loads(text)
+    if getattr(a, "json", False):
+        print(json.dumps(data, ensure_ascii=False, indent=2))
+        return 0
+    items = data.get("recordings") or []
+    if not items:
+        print("%s：还没有录制。" % label)
+        print(dim("  录制默认开；关掉：fleet shell --no-record"))
+        return 0
+    print("%s  %s" % (ok(label), dim(data.get("dir", ""))))
+    for it in items:
+        ts = time.strftime("%Y-%m-%d %H:%M", time.localtime(it.get("mtime", 0)))
+        print("  %-14s %8s  %s" % (it.get("id", ""), _human_bytes(it.get("size", 0)), ts))
+    print("")
+    print(dim("  回放：fleet replay <ID> [副端]"))
+    return 0
+
+
+def _play_cast(raw, speed=1.0):
+    """内置回放器：不依赖 asciinema 也能放。
+
+    只认 v2 的 `[time, "o", data]` 事件；`"i"`（键盘）忽略——我们本来就不录。
+    """
+    lines = raw.decode("utf-8", "replace").splitlines()
+    if not lines:
+        return 0
+    try:
+        header = json.loads(lines[0])
+        if not isinstance(header, dict) or header.get("version") != 2:
+            raise ValueError("not a v2 cast")
+    except Exception:
+        print(warn("[!] 这个文件不是 asciinema v2 cast，按纯文本打印"))
+        sys.stdout.write(raw.decode("utf-8", "replace"))
+        return 1
+    prev = 0.0
+    for line in lines[1:]:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            ev = json.loads(line)
+        except ValueError:
+            continue
+        if not isinstance(ev, list) or len(ev) < 3 or ev[1] != "o":
+            continue
+        try:
+            t = float(ev[0])
+        except (TypeError, ValueError):
+            continue
+        # 单条间隔封顶 2s：录了一段长时间的空白，回放时不该让人干等
+        delay = max(0.0, t - prev) / max(0.1, float(speed))
+        if delay > 0:
+            time.sleep(min(delay, 2.0))
+        prev = t
+        sys.stdout.write(ev[2] if isinstance(ev[2], str) else str(ev[2]))
+        sys.stdout.flush()
+    return 0
+
+
+def cmd_replay(a):
+    """把远端录制拉回来回放（asciinema cast）。"""
+    sid = (getattr(a, "session_id", "") or "").strip()
+    if not sid:
+        return die("要回放的录制 id（= 会话 id，fleet recordings 看有哪些）")
+    url, meta, label = _conn_endpoint(a)
+    if not url:
+        return die("本机没有安装节点，也没指定副端")
+    c = MCPClient(url, max(a.timeout, 60), token=meta.get("token", ""),
+                  connect_timeout=_connect_timeout(a))
+    chunks = []
+    off = 0
+    try:
+        c.handshake()
+        while True:
+            text, is_err = c.call("recording_fetch",
+                                  {"id": sid, "offset": off}, timeout=max(a.timeout, 60))
+            if is_err:
+                return die(text)
+            d = json.loads(text)
+            chunk = d.get("data_b64") or ""
+            if chunk:
+                chunks.append(base64.b64decode(chunk))
+            nxt = d.get("next", off)
+            if d.get("done") or nxt <= off:
+                break
+            off = nxt
+    except MCPError as e:
+        return die("取录制失败：%s" % e)
+    finally:
+        try:
+            c.close()
+        except Exception:
+            pass
+    raw = b"".join(chunks)
+    if not raw:
+        return die("录制是空的：%s" % sid)
+    if getattr(a, "dump", False):
+        # --dump：不按时间轴，直接把屏幕内容吐出来（要 grep 日志时用）
+        out = []
+        for line in raw.decode("utf-8", "replace").splitlines()[1:]:
+            try:
+                ev = json.loads(line)
+            except ValueError:
+                continue
+            if isinstance(ev, list) and len(ev) >= 3 and ev[1] == "o":
+                out.append(ev[2])
+        sys.stdout.write("".join(out))
+        return 0
+    player = shutil.which("asciinema")
+    if player and not getattr(a, "builtin", False):
+        import tempfile
+        fd, tmp = tempfile.mkstemp(suffix=".cast", prefix="fleet-replay-")
+        try:
+            with os.fdopen(fd, "wb") as f:
+                f.write(raw)
+            return subprocess.call([player, "play", "--speed", str(a.speed or 1), tmp])
+        finally:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+    return _play_cast(raw, a.speed or 1)
 
 
 # ---------------------------------------------------------------------------
@@ -2383,8 +2729,10 @@ def cmd_call(a):
     # 是同一个坑，判定也放在同一处——只有「没给 --tool、且这个位置参数不是任何
     # 已知副端」时才把它当工具名，其余情况一律当 target。
     if not tool and target and not _is_known_target(target, a.agent):
-        # `list` 是 --tool 的文档化取值，不是"猜"出来的，不必解释
-        if target != "list":
+        # `list` 是 --tool 的文档化取值，不是"猜"出来的，不必解释；
+        # 带下划线的多半是工具名（shell_open / recording_fetch），也不是误用，
+        # 提示只会变成噪音——真敲错节点名时下面那句「未知工具」会兜住。
+        if target != "list" and "_" not in target:
             print(dim("    （%r 不是已注册副端，按工具名在本机调用；指定副端："
                       "fleet call <名字> --tool %s）" % (target, target)), file=sys.stderr)
         tool, target = target, ""
@@ -5777,10 +6125,61 @@ def build_parser():
     sp.add_argument("target", nargs="?", default=None,
                     help="副端名字/地址；省略则探本机节点")
     sp.set_defaults(func=cmd_ping, timeout=5)
-    sp = common(sub.add_parser("shell", help="v5.3: 交互式远程 shell（PTY，替代 ssh）"))
+    sp = common(sub.add_parser("shell", help="v5.3: 交互式远程 shell（PTY，替代 ssh）"),
+                need_target=False)
+    sp.add_argument("target", nargs="?", default="", help="副端名字，省略=本机")
     sp.add_argument("--cwd", default="", help="远端起始目录")
     sp.add_argument("--insecure", action="store_true", help="跳过 HTTPS 证书校验")
+    sp.add_argument("--label", default="", help="会话标签（fleet sessions 里显示）")
+    sp.add_argument("--record", dest="record", action="store_true", default=None,
+                    help="强制录制（默认跟随节点配置，通常是开）")
+    sp.add_argument("--no-record", dest="record", action="store_false",
+                    help="本次不录（临时敲敏感内容时用）")
     sp.set_defaults(func=cmd_shell)
+
+    # ---- 连接管理（v5.2.6）----
+    sp = common(sub.add_parser(
+        "sessions", help="v5.2.6: 列出所有连接（shell / 隧道 / 后台任务）"),
+        need_target=False)
+    sp.add_argument("target", nargs="?", default="", help="副端名字，省略=本机")
+    sp.set_defaults(func=cmd_sessions)
+
+    sp = common(sub.add_parser(
+        "attach", help="v5.2.6: 接管一个已在跑的会话（断线重连）"),
+        need_target=False)
+    sp.add_argument("session_id", help="会话 id（fleet sessions 第一列）")
+    sp.add_argument("target", nargs="?", default="", help="副端名字，省略=本机")
+    sp.add_argument("--cwd", default="", help="（接管时忽略，保留参数以便和 shell 一致）")
+    sp.add_argument("--insecure", action="store_true", help="跳过 HTTPS 证书校验")
+    sp.add_argument("--label", default="", help="（接管时忽略）")
+    sp.set_defaults(func=cmd_attach, record=None, attach="")
+
+    sp = common(sub.add_parser(
+        "kill", help="v5.2.6: 断开任意连接（shell / 隧道 / 后台任务）"),
+        need_target=False)
+    sp.add_argument("session_id", help="连接 id（fleet sessions 第一列）")
+    sp.add_argument("target", nargs="?", default="", help="副端名字，省略=本机")
+    sp.add_argument("--kind", default="", choices=["", "shell", "tunnel", "job"],
+                    help="类型，默认按 id 前缀推断")
+    sp.set_defaults(func=cmd_kill)
+
+    sp = common(sub.add_parser(
+        "recordings", help="v5.2.6: 列出本机/副端的会话录制"),
+        need_target=False)
+    sp.add_argument("target", nargs="?", default="", help="副端名字，省略=本机")
+    sp.set_defaults(func=cmd_recordings)
+
+    sp = common(sub.add_parser(
+        "replay", help="v5.2.6: 回放会话录制（asciinema cast）"),
+        need_target=False)
+    sp.add_argument("session_id", help="录制 id（= 会话 id）")
+    sp.add_argument("target", nargs="?", default="", help="副端名字，省略=本机")
+    sp.add_argument("--speed", type=float, default=1.0, help="播放倍速，默认 1.0")
+    sp.add_argument("--dump", action="store_true",
+                    help="不按时间轴，直接把屏幕内容打出来（要 grep 时用）")
+    sp.add_argument("--builtin", action="store_true",
+                    help="用内置播放器（默认优先用系统的 asciinema）")
+    sp.set_defaults(func=cmd_replay)
     sp = common(sub.add_parser(
         "forward", help="v5.4: 端口转发（等价 ssh -L / -R）"))
     sp.add_argument("-L", "--local", action="append", metavar="[绑定:]端口:主机:端口",
@@ -6838,6 +7237,10 @@ def cmd_menu(a):
   [20] 交互式 shell（替代 ssh） [21] 端口转发（-L / -R）
   [10] 列远端工具清单（tools）
 
+  【连接管理】
+  [22] 看当前连接（sessions）   [23] 接管会话（attach）
+  [24] 断开连接（kill）         [25] 会话录制与回放
+
   【消息与拓扑】
   [11] 发送消息（msg send）     [12] 查看消息历史
   [13] 打印 mesh 拓扑图
@@ -6857,7 +7260,7 @@ def cmd_menu(a):
         print("  提示词速用：fleet prompt self_repair  然后原样粘给 AI 客户端。")
         print()
         try:
-            choice = input("  请选择 (0-21): ").strip()
+            choice = input("  请选择 (0-25): ").strip()
         except (EOFError, KeyboardInterrupt):
             print("\n  再见！")
             return 0
@@ -7090,6 +7493,67 @@ def cmd_menu(a):
             argv = ["forward", name]
             argv += (["--remote", spec] if direction == "R" else ["--local", spec])
             cmd_forward(_menu_args(argv))
+
+        # ---- 22: sessions ----
+        elif choice == "22":
+            _banner()
+            print("\n  当前连接（本机；要看副端：fleet sessions <名字>）")
+            print("  " + "-" * 40)
+            cmd_sessions(_menu_args(["sessions"]))
+            input("\n  按回车继续...")
+
+        # ---- 23: attach ----
+        elif choice == "23":
+            _banner()
+            print("\n  接管会话")
+            print("  " + "-" * 40)
+            cmd_sessions(_menu_args(["sessions"]))
+            print()
+            try:
+                sid = input("  会话 ID（留空返回）: ").strip()
+            except (EOFError, KeyboardInterrupt):
+                continue
+            if not sid:
+                continue
+            target = input("  在哪台设备（留空=本机）: ").strip()
+            argv = ["attach", sid] + ([target] if target else [])
+            cmd_attach(_menu_args(argv))
+            input("\n  按回车继续...")
+
+        # ---- 24: kill ----
+        elif choice == "24":
+            _banner()
+            print("\n  断开连接")
+            print("  " + "-" * 40)
+            cmd_sessions(_menu_args(["sessions"]))
+            print()
+            try:
+                sid = input("  会话 ID（留空返回）: ").strip()
+            except (EOFError, KeyboardInterrupt):
+                continue
+            if not sid:
+                continue
+            target = input("  在哪台设备（留空=本机）: ").strip()
+            argv = ["kill", sid] + ([target] if target else [])
+            cmd_kill(_menu_args(argv))
+            input("\n  按回车继续...")
+
+        # ---- 25: recordings / replay ----
+        elif choice == "25":
+            _banner()
+            print("\n  会话录制")
+            print("  " + "-" * 40)
+            target = input("  在哪台设备（留空=本机）: ").strip()
+            cmd_recordings(_menu_args(["recordings"] + ([target] if target else [])))
+            print()
+            try:
+                rid = input("  回放哪个（留空返回）: ").strip()
+            except (EOFError, KeyboardInterrupt):
+                continue
+            if rid:
+                argv = ["replay", rid] + ([target] if target else [])
+                cmd_replay(_menu_args(argv))
+            input("\n  按回车继续...")
 
         else:
             print("  无效选择，按回车继续...")

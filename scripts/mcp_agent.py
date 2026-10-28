@@ -104,7 +104,7 @@ for _stream in (sys.stdout, sys.stderr):
 DEFAULT_CONFIG = {
     "name": "node",             # 副端标识（显示在状态页与 serverInfo）
     "tool_prefix": "",          # 工具名前缀，如 "nas_"；留空则用裸名（exec/read/...）
-    "version": "5.2.5",
+    "version": "5.2.6",
     "sudo_password": "",        # 留空且非 root 时会尝试免密 sudo
     "work_dir": "/",            # 默认工作目录
     "command_timeout": 120,     # 秒
@@ -989,8 +989,18 @@ SHELL_TTL = 8 * 3600           # 已结束会话保留 8 小时
 SHELL_MAX = 8                  # 同时最多 8 个会话，防内存被撑爆
 # 客户端崩溃/断网时来不及 shell_close，会话会一直「活着」占槽位。客户端正常
 # 使用时每 5s 一次长轮询，last_read 一直在刷新；只有它真的不在了才不动。
-SHELL_IDLE = 30 * 60           # 30 分钟没人读 -> 认定客户端已消失，回收
+# v5.2.6: 会话要能**断开再回来**（tmux 手感），30 分钟太短——午饭回来就没了。
+# 内存代价是每会话 512KB 上限 × 8，可接受；磁盘只有录制文件，另有上限。
+SHELL_IDLE = int(CFG.get("shell_idle_sec") or 2 * 3600)
 SHELL_IDLE_MIN = 120           # 槽位紧张时，空闲超过 2 分钟就挤掉（挤最久的）
+
+# ---- 会话录制（v5.2.6）：asciinema v2 cast ----
+# 为什么用 cast 而不是自己发明格式：`asciinema play` / `agg` / asciinema-player
+# 都能直接放，不用我们写播放器，也不用把录像锁在 fleet 里。
+# 只记**输出**（"o"），不记键盘输入——录制的目的是「屏幕上出现了什么」，
+# 而键盘里可能有密码。这一点和 Teleport 的默认行为一致。
+REC_DIR = os.path.join(DATA_DIR, "recordings")
+REC_MAX = 64 * 1024 * 1024     # 单会话录制上限 64MB：不设限就是给磁盘留了个洞
 
 
 def _kill_shell(sess):
@@ -1018,6 +1028,7 @@ def _kill_shell(sess):
         sess["end"] = sess.get("end") or time.time()
     except Exception:
         pass
+    _rec_stop(sess)              # 被强杀时读线程来不及收尾，这里补一刀
 
 
 def _shell_sweep():
@@ -1035,6 +1046,78 @@ def _shell_sweep():
     for sess in victims:
         if sess:
             _kill_shell(sess)
+
+
+def _rec_start(sess, term):
+    """给会话挂一个 asciinema v2 录制器；失败就静默不录（不能因为录制不了就不给用）。"""
+    try:
+        import codecs
+        os.makedirs(REC_DIR, exist_ok=True)
+        path = os.path.join(REC_DIR, sess["id"] + ".cast")
+        # buffering=1：文本模式下是**行缓冲**，每条事件（一行）就落盘一次。
+        # 默认 8KB 缓冲会让「刚敲完就崩」的录制丢掉最后几十秒——而那种时刻
+        # 恰恰是最需要录像的时候。
+        f = io.open(path, "w", encoding="utf-8", newline="\n", buffering=1)
+        f.write(json.dumps({"version": 2, "width": sess["cols"], "height": sess["rows"],
+                            "timestamp": int(sess["start"]),
+                            "env": {"SHELL": sess.get("shell", ""), "TERM": term}},
+                           ensure_ascii=False) + "\n")
+        f.flush()
+    except Exception:
+        return ""
+    sess["rec"] = {"f": f, "path": path, "t0": sess["start"], "bytes": 0,
+                   "dropped": False,
+                   # PTY 的输出可能在**多字节字符中间**被切开（os.read 65536 一读）。
+                   # 直接 decode(errors="replace") 会把一个字拆成两个 �，回放里就是乱码。
+                   # 增量解码器会把半截留在内部，等下一块拼齐再吐。
+                   "dec": codecs.getincrementaldecoder("utf-8")("replace")}
+    return path
+
+
+def _rec_write(sess, chunk):
+    """把一段 PTY 输出写进录制。任何异常都只影响录制，不影响会话本身。"""
+    r = sess.get("rec")
+    if not r or r.get("dropped"):
+        return
+    if r["bytes"] >= REC_MAX:
+        r["dropped"] = True
+        try:
+            r["f"].close()
+        except Exception:
+            pass
+        return
+    try:
+        text = r["dec"].decode(chunk)
+        if not text:
+            return                      # 这一块只到半个字符，等下一块
+        r["f"].write(json.dumps([round(time.time() - r["t0"], 3), "o", text],
+                                ensure_ascii=False) + "\n")
+        r["bytes"] += len(text.encode("utf-8"))
+    except Exception:
+        r["dropped"] = True
+        try:
+            r["f"].close()
+        except Exception:
+            pass
+
+
+def _rec_stop(sess):
+    """收尾：冲掉解码器里剩下的半截，关文件。可重复调用。"""
+    r = sess.get("rec")
+    if not r:
+        return
+    sess["rec"] = None
+    try:
+        tail = r["dec"].decode(b"", True)
+        if tail:
+            r["f"].write(json.dumps([round(time.time() - r["t0"], 3), "o", tail],
+                                    ensure_ascii=False) + "\n")
+    except Exception:
+        pass
+    try:
+        r["f"].close()
+    except Exception:
+        pass
 
 
 def _shell_reader(sess):
@@ -1056,12 +1139,14 @@ def _shell_reader(sess):
                 # 只留最近的一段；base 记录「缓冲区第一个字节的绝对偏移」
                 sess["buf"] = sess["buf"][-SHELL_BUF_MAX:]
                 sess["base"] = sess["total"] - len(sess["buf"])
+        _rec_write(sess, chunk)          # 录制在锁外写盘，别让磁盘 IO 卡住读线程
     with sess["lock"]:
         sess["end"] = time.time()
         try:
             sess["exit"] = os.waitpid(sess["pid"], os.WNOHANG)[1]
         except Exception:
             sess["exit"] = None
+    _rec_stop(sess)
 
 
 def _b64d(s):
@@ -1123,6 +1208,7 @@ def t_shell_open(a):
         shell = "/bin/sh"
     cols = max(20, min(500, int(a.get("cols") or 80)))
     rows = max(5, min(200, int(a.get("rows") or 24)))
+    term = a.get("term") or "xterm-256color"
     wd = a.get("workDir") or CFG.get("work_dir") or os.path.expanduser("~")
 
     pid, fd = pty.fork()
@@ -1131,7 +1217,7 @@ def t_shell_open(a):
             if os.path.isdir(wd):
                 os.chdir(wd)
             env = dict(os.environ)
-            env["TERM"] = a.get("term") or "xterm-256color"
+            env["TERM"] = term
             env.pop("COLUMNS", None)
             env.pop("LINES", None)
             os.execvpe(shell, [shell, "-l"], env)
@@ -1146,12 +1232,22 @@ def t_shell_open(a):
     now = time.time()
     sess = {"id": sid, "fd": fd, "pid": pid, "buf": b"", "base": 0, "total": 0,
             "lock": threading.Lock(), "start": now, "last_read": now, "end": None,
-            "exit": None, "shell": shell, "cols": cols, "rows": rows}
+            "exit": None, "shell": shell, "cols": cols, "rows": rows,
+            # 归属信息：多端同时连一台机器时，`fleet sessions` 要能看出
+            # 哪条是自己的、哪条是别人留下的（否则只能靠猜时间）
+            "owner": (a.get("owner") or "").strip()[:64],
+            "label": (a.get("label") or "").strip()[:64],
+            "bytes_in": 0}
     with SHELLS_LOCK:
         SHELLS[sid] = sess
+    rec_on = a.get("record")
+    if rec_on is None:
+        rec_on = bool(CFG.get("record_shell", True))
+    rec_path = _rec_start(sess, term) if rec_on else ""
     threading.Thread(target=_shell_reader, args=(sess,), daemon=True).start()
     return json.dumps({"session_id": sid, "shell": shell, "cols": cols,
-                       "rows": rows, "pid": pid}, ensure_ascii=False), False
+                       "rows": rows, "pid": pid,
+                       "recording": rec_path}, ensure_ascii=False), False
 
 
 def _get_shell(a):
@@ -1177,6 +1273,7 @@ def t_shell_write(a):
         os.write(sess["fd"], data)
     except OSError as e:
         return "写入失败：%r（会话可能已退出）" % (e,), True
+    sess["bytes_in"] = sess.get("bytes_in", 0) + len(data)
     return "ok", False
 
 
@@ -1284,6 +1381,166 @@ def t_shell_list(a):
                         s["rows"], age, idle, total,
                         "已结束" if s.get("end") else "运行中"))
     return "\n".join(lines), False
+
+
+# ---------------------------------------------------------------------------
+# 连接管理（v5.2.6）：一张表看全这台机器上的所有外部连接
+# ---------------------------------------------------------------------------
+# 为什么要统一：shell 会话、`-R` 监听、隧道连接、后台任务，本质都是「有人从
+# 外面挂在这台机器上」。以前它们各有各的 list 工具（shell_list / tunnel_list /
+# exec_jobs），想知道「现在有几条连接」得敲三次、再自己拼。ssh 的对应物是
+# `ss -tp` + `who` + `ps`，也都得拼。这里给一张表。
+
+def _age_str(sec):
+    sec = max(0, int(sec))
+    if sec < 60:
+        return "%ds" % sec
+    if sec < 3600:
+        return "%dm%02ds" % (sec // 60, sec % 60)
+    if sec < 86400:
+        return "%dh%02dm" % (sec // 3600, (sec % 3600) // 60)
+    return "%dd%02dh" % (sec // 86400, (sec % 86400) // 3600)
+
+
+def t_sessions(a):
+    """列出本机所有连接：shell 会话 / 隧道（连接与监听）/ 后台任务。"""
+    _shell_sweep()
+    _tun_sweep()
+    _job_sweep()
+    now = time.time()
+    out = []
+    with SHELLS_LOCK:
+        shells = list(SHELLS.values())
+    for s in shells:
+        with s["lock"]:
+            total = s["total"]
+        rec = s.get("rec") or {}
+        out.append({
+            "kind": "shell", "id": s["id"], "pid": s.get("pid"),
+            "label": s.get("label") or os.path.basename(s.get("shell") or "sh"),
+            "owner": s.get("owner", ""),
+            "age": int(now - s["start"]), "age_h": _age_str(now - s["start"]),
+            "idle": int(now - s.get("last_read", s["start"])),
+            "idle_h": _age_str(now - s.get("last_read", s["start"])),
+            "bytes_out": total, "bytes_in": s.get("bytes_in", 0),
+            "alive": not s.get("end"),
+            "geometry": "%dx%d" % (s.get("cols", 80), s.get("rows", 24)),
+            "recording": rec.get("path", ""),
+            "recorded": rec.get("bytes", 0),
+        })
+    with TUNNELS_LOCK:
+        tuns = list(TUNNELS.values())
+    for s in tuns:
+        kind = s.get("kind", "conn")
+        with s["lock"]:
+            total = s.get("total", 0)
+        out.append({
+            "kind": "tunnel-listen" if kind == "listen" else "tunnel-conn",
+            "id": s["id"], "pid": None,
+            "label": s.get("bound") or s.get("peer") or "",
+            "owner": "", "age": int(now - s.get("start", now)),
+            "age_h": _age_str(now - s.get("start", now)),
+            "idle": int(now - s.get("last_data", s.get("last", now))),
+            "idle_h": _age_str(now - s.get("last_data", s.get("last", now))),
+            "bytes_out": total, "bytes_in": 0,
+            "alive": not s.get("end"), "geometry": "",
+            "recording": "", "recorded": 0,
+        })
+    with JOBS_LOCK:
+        jobs = list(JOBS.values())
+    for j in jobs:
+        out.append({
+            "kind": "job", "id": j["id"], "pid": getattr(j.get("proc"), "pid", None),
+            "label": (j.get("cmd") or "")[:60], "owner": "",
+            "age": int(now - j["start"]), "age_h": _age_str(now - j["start"]),
+            "idle": 0, "idle_h": "-",
+            "bytes_out": len(j.get("buf") or b""), "bytes_in": 0,
+            "alive": not j.get("end"), "geometry": "",
+            "recording": "", "recorded": 0,
+        })
+    out.sort(key=lambda x: (x["kind"], -x["age"]))
+    return json.dumps({"count": len(out), "sessions": out},
+                      ensure_ascii=False), False
+
+
+def _guess_kind(sid):
+    if sid.startswith("sh-"):
+        return "shell"
+    if sid.startswith("tl-") or sid.startswith("tn-"):
+        return "tunnel"
+    return "job"
+
+
+def t_session_kill(a):
+    """按 id 关掉任意连接。id 前缀已经能区分类型，kind 可省。"""
+    sid = (a.get("id") or "").strip()
+    if not sid:
+        return "要给 id（fleet sessions 第一列）", True
+    kind = (a.get("kind") or "").strip() or _guess_kind(sid)
+    if kind in ("shell", "sh"):
+        return t_shell_close({"session_id": sid})
+    if kind in ("tunnel", "tn", "tl"):
+        return t_tunnel_close({"tunnel_id": sid})
+    if kind in ("job", "exec"):
+        return t_exec_kill({"job_id": sid})
+    return "不认识的 kind：%s（可选 shell / tunnel / job）" % kind, True
+
+
+def t_recording_list(a):
+    """列出本机录制文件（asciinema cast）。"""
+    try:
+        names = sorted(os.listdir(REC_DIR))
+    except OSError:
+        names = []
+    items = []
+    for n in names:
+        if not n.endswith(".cast"):
+            continue
+        p = os.path.join(REC_DIR, n)
+        try:
+            st = os.stat(p)
+        except OSError:
+            continue
+        items.append({"id": n[:-5], "size": st.st_size,
+                      "mtime": int(st.st_mtime),
+                      "path": p})
+    items.sort(key=lambda x: -x["mtime"])
+    return json.dumps({"count": len(items), "recordings": items,
+                       "dir": REC_DIR}, ensure_ascii=False), False
+
+
+def t_recording_fetch(a):
+    """分块取录制文件（base64）。offset 是**字节**偏移，不是事件条数。"""
+    rid = (a.get("id") or "").strip()
+    # 目录穿越：id 直接拼进路径，不校验就能读 /etc/shadow 之外的任意文件
+    if not rid or "/" in rid or "\\" in rid or rid.startswith("."):
+        return "非法 id：%r" % rid, True
+    path = os.path.join(REC_DIR, rid + ".cast")
+    try:
+        size = os.path.getsize(path)
+    except OSError:
+        return "没有这个录制：%s（fleet recordings 看有哪些）" % rid, True
+    try:
+        offset = max(0, int(a.get("offset") or 0))
+    except Exception:
+        offset = 0
+    try:
+        limit = int(a.get("limit") or 512 * 1024)
+    except Exception:
+        limit = 512 * 1024
+    limit = max(4096, min(4 * 1024 * 1024, limit))
+    try:
+        with io.open(path, "rb") as f:
+            f.seek(offset)
+            chunk = f.read(limit)
+    except (OSError, IOError) as e:
+        return "读取失败：%s" % e, True
+    return json.dumps({
+        "id": rid, "size": size, "offset": offset,
+        "data_b64": _b64e(chunk),
+        "next": offset + len(chunk),
+        "done": offset + len(chunk) >= size,
+    }, ensure_ascii=False), False
 
 
 # ---------------------------------------------------------------------------
@@ -3699,7 +3956,10 @@ BASE_TOOLS = [
          "cols": {"type": "number", "description": "列数，默认 80"},
          "rows": {"type": "number", "description": "行数，默认 24"},
          "term": {"type": "string", "description": "TERM 环境变量，默认 xterm-256color"},
-         "workDir": {"type": "string", "description": "起始目录"}}}),
+         "workDir": {"type": "string", "description": "起始目录"},
+         "record": {"type": "boolean", "description": "是否录制（asciinema cast），默认跟随配置"},
+         "label": {"type": "string", "description": "会话标签，便于 sessions 里辨认"},
+         "owner": {"type": "string", "description": "谁开的（agent 名 / 主机名）"}}}),
     ("shell_write", "把键盘输入写进交互式会话（data_b64 为 base64 编码的原始字节）。",
      {"type": "object", "properties": {
          "session_id": {"type": "string"},
@@ -3721,6 +3981,23 @@ BASE_TOOLS = [
       "required": ["session_id"]}),
     ("shell_list", "列出本机所有交互式会话。",
      {"type": "object", "properties": {}}),
+    # ---- 连接管理（v5.2.6）：一张表 + 统一断开 + 录像回放 ----
+    ("sessions", "列出本机所有连接：shell 会话 / 隧道（连接与监听）/ 后台任务，含时长、空闲、字节数、是否在录。",
+     {"type": "object", "properties": {}}),
+    ("session_kill", "按 id 断开任意连接（shell / 隧道 / 后台任务）。id 前缀已能区分类型。",
+     {"type": "object", "properties": {
+         "id": {"type": "string", "description": "会话 id，如 sh-1a2b3c4d / tn-... / job id"},
+         "kind": {"type": "string", "enum": ["shell", "tunnel", "job"],
+                  "description": "可省，按 id 前缀推断"}},
+      "required": ["id"]}),
+    ("recording_list", "列出本机录制文件（asciinema v2 cast），按时间倒序。",
+     {"type": "object", "properties": {}}),
+    ("recording_fetch", "分块取一个录制文件（base64），offset 是字节偏移。",
+     {"type": "object", "properties": {
+         "id": {"type": "string", "description": "录制 id（= 会话 id）"},
+         "offset": {"type": "number", "description": "字节偏移，首次传 0"},
+         "limit": {"type": "number", "description": "单次最多字节，默认 512KB"}},
+      "required": ["id"]}),
     # ---- 端口转发（v5.4）：替代 ssh -L / -R ----
     ("tunnel_open", "从副端本机连出去，建立一条 TCP 隧道（主端 -L 的远端半截）。",
      {"type": "object", "properties": {
@@ -3827,6 +4104,8 @@ BASE_FUNCS = {
     "shell_open": t_shell_open, "shell_write": t_shell_write,
     "shell_read": t_shell_read, "shell_resize": t_shell_resize,
     "shell_close": t_shell_close, "shell_list": t_shell_list,
+    "sessions": t_sessions, "session_kill": t_session_kill,
+    "recording_list": t_recording_list, "recording_fetch": t_recording_fetch,
     "tunnel_open": t_tunnel_open, "tunnel_listen": t_tunnel_listen,
     "tunnel_accept": t_tunnel_accept, "tunnel_read": t_tunnel_read,
     "tunnel_write": t_tunnel_write, "tunnel_close": t_tunnel_close,
