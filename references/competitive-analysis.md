@@ -146,16 +146,14 @@ README 里建议用户自己靠 `~/.ssh/config` 和系统日志兜。
 
 ### P0 —— 直接影响「替代 ssh」和「集群可用」
 
-1. **会话录制 / 回放**。`fleet shell` 的字节流没有留证，审计链只到命令级。
-   Teleport 和 Tailscale SSH 都有。做法很便宜：`t_shell_read` 旁路写 asciinema cast
-   （JSONL，`[time, "o", "bytes"]`），`fleet shell --record` 默认开，`fleet replay <id>` 回放。
-   我们本来就在 base64 传输出流，只是没落盘。
-2. **批量并行执行**。`fleet run --all` / `--group web "uptime"`，复用 `health` 的
-   ThreadPool 骨架 + 结果聚合表（按退出码分组）。这是「管一堆机器」的第一反应，
-   现在只能写 `for n in $(fleet targets); do fleet exec $n ...; done`。
+1. ~~**会话录制 / 回放**~~ —— **已在 v5.2.6 做完**。`t_shell_read` 旁路写 asciinema
+   v2 cast，`fleet recordings` / `fleet replay` 回放；只录输出不录键盘。
+2. ~~**批量并行执行**~~ —— **已在 v5.2.8 做完**。`fleet run --all/--group/名字列表`，
+   `ThreadPoolExecutor` + 每台独立客户端，稳定顺序、退出码判据、`--short`/`--quiet`/`--json`
+   三种视图；配套 `fleet group` 分组管理（`groups` 存进节点，跟着节点走）。
 3. **单 endpoint 聚合（gateway 模式）**。一个 MCP URL 暴露全集群，工具名 `node__tool`。
    否则接 5 台设备要在客户端配 5 次——这正是 Docker MCP Gateway / `mcp-gateway`
-   已经解决的事，我们没做。
+   已经解决的事，我们没做。**（下一个要做的）**
 
 ### P1 —— 影响「AI 借用设备环境」和团队场景
 

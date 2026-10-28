@@ -10,7 +10,85 @@
 
 ---
 
-## [5.2.7] — 2026-10-28 · 第一次上真软路由：三个只有真机才暴露的坑
+## [5.2.8] — 2026-10-28 · 一次管一堆机器：批量执行与分组
+
+竞品调研（`references/competitive-analysis.md`）里剩下的 P0 第一项。ssh 本身没有
+「在多台机器上跑同一条命令」的能力，这件事历来由 pdsh / clush / ansible ad-hoc 补。
+在此之前，这个项目的答案是让用户自己写循环：
+
+```bash
+for n in $(fleet targets); do fleet exec $n "uptime"; done
+```
+
+串行、出错不停、输出糊成一片、也看不出哪台失败。**这等于没做。**
+
+### 1. `fleet run`：批量并行执行
+
+```bash
+fleet run --all "uptime"
+fleet run --group web "systemctl restart nginx"
+fleet run nas,pi "df -h"
+fleet run --all --short "apt-get -s upgrade"   # 每台一行，看哪台不对
+fleet run --all --quiet "reboot"               # 只要结论，判退出码
+```
+
+`ThreadPoolExecutor` + **每台一个独立客户端**——`http.client` 的连接不是线程安全的，
+共用一个会抛 `CannotSendRequest: Request-sent`（`MCPClient` 的注释里早就写了这条，
+批量执行是第一个真的会撞上的场景）。
+
+### 2. 一台离线不能拖住整批
+
+建连用短超时、不重试（和 `health` 同一条理由：体检不是诊断）。离线那台单独记一行
+错误，其余照常出结果，退出码 1。原来串行时，五台里三台没开机，一次批量要等
+三个建连超时。
+
+### 3. 输出顺序稳定，进度不掺进结果
+
+结果按节点名排序打印，同一批跑两次排版一致，能直接 `diff`。进度（`3/5 完成`）
+只写 stderr、且只在终端里显示——重定向到文件时那些 `\r` 只会变成垃圾字符。
+
+### 4. 两个必然踩到的 argparse 坑
+
+- **`fleet run --all "uptime"`**：`[targets?] [command...]` 的歧义让唯一的位置参数
+  被 `targets` 吃掉，`command` 变成空。范围已由 `--all/--group/--local` 说清，
+  这个孤立的位置参数只能是命令。
+- **`fleet run nas --short "df -h"`**：`REMAINDER` 把 `--short` 一起塞进命令，
+  设备上直接报 `bash: --short: invalid option`。自己捞一遍开关（`_RUN_BOOL` /
+  `_RUN_VAL` 两张表），前后两种写法都成立。
+
+### 5. 分组：`groups` 存在节点上，不另起一份文件
+
+```bash
+fleet group                       # 有哪些组、各几个成员
+fleet group web                   # 这个组里是谁
+fleet group add web istoreos nas
+fleet group rm web nas
+fleet group del web
+fleet add --name pi --ip 192.168.1.9 --group web
+```
+
+分组信息写进登记表每个节点的 `groups` 字段，**跟着节点走**：`fleet remove`
+删节点时不会留下幽灵成员。重新 `add` 同一台（换地址/换令牌）不会把它踢出原来的组；
+`groups` 手写成 `"web,db"` 这种走形格式也认（`_norm_groups`）。
+
+### 6. 一个自己写出来的 bug，值得记一笔
+
+`cmd_run` 里写 `err = _run_take_flags(...)`，把模块级的 `err()` 颜色函数**遮蔽**了，
+后面 `err("[x] ...")` 就变成 `'NoneType' object is not callable`。这类错误只在
+「走到那条分支」时才炸——`--quiet` 路径不打印错误所以一直正常，直到跑
+`fleet run --all -j 2` 才暴露。变量名别跟函数名撞。
+
+### 其它
+
+- 菜单加 [26] 批量执行 / [27] 分组管理，`请选择 (0-25)` → `(0-27)`；
+- `fleet list` 每行补 `[组: web]`，`fleet add` 打印归组结果；
+- 块头横线按**显示宽度**算（`_dw`），中文「连不上」占两列，用 `len()` 会歪 3 格；
+- 工具总数不变（73）：`run` / `group` 是 CLI 侧编排，不新增副端工具。
+
+测试：1039 → **1101 passed, 1 skipped**（新增 `tests/test_batch_528.py` 62 条）。
+
+---
+
 
 拿到 iStoreOS（24.10.7 / Celeron J4125 / 998MB 内存 / Tailscale）的登录权限后，
 把它从 5.2.0 原地升到 5.2.7，逐条敲命令。**前三条命令就翻车了。**

@@ -1,7 +1,7 @@
-# 真机测试结果 · MCP Fleet v5.2.7
+# 真机测试结果 · MCP Fleet v5.2.8
 
 > 本文件记录可复现的真实设备验证。最近一次：2026-10-28（iStoreOS 真机）。
-> 自动化用例：**1039 passed + 1 skipped**（`python3 -m pytest tests/ -q`）。
+> 自动化用例：**1101 passed + 1 skipped**（`python3 -m pytest tests/ -q`）。
 > 下列结果来自实际安装/升级/运行，不是单元测试推断。
 
 ## 1. 覆盖矩阵
@@ -12,7 +12,7 @@
 | Ubuntu 24.04.5 LTS（云主机） | systemd 255 | 5.1.1（修复合集） | ✅ 安装 / 自签 TLS / token / 自愈 / 远程更新 / 回滚 / 卸载 |
 | Android 14（realme RMX2202） | Termux（wake-lock + 后台进程） | 5.2.0 → 5.2.0 | ✅ 安装 / 默认 token / 电池引导 / CLI / 跨端执行 / 消息 / 自更新 |
 | Linux 其他发行版 | systemd/openrc/nohup | — | 🟡 单元测试 + 模板渲染，未真机 |
-| OpenWrt / 软路由（iStoreOS 24.10.7） | procd | 5.2.0 → 5.2.7 | ✅ 安装 / 升级 / exec / cp / forward / sessions / 录制回放（见第 6 节） |
+| OpenWrt / 软路由（iStoreOS 24.10.7） | procd | 5.2.0 → 5.2.8 | ✅ 安装 / 升级 / exec / cp / forward / sessions / 录制回放（见第 6 节） |
 | Windows | schtasks | — | 🟡 单元测试 + 模板渲染，未真机 |
 | Docker | compose | — | 🟡 静态审查 + 配置修复，未做运行时验证 |
 
@@ -98,6 +98,33 @@ audit     → ok:true（升级前 ok:false / bad_index 0 —— 5.2.4 修的那�
 | 每条 exec 输出被开机横幅污染 | `fleet exec istoreos "uname -s"` 返回 9 行 ASCII + `Linux` | `_wrap` 默认 `-lc`，OpenWrt 的 `/etc/profile` 打 MOTD |
 | `fleet cp` 完全不可用 | `远端 stat 输出异常：'\x1b[0;1;34;94m▀ ...'` | 同上，横幅把 stat 那一行挤掉了 |
 | `net_check listen` 返回 683KB | 6943 行（含 ESTABLISHED） | busybox `netstat` 不认 `-l`，`ss` 又不存在 |
+
+### 5.1 批量执行（v5.2.8，同一台真机 + 本机）
+
+`fleet run --all --local "uptime"` —— 两台节点并发跑，一台在 Tailscale 那头
+（往返 4–11s，丢包），一台是本地回环：
+
+```text
+── istoreos ──────────────────────────────────────────  [exit 0] 11455ms
+ 10:30:36 up 19 days, 22:56,  load average: 1.01, 0.90, 0.94
+
+── node ─────────────────────────────────────────────────  [exit 0] 63ms
+ 10:30  up 6 days, 21:10, 1 user, load averages: 2.99 3.03 3.53
+
+✓ 2 台全部成功  ·  总耗时 11.5s
+```
+
+**总耗时 11.5s = max(11.4s, 0.06s)，不是 11.46s 的累加**——这就是并行的证据。
+块头按显示宽度对齐到 72 列（`_dw` 按 East Asian Width 算，中文占两列）。
+
+同一批机器上验证过的失败路径：
+
+```text
+run --all（含一台连不上的） → ✓ 1 成功  ✗ 1 失败，退出码 1，好的那台结果完整
+run nosuch "echo hi"        → 提示「没有这个节点或组」，退出码 2
+run nas（忘给命令）          → 「没给命令」+ 三种用法，退出码 1
+run istoreos --quiet "exit 7" → 只打汇总，退出码 1（--quiet 写在命令前/后都认）
+```
 
 ## 6. 修复过的真实缺陷（真机发现，已合并进 5.1.1 / 5.2.7）
 

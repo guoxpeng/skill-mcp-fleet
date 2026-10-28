@@ -1,12 +1,12 @@
 ---
 name: mcp-fleet
-version: 5.2.7
+version: 5.2.8
 description: 把手机、NAS、云服务器、软路由、电脑与 Docker 容器组成一张 AI 对等协作网：一条命令安装节点、设备码/邀请链接安全配对，任意 MCP Agent 即可跨设备执行命令、读写与传输文件、查看容器日志、离线留言、按能力委派任务，并自带只读自检与有界自修复。默认安全（Ed25519 身份、请求签名防重放、认证加密信箱、哈希链审计），零第三方依赖、不依赖任何中心服务。当用户需要管理 NAS、远程控制家中电脑、多设备互联、让 AI 操作设备、远程执行命令、软路由排查、云主机纳管、离线留言、设备监控、MCP 组网或多 Agent 协作时使用；即使用户未提 "fleet"，只要涉及「用聊天指挥另一台设备干活」也应主动使用。
 license: MIT
 compatibility: Python 3.6+，纯标准库；Linux / macOS / Windows / Android(Termux) / OpenWrt。可选 openssl（自动生成 TLS 证书）与 tailscale（跨网段加速）。
 ---
 
-# MCP Fleet v5.2.7 · 让所有设备成为一支 AI 团队
+# MCP Fleet v5.2.8 · 让所有设备成为一支 AI 团队
 
 MCP Fleet 把每台设备变成一个**节点**，节点之间对等互联：自动发现、在线直投、离线信箱、
 按能力委派。设备上的 AI Agent 可以直接对话与协作，而不是"人拿遥控器"。
@@ -164,6 +164,22 @@ A(规划) → propose 任务给 B(执行) → B 回 progress → B 回 result+�
 失败：B 回 fail(原因/已尝试) → A 重规划或升级给用户，不静默重试
 ```
 
+### 4）多台机器一起动手（v5.2.8，走 CLI）
+
+MCP 工具是「一次一台」的语义，批量要落到 CLI（Agent 用 bash 跑即可）：
+
+```bash
+fleet run --all --short "apt-get -s upgrade"   # 全部节点，每台一行，看谁不对
+fleet run --group web "systemctl restart nginx"
+fleet run nas,pi "df -h" --short
+```
+
+- 退出码可直接当判据：全成功 `0` / 有失败 `1` / 没匹配到 `2`；
+- 一台离线不拖住整批（短建连、不重试），其余照常出结果；
+- `--json` 拿结构化结果自己聚合；`--quiet` 只要结论。
+- **`fleet group` 是「节点分组」**（给批量执行用，存在登记表里），
+  和 agent 协作组（`group_form` / `group_list` / `group_disband`）不是一回事。
+
 ---
 
 ## 四、安全红线（必须遵守）
@@ -196,6 +212,7 @@ A(规划) → propose 任务给 B(执行) → B 回 progress → B 回 result+�
 | 模式 | `node_mode` `request_assist` `assist_queue` | 临时/长期、直接/辅助 |
 | 自对话 | `fleet_help` `fleet_think` `fleet_plan` `fleet_reflect` `fleet_review` `fleet_handoff` | 规划/反思/验收/交接 |
 | 运维 | `fleet_doctor` `fleet_metrics` `fleet_identity` `fleet_audit_verify` `fleet_token_rotate` | 自检/指标/身份/审计/轮换 |
+| 批量（CLI） | `fleet run` `fleet group` | 多台并行跑同一命令 / 节点分组（**不是 MCP 工具**，用 bash 调） |
 
 完整参数：调用 `fleet_help(topic="tools")`，或见 `references/agent-playbook.md`。
 

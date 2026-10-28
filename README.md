@@ -1,4 +1,4 @@
-# MCP Fleet v5.2.7 · 让所有设备成为一支 AI 团队
+# MCP Fleet v5.2.8 · 让所有设备成为一支 AI 团队
 
 > **2026 华为开发者大赛 · 小红书 Skill 创新赛** ｜ 通用赛道 · 开发工具
 > 作者：guoxpeng ｜ 开源仓库：https://github.com/guoxpeng/skill-mcp-fleet ｜ 许可：MIT
@@ -159,7 +159,52 @@ fleet replay sh-1a2b3c4d       # 回放（asciinema v2 cast）
 - 三个真会翻车的细节：多字节字符跨 `os.read` 边界（增量解码器）、
   默认 8KB 缓冲丢最后几十秒（改行缓冲）、录制目录不可写时不能拖垮会话本身。
 
-### 6.7 端口转发（`ssh -L / -R` 的等价物）
+### 6.7 批量执行与分组（v5.2.8）
+
+ssh 还有一件事做不了：**一次管一堆机器**。以前只能自己写循环——
+
+```bash
+for n in $(fleet targets); do fleet exec $n "uptime"; done
+```
+
+串行、出错不停、输出糊成一片、也看不出哪台失败。v5.2.8 把 pdsh / clush /
+ansible ad-hoc 干的那件事补上：
+
+```bash
+fleet run --all "uptime"                      # 全部副端，并发 8
+fleet run --group web "systemctl restart nginx"
+fleet run nas,pi "df -h"                      # 点名
+fleet run --all --short "apt-get -s upgrade"  # 每台只留一行，看哪台不对
+fleet run --all --quiet "reboot"              # 只要结论，脚本里判退出码
+```
+
+- **不串行**：`ThreadPoolExecutor` + 每台一个独立客户端（`http.client` 的连接不是
+  线程安全的，共用会 `CannotSendRequest`）。默认并发 8，`--jobs` 可调。
+- **一台离线不拖住整批**：建连用短超时、不重试（和 `health` 同一条理由），
+  离线那台单独记一行错误，其余照常出结果。
+- **输出顺序稳定**：结果按节点名排序打印，同一批跑两次排版一致，能直接 `diff`。
+  进度（`3/5 完成`）只写 stderr 且仅在终端里显示，重定向时不会掺进结果。
+- **退出码能当判据**：全成功 `0` / 有失败 `1` / 没匹配到任何节点 `2`。
+- **开关前后都能写**：`fleet run nas --short "df -h"` 里的 `--short` 不会被当成
+  命令发给设备（argparse 的 `REMAINDER` 会吞掉它，这里自己捞回来）。
+- **`--all "uptime"` 不歧义**：唯一的那个位置参数是命令，不是节点名。
+
+分组信息存在登记表每个节点的 `groups` 字段里，跟着节点走——`fleet remove`
+删节点时不会留下幽灵成员：
+
+```bash
+fleet group                                   # 有哪些组、各几个成员
+fleet group web                               # 这个组里是谁
+fleet group add web istoreos nas              # 加成员
+fleet group rm web nas
+fleet group del web
+fleet add --name pi --ip 192.168.1.9 --group web   # 登记时就归组
+```
+
+重新 `add` 同一台（换地址、换令牌）不会把它踢出原来的组；`groups` 写成
+`"web,db"` 这种走形格式也认。
+
+### 6.8 端口转发（`ssh -L / -R` 的等价物）
 
 5.3 给了终端，但 ssh 还有一半用处是端口转发：远端内网里只有那台机器能碰的数据库、
 面板、私有 API，全靠它接出来。
@@ -180,7 +225,7 @@ fleet forward --list nas                      # 看副端当前隧道
   和主端**已观测多久**，并把 `first_seen / last_ok / up_count` 记在
   `~/.mcp-fleet/seen.json`（掉线不清零）——只看当次 UP 看不出稳定性。
 
-### 6.8 可复现的验证证据
+### 6.9 可复现的验证证据
 
 ```bash
 .venv/bin/python -m pytest tests/ -q        # 815 passed, 1 skipped
@@ -210,12 +255,12 @@ bash scripts/demo.sh                        # 本机双节点 30 秒演示
 
 ```bash
 python3 scripts/build_package.py
-# → dist/mcp-fleet-v5.2.7.zip + SHA256SUMS + MANIFEST.json
+# → dist/mcp-fleet-v5.2.8.zip + SHA256SUMS + MANIFEST.json
 ```
 
 - 提交包文件数 **≤ 30**、大小 **≤ 40 MB**，由脚本自动裁剪并以清单/SHA256 固化。
 - 纯标准库、零第三方运行时依赖、MIT 许可、可离线部署。
-- 版本：代码 `SERVER_VERSION=5.2.7` ＝ git tag `v5.2.7` ＝ GitHub Release。
+- 版本：代码 `SERVER_VERSION=5.2.8` ＝ git tag `v5.2.8` ＝ GitHub Release。
   完整演进见 `CHANGELOG.md`。
 - **版本号一律三段式 `X.Y.Z`**：默认只动补丁位（修 bug、稳定性、性能），
   新增能力才动次版本位，破坏性变更才动主版本位。构建脚本会做三段式校验与

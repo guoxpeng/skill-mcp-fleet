@@ -18,7 +18,11 @@ mcp-fleet 统一命令行 —— 节点之间互相操控（不分主副，谁�
   probe <target>                连通性 + 握手 + 列工具 + 试调 exec（只读诊断）
   doctor <target>               完整链路体检（逐项打分，失败给排查方向）
   exec <target> <命令...>       在副端执行 shell 命令
+  run --all|--group G <命令...> 一批机器上**并行**跑同一条命令（替代 shell 循环）
+  group [ls|add|rm|del]         节点分组：批量执行的选点依据
   shell <target>                交互式 shell（PTY，可跑 vim/top，替代 ssh）
+  sessions / attach / kill      连接管理：一张表看全 / 接管挂起的会话 / 统一断开
+  recordings / replay           会话录像（asciinema v2 cast）与回放
   forward <target> -L 8080:h:80 端口转发（等价 ssh -L / -R）
   call <target> --tool T [--args JSON]   调任意工具
   health [--deep]               批量体检所有副端
@@ -48,6 +52,9 @@ target 写法
   python fleet.py call nas --tool sysinfo
   python fleet.py call cloud --tool read --args '{"filePath":"/etc/os-release"}'
   python fleet.py health --deep
+  python fleet.py run --all --short "uptime"
+  python fleet.py group add web nas pi
+  python fleet.py run --group web "systemctl restart nginx"
   python fleet.py install-cmd --name pi --port 3100 --mirror ghfast
   python fleet.py bootstrap --host 192.168.1.9 --user root --name pi
   python fleet.py tunnel cloud --status
@@ -76,7 +83,7 @@ import uuid
 
 # ---------------------------------------------------------------- 基础
 
-VERSION = "5.2.7"
+VERSION = "5.2.8"
 PROTOCOL = "2024-11-05"
 HERE = os.path.dirname(os.path.abspath(__file__))
 
@@ -1005,6 +1012,46 @@ def mask_token(tok):
     return t[:4] + "…" + t[-4:]
 
 
+# ---------------------------------------------------------------- 分组（v5.2.8）
+# 「把这几台一起操作」是管一堆设备时的第一反应。分组信息存在登记表每个节点的
+# `groups` 字段里，**不另起一份 groups.json**：分组的唯一含义就是「这些节点
+# 属于谁」，跟着节点走，`fleet remove` 删节点时才不会留下幽灵成员。
+
+def _norm_groups(v):
+    """把 groups 字段归一成去重后的 list[str]。
+
+    手工编辑登记表时容易写成 `"web"`（字符串）或 `"web,db"`（逗号），
+    这两种都得认——不能因为格式不合预期就把节点静默踢出组。
+    """
+    if not v:
+        return []
+    if isinstance(v, str):
+        v = v.replace(",", " ").split()
+    if not isinstance(v, (list, tuple)):
+        return []
+    out = []
+    for x in v:
+        s = str(x).strip()
+        if s and s not in out:
+            out.append(s)
+    return out
+
+
+def node_groups(reg=None):
+    """{组名: [节点名...]}，组内成员按名字排序。"""
+    if reg is None:
+        reg = load_registry()
+    out = {}
+    for name, v in (reg.get("nodes") or {}).items():
+        if not isinstance(v, dict):
+            continue
+        for g in _norm_groups(v.get("groups")):
+            out.setdefault(g, []).append(name)
+    for members in out.values():
+        members.sort()
+    return out
+
+
 def load_json_config(path):
     with open(path, encoding="utf-8") as f:
         return json.load(f)
@@ -1252,14 +1299,24 @@ def cmd_list(a):
         return 0
     print("已注册副端（%d 个）：\n" % len(nodes))
     w = max(len(n) for n in nodes)
+    # 反向索引：节点 → 它属于哪些组。组信息只在登记表里，agent 配置里的
+    # 条目没有这一项（改人家的 mcp.json 加自定义字段不合适）。
+    n2g = {}
+    for g, members in node_groups().items():
+        for m in members:
+            n2g.setdefault(m, []).append(g)
     for name in sorted(nodes):
         m = nodes[name]
         tag = "登记表" if m["agent"] == "registry" else m["agent"]
         lock = " 🔒" if m.get("token") else ""
-        print("  %-*s  %-38s  [%s]%s" % (w, name, m["url"], tag, lock))
+        grp = ("  " + dim("[组: %s]" % "、".join(sorted(n2g[name])))) if name in n2g else ""
+        print("  %-*s  %-38s  [%s]%s%s" % (w, name, m["url"], tag, lock, grp))
         if m.get("config"):
             print("  %-*s  %s" % (w, "", dim(m["config"])))
     print()
+    if n2g:
+        print(dim("  整组一起操作：fleet run --group %s \"uptime\""
+                  % sorted(node_groups())[0]))
     print(dim("提示：agent 侧的 MCP 配置改完必须重启 agent 才生效；"
               "本脚本（exec/call）改完立即可用。"))
     if any(not n.get("token") for n in nodes.values()):
@@ -2722,6 +2779,421 @@ def cmd_exec(a):
     return 0
 
 
+# ---------------------------------------------------------------- 批量执行（v5.2.8）
+# 以前「一次管一堆机器」只能写 shell 循环：
+#   for n in $(fleet targets); do fleet exec $n "cmd"; done
+# 串行、出错不停、输出糊成一片、还看不出哪台失败。ssh 世界里这一步是
+# pdsh / clush / ansible ad-hoc 的活儿，这里补上同一件事的最小版本。
+
+#: 默认并发。一台设备的副端是单进程 Python，同一秒灌 20 个连接只会互相排队；
+#: 8 是「明显快于串行、又不至于把小设备打懵」的折中，要更快就 --jobs。
+RUN_JOBS = 8
+
+
+def _split_names(s):
+    """`"web,db  nas"` → ["web", "db", "nas"]"""
+    if not s:
+        return []
+    return [x for x in str(s).replace(",", " ").split() if x]
+
+
+def _run_scope(a):
+    """解析 --all / --group / 显式名字 → ([(name, url, token)], [未知项])。
+
+    顺序**保持稳定**（先组内按名字，再追加显式名字），因为并行结果的打印顺序
+    跟着这个列表走——同一批机器跑两次得到同样的排版，才能用 diff 比对。
+    """
+    nodes = discover_nodes(a.agent)
+    chosen, unknown = [], []
+
+    if getattr(a, "all", False):
+        chosen = sorted(nodes)
+        if not chosen:
+            return [], []
+    else:
+        groups = node_groups()
+        for g in _split_names(",".join(getattr(a, "group", None) or [])):
+            members = groups.get(g)
+            if members is None:
+                unknown.append(("组", g))
+                continue
+            for m in members:
+                if m not in chosen:
+                    chosen.append(m)
+        for n in _split_names(getattr(a, "targets", "") or ""):
+            if n in chosen:
+                continue
+            # 位置参数先当**节点**，再当**组**：`fleet run web "uptime"` 里
+            # web 是组名的可能性远大于它是一台叫 web 的机器，但真有同名机器
+            # 时得听机器的（用户点名比归类更明确）。
+            if n in nodes or _is_known_target(n, a.agent):
+                chosen.append(n)
+                continue
+            members = groups.get(n)
+            if members is not None:
+                for m in members:
+                    if m not in chosen:
+                        chosen.append(m)
+                continue
+            unknown.append(("节点或组", n))
+
+    if getattr(a, "local", False):
+        me = local_node()
+        if me:
+            nm = me.get("name") or "本机"
+            if nm not in chosen:
+                chosen.append(nm)
+        else:
+            unknown.append(("本机节点", "（没装）"))
+
+    out = []
+    for n in chosen:
+        try:
+            url, meta = resolve_target(n, a.agent, a.port, sync=False)
+        except Exception:
+            unknown.append(("节点", n))
+            continue
+        out.append((n, url, meta.get("token", "")))
+    return out, unknown
+
+
+def _run_progress(done, total, bad):
+    """进度只写 stderr：stdout 留给真正的结果，管道重定向时不会掺进进度。"""
+    tail = ("  失败 %d" % bad) if bad else ""
+    sys.stderr.write("\r\x1b[K  … %d/%d 完成%s" % (done, total, tail))
+    sys.stderr.flush()
+
+
+def _dw(s):
+    """显示宽度。中文/全角字符占两列，`len()` 只算一个——用它算横线长度，
+    「连不上」和「[exit 0]」两种块头才会对齐到同一列。"""
+    import unicodedata
+    n = 0
+    for ch in s:
+        n += 2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1
+    return n
+
+
+def _run_block(r, width=72):
+    """一台机器一个块：块头写名字/退出码/耗时，下面原样贴输出。"""
+    code = r.get("exit")
+    if code == 0:
+        plain, tail = "  [exit 0] %dms" % r["ms"], ok("0")
+    elif code is None:
+        plain, tail = "  连不上  %dms" % r["ms"], err("连不上")
+    else:
+        plain, tail = "  [exit %d] %dms" % (code, r["ms"]), err(str(code))
+    head = "── %s " % r["name"]
+    fill = max(2, width - _dw(head) - _dw(plain))
+    # 块头分两段打：横线用 dim，退出码用红/绿——合在一个字符串里，
+    # 颜色码会污染 fill 的宽度计算，线就长短不一了。
+    sys.stdout.write(dim(head + "─" * fill) + "  ")
+    if code is None:
+        print(tail + "  %dms" % r["ms"])
+    else:
+        print("[exit %s] %dms" % (tail, r["ms"]))
+    if r.get("error"):
+        print("  " + err(r["error"]))
+        return
+    body = (r.get("out") or "").rstrip()
+    errb = (r.get("err") or "").rstrip()
+    if not body and not errb:
+        print(dim("  (无输出)"))
+        return
+    for ln in body.splitlines():
+        print(" " + ln)
+    if errb:
+        for ln in errb.splitlines():
+            print(" " + err(ln))
+
+
+def _run_brief(r):
+    """一行摘要：第一行输出 + 剩余行数。批量看「哪台不对」时这个视图最省眼。"""
+    if r.get("error"):
+        return r["error"]
+    body = (r.get("out") or "").strip() or (r.get("err") or "").strip()
+    if not body:
+        return "(无输出)"
+    lines = [x.strip() for x in body.splitlines() if x.strip()]
+    first = lines[0]
+    if len(first) > 52:
+        first = first[:51] + "…"
+    if len(lines) > 1:
+        return first + dim("  (+%d 行)" % (len(lines) - 1))
+    return first
+
+
+#: 写在命令**后面**也要认的开关。argparse 的 REMAINDER 会把 `fleet run nas
+#: --short "df -h"` 里的 --short 一起塞进命令里，然后设备上就报
+#: `bash: --short: invalid option`。两边写法都得成立，所以自己捞一遍。
+_RUN_BOOL = {"--sudo": "sudo", "--quiet": "quiet", "-q": "quiet",
+             "--short": "short", "--json": "json", "--all": "all", "-a": "all",
+             "--local": "local", "--no-sync": "no_sync"}
+_RUN_VAL = {"--workdir": "workdir", "--timeout-ms": "timeout_ms",
+            "--jobs": "jobs", "-j": "jobs", "--group": "group", "-g": "group",
+            "--timeout": "timeout", "--agent": "agent", "--port": "port"}
+
+
+def _run_take_flags(a, toks):
+    """把 toks 开头属于本命令的开关吃掉，原地修改 toks，返回错误信息或 None。"""
+    while toks and toks[0].startswith("-"):
+        name, eq, inline = toks[0].partition("=")
+        if name in _RUN_BOOL and not eq:
+            setattr(a, _RUN_BOOL[name], True)
+            toks.pop(0)
+            continue
+        if name not in _RUN_VAL:
+            break                     # 真·命令的一部分（比如 `-la`），留着
+        if eq:
+            val = inline
+            del toks[:1]
+        elif len(toks) > 1:
+            val = toks[1]
+            del toks[:2]
+        else:
+            break                     # 只给了开关名，没有值：当命令的一部分
+        attr = _RUN_VAL[name]
+        if attr == "group":
+            a.group = (a.group or []) + [val]
+        elif attr in ("timeout_ms", "jobs", "timeout", "port"):
+            try:
+                setattr(a, attr, int(val))
+            except ValueError:
+                return "%s 需要整数，收到 %r" % (name, val)
+        else:
+            setattr(a, attr, val)
+    return None
+
+
+def cmd_run(a):
+    toks = list(a.command or [])
+    # 先捞开关，再判断「唯一的位置参数到底是命令还是节点」——顺序反了的话
+    # `fleet run --all "uptime" --short` 会把 targets 当节点、command 只剩 --short。
+    bad_flag = _run_take_flags(a, toks)
+    if bad_flag:
+        return die(bad_flag)
+    # argparse 的 `[targets?] [command...]` 有个必然的歧义：`fleet run --all "uptime"`
+    # 里唯一的那个位置参数会被 targets 吃掉，command 变成空。范围已经由
+    # --all/--group/--local 说清楚了，那这个孤立的位置参数只能是命令。
+    if not toks and a.targets and (a.all or a.group or a.local):
+        toks = [a.targets]
+        a.targets = ""
+    cmd = " ".join(toks).strip()
+    if not cmd:
+        return die("没给命令。用法：\n"
+                   "    全 部：fleet run --all \"uptime\"\n"
+                   "    按 组：fleet run --group web \"systemctl restart nginx\"\n"
+                   "    点 名：fleet run nas,pi \"df -h\"")
+
+    picked, unknown = _run_scope(a)
+    for kind, name in unknown:
+        print(warn("[!] ") + "没有这个%s：%s" % (kind, name), file=sys.stderr)
+    if not picked:
+        print(err("[x] ") + "没有匹配到任何节点。", file=sys.stderr)
+        print(dim("  看看有什么：fleet list（节点） / fleet group（分组）"), file=sys.stderr)
+        return 2
+
+    args = {"command": cmd}
+    if a.sudo:
+        args["sudo"] = True
+    if a.workdir:
+        args["workDir"] = a.workdir
+    if a.timeout_ms:
+        args["timeoutMs"] = a.timeout_ms
+
+    timeout = max(float(a.timeout or 30), 5.0)
+    ct = _connect_timeout(a)
+    jobs = max(1, min(int(getattr(a, "jobs", 0) or RUN_JOBS), len(picked)))
+    total = len(picked)
+    # 进度只在「有人在看」时打：重定向到文件/管道时，那些 \r 只会变成垃圾字符。
+    tty = bool(getattr(sys.stderr, "isatty", lambda: False)()) and not a.json \
+        and not getattr(a, "quiet", False)
+    tick = {"n": 0, "bad": 0}
+    lock = threading.Lock()
+
+    def one(item):
+        name, url, token = item
+        t0 = time.time()
+        row = {"name": name, "url": url, "exit": None, "ms": 0,
+               "out": "", "err": "", "error": ""}
+        try:
+            c = MCPClient(url, timeout, token=token, connect_timeout=ct)
+            c.handshake()
+            text, iserr = c.call("exec", dict(args), timeout=timeout)
+            code, out, errtxt = parse_exec(text)
+            row.update(exit=code, out=out, err=errtxt)
+            # 工具层报错但退出码是 0（返回体不合标准格式时会这样）：不能算成功，
+            # 否则「批量结果全绿」而实际什么都没干，比报错更害人。
+            if iserr and code == 0:
+                row["exit"] = 1
+        except Exception as e:
+            row["exit"] = None
+            row["error"] = _human_net_err(e)
+        row["ms"] = int((time.time() - t0) * 1000)
+        with lock:
+            tick["n"] += 1
+            if row["exit"] != 0:
+                tick["bad"] += 1
+            if tty:
+                _run_progress(tick["n"], total, tick["bad"])
+        return row
+
+    t_all = time.time()
+    if total > 1:
+        from concurrent.futures import ThreadPoolExecutor
+        with ThreadPoolExecutor(max_workers=jobs) as ex:
+            rows = list(ex.map(one, picked))     # map 保序 = 输出顺序稳定
+    else:
+        rows = [one(picked[0])]
+    elapsed = time.time() - t_all
+    if tty:
+        sys.stderr.write("\r\x1b[K")
+        sys.stderr.flush()
+
+    bad = [r for r in rows if r["exit"] != 0]
+
+    if a.json:
+        print(json.dumps({"command": cmd, "count": len(rows),
+                          "failed": len(bad), "elapsed_s": round(elapsed, 2),
+                          "results": rows}, ensure_ascii=False, indent=2))
+        return 1 if bad else 0
+
+    if not a.quiet:
+        if a.short:
+            w = max(_dw(r["name"]) for r in rows)
+            print()
+            for r in rows:
+                if r["exit"] == 0:
+                    mark, code_s = ok("✓"), ok("0")
+                elif r["exit"] is None:
+                    mark, code_s = err("✗"), err("  -")
+                else:
+                    mark, code_s = err("✗"), err(str(r["exit"]))
+                # 名字里可能有中文：按显示宽度补空格，`%-*s` 按 len 补会歪
+                pad = " " * max(0, w - _dw(r["name"]))
+                print("  %s %s%s  %s  %6dms  %s"
+                      % (mark, r["name"], pad, code_s, r["ms"], _run_brief(r)))
+        else:
+            for r in rows:
+                print()
+                _run_block(r)
+
+    print()
+    if not bad:
+        print(ok("✓ %d 台全部成功" % len(rows)) + dim("  ·  总耗时 %.1fs" % elapsed))
+    else:
+        print(ok("✓ %d 成功" % (len(rows) - len(bad)))
+              + "   " + err("✗ %d 失败" % len(bad))
+              + dim("  ·  总耗时 %.1fs" % elapsed))
+        w = max(_dw(r["name"]) for r in bad)
+        for r in bad:
+            why = r.get("error") or ("exit %s" % r["exit"])
+            pad = " " * max(0, w - _dw(r["name"]))
+            print("  " + err("✗") + " %s%s  %s" % (r["name"], pad, why))
+    if not a.quiet:
+        print(dim("  只看单台细节：fleet exec <名字> \"%s\"" % cmd))
+    return 1 if bad else 0
+
+
+def cmd_group(a):
+    """分组管理。`fleet group` 看全部，`fleet group web` 看一个组。"""
+    act = (a.action or "ls").strip()
+    if act not in ("ls", "add", "rm", "del"):
+        # `fleet group web` 是最自然的写法，不该报「未知动作」
+        a.group = act
+        act = "ls"
+
+    reg = load_registry()
+    nodes = reg.setdefault("nodes", {})
+    groups = node_groups(reg)
+
+    if act == "ls":
+        if a.group:
+            members = groups.get(a.group)
+            if members is None:
+                print(err("[x] ") + "没有这个组：%s" % a.group)
+                if groups:
+                    print(dim("  现有的：%s" % "、".join(sorted(groups))))
+                return 1
+            print("组 %s（%d 台）：" % (a.group, len(members)))
+            for m in members:
+                print("  " + m)
+            return 0
+        if not groups:
+            print(warn("还没有分组。"))
+            print(dim("  建一个：fleet group add web istoreos nas"))
+            print(dim("  或者在登记时带上：fleet add --name pi --ip 192.168.1.9 --group web"))
+            return 0
+        w = max(len(g) for g in groups)
+        print("分组（%d 个）：\n" % len(groups))
+        for g in sorted(groups):
+            members = groups[g]
+            print("  %-*s  %2d 台  %s" % (w, g, len(members), "、".join(members)))
+        print()
+        print(dim("  一起跑命令：fleet run --group %s \"uptime\"" % sorted(groups)[0]))
+        return 0
+
+    if act == "del":
+        if not a.group:
+            return die("要删哪个组？fleet group del <组名>")
+        hit = 0
+        for v in nodes.values():
+            if not isinstance(v, dict):
+                continue
+            cur = _norm_groups(v.get("groups"))
+            if a.group in cur:
+                cur = [g for g in cur if g != a.group]
+                hit += 1
+                if cur:
+                    v["groups"] = cur
+                else:
+                    v.pop("groups", None)
+        if not hit:
+            print(warn("[!] ") + "没有组叫 %s，什么也没改" % a.group)
+            return 1
+        save_registry(reg)
+        print(ok("[+] ") + "已删除组 %s（%d 个节点受影响）" % (a.group, hit))
+        return 0
+
+    # add / rm
+    if not a.group:
+        return die("要操作哪个组？fleet group %s <组名> <节点...>" % act)
+    members = list(a.nodes or [])
+    if not members:
+        return die("要给哪个节点操作？fleet group %s %s <节点...>" % (act, a.group))
+    missing = [n for n in members if n not in nodes]
+    if missing:
+        print(err("[x] ") + "登记表里没有：%s" % "、".join(missing))
+        print(dim("  只有登记表里的节点能分组（agent 配置里的条目改不了）。"))
+        print(dim("  先登记：fleet add --name %s --url http://IP:3100/mcp --token T"
+                  % missing[0]))
+        return 1
+    changed = 0
+    for n in members:
+        cur = _norm_groups(nodes[n].get("groups"))
+        if act == "add":
+            if a.group in cur:
+                continue
+            cur.append(a.group)
+        else:
+            if a.group not in cur:
+                continue
+            cur = [g for g in cur if g != a.group]
+        changed += 1
+        if cur:
+            nodes[n]["groups"] = cur
+        else:
+            nodes[n].pop("groups", None)
+    if not changed:
+        print(dim("  没有变化（%s 已在/不在组 %s 里）" % ("、".join(members), a.group)))
+        return 0
+    save_registry(reg)
+    verb = "加入" if act == "add" else "移出"
+    print(ok("[+] ") + "已把 %s %s组 %s" % ("、".join(members), verb, a.group))
+    print(dim("  一起跑命令：fleet run --group %s \"uptime\"" % a.group))
+    return 0
+
+
 def cmd_call(a):
     tool = (a.tool or "").strip()
     target = (getattr(a, "target", "") or "").strip()
@@ -3445,11 +3917,19 @@ def cmd_add(a):
 
     # 写本地登记表（让不支持 MCP 的 agent 也能用 fleet.py 操控）
     reg = load_registry()
-    reg.setdefault("nodes", {})[a.name] = {"url": url,
-                                           "description": "mcp-fleet 副端",
-                                           "token": token}
+    old = (reg.get("nodes") or {}).get(a.name) or {}
+    entry = {"url": url, "description": "mcp-fleet 副端", "token": token}
+    # 重新 add 同一台（换地址、换令牌）不该把它踢出原来的组——分组是用户的
+    # 组织方式，不是 add 的副产物。显式给了 --group 才覆盖。
+    grp = _norm_groups(getattr(a, "group", None) or old.get("groups"))
+    if grp:
+        entry["groups"] = grp
+    reg.setdefault("nodes", {})[a.name] = entry
     save_registry(reg)
     print(ok("[+] ") + "已登记到 %s" % REGISTRY)
+    if grp:
+        print(dim("    分组：%s（fleet run --group %s \"命令\"）"
+                  % ("、".join(grp), grp[0])))
 
     print()
     if token:
@@ -6245,6 +6725,36 @@ def build_parser():
     sp.add_argument("--timeout-ms", type=int, help="命令超时（毫秒）")
     sp.set_defaults(func=cmd_exec)
 
+    # 批量并行执行：ssh 世界里这一步是 pdsh / clush / ansible ad-hoc。
+    # 位置参数 targets 与 --all/--group 是**互斥的两条路**：给了 --all 时
+    # 第一个位置参数就是命令，否则第一个位置参数是节点列表。
+    sp = common(sub.add_parser(
+        "run", help="一批机器上并行跑同一条命令（--all / --group / 名字列表）"),
+        need_target=False)
+    sp.add_argument("targets", nargs="?", default="",
+                    help="逗号/空格分隔的副端名；用 --all / --group 时省略")
+    sp.add_argument("command", nargs=argparse.REMAINDER, help="要执行的命令")
+    sp.add_argument("--all", "-a", action="store_true", help="全部已登记副端")
+    sp.add_argument("--group", "-g", action="append", metavar="组名",
+                    help="按组选节点，可重复，也可 -g web,db")
+    sp.add_argument("--local", action="store_true", help="把本机节点也加进来")
+    sp.add_argument("--jobs", "-j", type=int, default=RUN_JOBS,
+                    help="并发数（默认 %d）" % RUN_JOBS)
+    sp.add_argument("--short", action="store_true",
+                    help="每台只打一行摘要（第一行输出），不贴全文")
+    sp.add_argument("--quiet", "-q", action="store_true", help="只打汇总，不打每台的输出")
+    sp.add_argument("--sudo", action="store_true", help="用 sudo 执行")
+    sp.add_argument("--workdir", help="工作目录")
+    sp.add_argument("--timeout-ms", type=int, help="单台命令超时（毫秒）")
+    sp.set_defaults(func=cmd_run)
+
+    sp = sub.add_parser("group", help="节点分组（给批量执行用；和 agent 协作组 group_form 无关）")
+    sp.add_argument("action", nargs="?", default="ls",
+                    help="ls（默认）/ add / rm / del；直接写组名 = 看这个组")
+    sp.add_argument("group", nargs="?", default="", help="组名")
+    sp.add_argument("nodes", nargs="*", default=[], help="节点名（可多个）")
+    sp.set_defaults(func=cmd_group)
+
     sp = common(sub.add_parser("call", help="调任意工具"), need_target=False)
     sp.add_argument("target", nargs="?", default="",
                     help="副端名字/地址；省略=本机。也可以只写工具名（fleet call sysinfo）")
@@ -6397,6 +6907,8 @@ def build_parser():
     sp.add_argument("--mcp", help="直接指定 mcp.json 路径")
     sp.add_argument("--no-test", action="store_true", help="跳过连通性测试")
     sp.add_argument("--force", action="store_true", help="测试失败也写入")
+    sp.add_argument("--group", action="append", metavar="组名",
+                    help="登记到某个组（可重复），之后 fleet run --group 组名 一起操作")
     sp.add_argument("--timeout", type=int, default=10)
     sp.set_defaults(func=cmd_add)
 
@@ -7268,6 +7780,7 @@ def cmd_menu(a):
   【远程操控】
    [8] 执行命令（exec）          [9] 调用工具（call）
   [20] 交互式 shell（替代 ssh） [21] 端口转发（-L / -R）
+  [26] 批量执行（run）          [27] 分组管理（group）
   [10] 列远端工具清单（tools）
 
   【连接管理】
@@ -7293,7 +7806,7 @@ def cmd_menu(a):
         print("  提示词速用：fleet prompt self_repair  然后原样粘给 AI 客户端。")
         print()
         try:
-            choice = input("  请选择 (0-25): ").strip()
+            choice = input("  请选择 (0-27): ").strip()
         except (EOFError, KeyboardInterrupt):
             print("\n  再见！")
             return 0
@@ -7586,6 +8099,59 @@ def cmd_menu(a):
             if rid:
                 argv = ["replay", rid] + ([target] if target else [])
                 cmd_replay(_menu_args(argv))
+            input("\n  按回车继续...")
+
+        # ---- 26: run（批量并行执行） ----
+        elif choice == "26":
+            _banner()
+            print("\n  批量执行")
+            print("  " + "-" * 40)
+            groups = node_groups()
+            if groups:
+                print("  现有分组：%s" % "、".join(sorted(groups)))
+            try:
+                scope = input("  范围（回车=全部；或写组名/节点名，逗号分隔）: ").strip()
+                cmdline = input("  命令: ").strip()
+            except (EOFError, KeyboardInterrupt):
+                continue
+            if not cmdline:
+                continue
+            argv = ["run"] + ([scope] if scope else ["--all"]) + [cmdline]
+            cmd_run(_menu_args(argv))
+            input("\n  按回车继续...")
+
+        # ---- 27: group（分组管理） ----
+        elif choice == "27":
+            _banner()
+            print("\n  分组管理")
+            print("  " + "-" * 40)
+            cmd_group(_menu_args(["group"]))
+            print()
+            print("  1) 把节点加入组   2) 从组里移出   3) 删掉整组")
+            try:
+                op = input("  选择（回车返回）: ").strip()
+            except (EOFError, KeyboardInterrupt):
+                continue
+            if op not in ("1", "2", "3"):
+                continue
+            try:
+                gname = input("  组名: ").strip()
+            except (EOFError, KeyboardInterrupt):
+                continue
+            if not gname:
+                continue
+            if op == "3":
+                cmd_group(_menu_args(["group", "del", gname]))
+            else:
+                try:
+                    names = input("  节点名（逗号分隔）: ").strip()
+                except (EOFError, KeyboardInterrupt):
+                    continue
+                if not names:
+                    continue
+                argv = (["group", "add" if op == "1" else "rm", gname]
+                        + _split_names(names))
+                cmd_group(_menu_args(argv))
             input("\n  按回车继续...")
 
         else:
