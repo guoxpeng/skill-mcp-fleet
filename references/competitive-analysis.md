@@ -151,9 +151,10 @@ README 里建议用户自己靠 `~/.ssh/config` 和系统日志兜。
 2. ~~**批量并行执行**~~ —— **已在 v5.2.8 做完**。`fleet run --all/--group/名字列表`，
    `ThreadPoolExecutor` + 每台独立客户端，稳定顺序、退出码判据、`--short`/`--quiet`/`--json`
    三种视图；配套 `fleet group` 分组管理（`groups` 存进节点，跟着节点走）。
-3. **单 endpoint 聚合（gateway 模式）**。一个 MCP URL 暴露全集群，工具名 `node__tool`。
-   否则接 5 台设备要在客户端配 5 次——这正是 Docker MCP Gateway / `mcp-gateway`
-   已经解决的事，我们没做。**（下一个要做的）**
+3. ~~**单 endpoint 聚合（gateway 模式）**~~ —— **已在 v5.2.10 做完**。本机节点
+   `gateway: true` 后，`/mcp` 同时暴露对端工具（`节点__工具`），本机工具保持裸名；
+   默认只聚合 19 个常用工具/节点，清单缓存 + 并行拉取 + 成环保护 + 网关跳审计。
+   Docker MCP Gateway 那一层的能力，现在有了。
 
 ### P1 —— 影响「AI 借用设备环境」和团队场景
 

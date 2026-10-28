@@ -1,4 +1,4 @@
-# MCP Fleet v5.2.9 · 让所有设备成为一支 AI 团队
+# MCP Fleet v5.2.10 · 让所有设备成为一支 AI 团队
 
 > **2026 华为开发者大赛 · 小红书 Skill 创新赛** ｜ 通用赛道 · 开发工具
 > 作者：guoxpeng ｜ 开源仓库：https://github.com/guoxpeng/skill-mcp-fleet ｜ 许可：MIT
@@ -241,10 +241,53 @@ curl --socks5-hostname 127.0.0.1:1080 http://127.0.0.1:80/   # 设备本机的 L
   和主端**已观测多久**，并把 `first_seen / last_ok / up_count` 记在
   `~/.mcp-fleet/seen.json`（掉线不清零）——只看当次 UP 看不出稳定性。
 
-### 6.9 可复现的验证证据
+### 6.9 网关模式（v5.2.10）：一个 endpoint 管全网
+
+接 5 台设备就要在客户端配 5 个 MCP 条目、看到 5×73 个同名工具——这条路走不通。
+网关模式让**本机节点自己**变成集群的入口：
 
 ```bash
-.venv/bin/python -m pytest tests/ -q        # 815 passed, 1 skipped
+fleet gateway on          # 写配置 + 重启本机节点
+fleet gateway             # 看状态：聚合了谁、多少工具、是否已生效
+fleet gateway tools       # 列出聚合后的工具名
+fleet gateway off
+```
+
+客户端只配一个地址，工具名形如 `节点__工具`：
+
+```text
+istoreos__exec     → 在 istoreos 上执行命令
+exec               → 在本机执行（**裸名不变**）
+```
+
+实测（本机 + iStoreOS）：**73 本机 + 19 对端 = 92 个工具**，一个 URL。
+
+- **本机工具保持裸名**。开网关不能把已有客户端配置改坏——否则「打开一个可选
+  功能」变成了破坏性变更。
+- **只暴露常用子集**（`gateway_tools: "core"`，19 个/节点）。73×N 会把客户端
+  上下文塞满，而 90% 的场景只用得到 exec/read/write/sysinfo/shell 这些。
+  要全量：`gateway_tools: "all"`；要精确：`"exec,read,docker_ps"`。
+- **一台离线不毁整张表，但也不能拖垮这张表**：并行拉取，单台预算
+  `gateway_list_timeout`（默认 4s，三次往返**共用**这一份），整轮总等待
+  `gateway_list_wait`（默认 6s，超出就本轮跳过那台）。对端自己也是网关时它
+  那一跳同样在等别人——这里给多长，客户端的 `tools/list` 就可能等多久。
+  清单缓存 `gateway_cache_sec`（默认 300s），启动时后台预热；**没拿全时缓存
+  自动缩到 30s**（否则设备重启后要等五分钟才重新出现），空结果也照样缓存
+  （全部离线是最该被缓存的场景）。
+- **`tools/call` 永不重试**。请求可能已经在对端开始执行了，重发等于跑两遍；
+  会话失效（对端重启）只在**调用发出之前**重建。
+- **成环保护**：A 聚合 B、B 又聚合 A 时，`tools/list` 会互相递归——按
+  `X-Fleet-Hops` 拦，到顶就只报自己的工具。
+- **前缀冲突不静默合并**：`nas.lan` 和 `nas_lan` 折成同一个前缀时跳过并报错，
+  否则会变成「调 A 打到了 B」。纯中文节点名退回 `node+哈希`，不会互相覆盖。
+- 网关这一跳也进审计链：`{"tool":"istoreos__exec","detail":"gateway","status":"ok"}`。
+- 安全边界要说清：网关的 token **等于整个集群的 token**。默认关，开之前先想清楚
+  这个端点暴露给谁。
+
+### 6.10 可复现的验证证据
+
+```bash
+.venv/bin/python -m pytest tests/ -q        # 1165 passed, 1 skipped
 sh scripts/install.sh --dry-run --json --name demo   # 安装器零副作用预演
 bash scripts/demo.sh                        # 本机双节点 30 秒演示
 ```
@@ -271,12 +314,12 @@ bash scripts/demo.sh                        # 本机双节点 30 秒演示
 
 ```bash
 python3 scripts/build_package.py
-# → dist/mcp-fleet-v5.2.9.zip + SHA256SUMS + MANIFEST.json
+# → dist/mcp-fleet-v5.2.10.zip + SHA256SUMS + MANIFEST.json
 ```
 
 - 提交包文件数 **≤ 30**、大小 **≤ 40 MB**，由脚本自动裁剪并以清单/SHA256 固化。
 - 纯标准库、零第三方运行时依赖、MIT 许可、可离线部署。
-- 版本：代码 `SERVER_VERSION=5.2.9` ＝ git tag `v5.2.9` ＝ GitHub Release。
+- 版本：代码 `SERVER_VERSION=5.2.10` ＝ git tag `v5.2.10` ＝ GitHub Release。
   完整演进见 `CHANGELOG.md`。
 - **版本号一律三段式 `X.Y.Z`**：默认只动补丁位（修 bug、稳定性、性能），
   新增能力才动次版本位，破坏性变更才动主版本位。构建脚本会做三段式校验与

@@ -34,6 +34,7 @@ MCP 副端 Agent（零依赖 · 纯 Python 标准库）
 
 import argparse
 import base64
+import hashlib
 import json
 import os
 import re
@@ -104,7 +105,7 @@ for _stream in (sys.stdout, sys.stderr):
 DEFAULT_CONFIG = {
     "name": "node",             # 副端标识（显示在状态页与 serverInfo）
     "tool_prefix": "",          # 工具名前缀，如 "nas_"；留空则用裸名（exec/read/...）
-    "version": "5.2.9",
+    "version": "5.2.10",
     "sudo_password": "",        # 留空且非 root 时会尝试免密 sudo
     "work_dir": "/",            # 默认工作目录
     "command_timeout": 120,     # 秒
@@ -117,6 +118,20 @@ DEFAULT_CONFIG = {
                                 # 都被 9 行 ASCII 艺术污染，`| jq` / `$(...)` / cp 的
                                 # stat 解析全部失败（真机实测）。需要 profile 里的 PATH
                                 # 时才打开；交互式 shell 走 shell_open 的 -l，不受影响。
+    # ---- 网关模式（v5.2.10）------------------------------------------------
+    # True 时本节点的 /mcp 同时代理所有已配对节点：对端工具以 `节点__工具`
+    # 出现，本机工具仍是裸名（不破坏已有配置）。默认关——它是一个入口，
+    # 开了等于「这一个 token 能操作全网」，要用户自己决定。
+    "gateway": False,
+    "gateway_nodes": [],        # 空=全部 peer；也可写 ["nas","pi"] 只暴露部分
+    "gateway_tools": "core",    # core=常用子集 / all=全量 / "exec,read" 自定义
+    "gateway_cache_sec": 300,   # 工具清单缓存（拉一次要 N 个往返，别每次 list 都拉）
+    # 单台对端拉 tools/list 的预算，三次往返（initialize/initialized/list）
+    # **共用**这一份。对端自己也是网关时会连带等它的对端，所以不能给太长：
+    # 这里给多长，客户端的 tools/list 就可能等多久。
+    "gateway_list_timeout": 4,
+    "gateway_list_wait": 6,     # 整轮聚合的总等待上限（超出就本轮跳过那台）
+    "gateway_call_timeout": 130,
     # ---- 访问控制（v3.0）--------------------------------------------------
     # 非空则所有请求必须带 Authorization: Bearer <token>（或 X-Fleet-Token）。
     # 副端以 root 运行、exec 等于 root shell，走公网隧道时**必须**设置。
@@ -2813,6 +2828,26 @@ def _peer_opener(url):
     return urllib.request.build_opener()
 
 
+def _peer_signable(url):
+    """这台对端是否**配对过**（我这边存着它的公钥）。
+
+    签名是更强的认证，但前提是双向：我签了名，对端得能查到我的公钥才会认。
+    没配对就签名 = 必然 401（对端说「未知节点」），而对方的 token 本来是好的
+    ——现场表现就是「fleet exec 通，网关 401」，最难查的那种。
+
+    所以只在对端确实配对过时才签名；否则退回 token。对端若开了
+    require_signature，仍然会拒（那是它自己的策略，我们不该绕过）。
+    """
+    try:
+        for _n, v in (load_peers().get("nodes") or {}).items():
+            v = v or {}
+            if str(v.get("url") or "") == url and (v.get("pubkey") or ""):
+                return True
+    except Exception:
+        pass
+    return False
+
+
 def _peer_rpc(url, token, payload, sid, hops, timeout):
     import urllib.request
     import urllib.error
@@ -2821,12 +2856,14 @@ def _peer_rpc(url, token, payload, sid, hops, timeout):
                "Accept": "application/json, text/event-stream",
                "X-Fleet-Hops": str(hops),
                "X-Fleet-From": SERVER_NAME}
-    # v5.2: 对端已配对公钥时附加 Ed25519 签名（token 仍保留，兼容 v5）
-    try:
-        _spath = urllib.parse.urlsplit(url).path or "/"
-        headers.update(_sign_outbound_headers("POST", _spath, body))
-    except Exception:
-        pass
+    # v5.2: 已配对时附加 Ed25519 签名（token 仍保留，兼容 v5）。
+    # 未配对只发 token —— 见 _peer_signable 的说明。
+    if _peer_signable(url):
+        try:
+            _spath = urllib.parse.urlsplit(url).path or "/"
+            headers.update(_sign_outbound_headers("POST", _spath, body))
+        except Exception:
+            pass
     req = urllib.request.Request(url, data=body, method="POST", headers=headers)
     if token:
         req.add_header("Authorization", "Bearer " + token)
@@ -4934,6 +4971,309 @@ def _audit_call(tool, args, status, detail=""):
 # ---------------------------------------------------------------------------
 # JSON-RPC
 # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# v5.2.10 网关模式：一个 endpoint 暴露整个集群
+#
+# 没有它，接 5 台设备就要在客户端配 5 个 MCP 条目、看到 5×73 个同名工具；
+# 有了它，客户端只认本机一个 URL，对端工具叫 `节点__工具`。
+#
+# 三条设计约束，都是踩过的坑：
+#   1. **本机工具保持裸名**（`exec` 还是 `exec`）。开网关不能把已有配置改坏，
+#      否则「打开一个可选功能」变成了破坏性变更。
+#   2. **只重建会话，不重发命令**。tools/call 永不重试——重试等于把
+#      `rm -rf` 跑两遍。会话失效（对端重启）只在**调用发出之前**重建。
+#   3. **一台离线不能毁掉整张表**。并行拉取 + 单台短超时 + 结果缓存，
+#      离线的跳过并在 tools/list 里留一句提示，而不是让整次 list 失败。
+# ---------------------------------------------------------------------------
+
+#: 默认只暴露「借用设备环境」真正用得上的那些。73 个工具 × N 台会直接把
+#: 客户端上下文塞满，而 90% 的场景只用得到下面这些。要全量：gateway_tools=all
+GW_CORE_TOOLS = (
+    "exec", "read", "write", "list_dir", "search",
+    "sysinfo", "ps", "systemctl", "service_logs",
+    "docker_ps", "docker_logs", "net_check", "http_get",
+    "shell_open", "shell_write", "shell_read", "shell_close",
+    "upload", "download",
+)
+
+GW_LOCK = threading.RLock()
+GW_CACHE = {"ts": 0.0, "tools": [], "errors": [], "nodes": 0, "ttl": 0.0}
+GW_SESS = {}          # node -> {"url", "token", "sid"}；只为了少两次往返
+
+
+def gw_enabled():
+    return bool(CFG.get("gateway"))
+
+
+def _gw_node_list():
+    """[(name, url, token)] —— 网关要聚合哪些节点（默认：全部已配对 peer）。"""
+    nodes = load_peers().get("nodes") or {}
+    want = CFG.get("gateway_nodes") or []
+    if isinstance(want, str):
+        want = [x for x in want.replace(",", " ").split() if x.strip()]
+    want = set(str(x).strip() for x in want)
+    out = []
+    for name in sorted(nodes):
+        if want and name not in want:
+            continue
+        v = nodes[name] or {}
+        url = str(v.get("url") or "")
+        if not url.startswith(("http://", "https://")):
+            continue
+        out.append((name, url, v.get("token", "")))
+    return out
+
+
+def _gw_safe(name):
+    """节点名 → 工具名前缀。
+
+    MCP 工具名只允许 `[A-Za-z0-9_-]`，而节点名可能是 `nas.lan` / `树莓派`。
+    统一折成下划线；折完可能撞名，撞了由调用方跳过并报错——**不要**静默
+    让两台机器共用一个前缀，那会变成「调 A 打到了 B」。
+    """
+    raw = (name or "").strip()
+    s = re.sub(r"[^0-9A-Za-z_-]+", "_", raw).strip("_")
+    if s:
+        return s
+    # 纯中文/纯符号的名字折完是空的。退回「node + 名字哈希前 6 位」，
+    # 而不是统统叫 node —— 那样两台中文名机器会互相覆盖。
+    return "node" + hashlib.sha1(raw.encode("utf-8")).hexdigest()[:6]
+
+
+def _gw_pick(all_tools):
+    """按 gateway_tools 过滤工具名。core / all / "exec,read" / [...]
+
+    名字按**节点自己暴露的名字**匹配（`tool_prefix` 为空时就是 `exec`）。
+    给节点设了前缀（`nas_exec`）又想精确挑选时，写全名或用 all。
+    """
+    sel = CFG.get("gateway_tools")
+    if isinstance(sel, str):
+        low = sel.strip().lower()
+        if low == "all":
+            return list(all_tools)
+        if not low or low == "core":
+            return [t for t in all_tools if (t.get("name") or "") in GW_CORE_TOOLS]
+        names = set(x for x in sel.replace(",", " ").split() if x.strip())
+    elif isinstance(sel, (list, tuple)):
+        names = set(str(x).strip() for x in sel if str(x).strip())
+    else:
+        names = set()
+    if not names:
+        return [t for t in all_tools if (t.get("name") or "") in GW_CORE_TOOLS]
+    return [t for t in all_tools if (t.get("name") or "") in names]
+
+
+def _gw_fetch(name, url, token, timeout=4, hops=1):
+    """拉一个节点的 tools/list。返回 (tools | None, 错误)。
+
+    hops 必须由调用方从**请求线程**传进来：这里跑在线程池里，
+    `_REQ.hops` 在 worker 线程上是空的（threading.local）。如果就地读，
+    每一跳都从 0 重新数，A→B→A 的环就永远拦不住。
+
+    三次往返（initialize / initialized / tools-list）共享**一个** deadline。
+    各算各的话，一台挂住的机器能拖 3×timeout，网关自己的 tools/list 就从
+    「工具清单」变成「客户端超时」——现场表现是「节点明明是好的，客户端
+    却说连不上」。这个坑在真机上抓到过：副端自己也开着网关、且它的对端离线。
+    """
+    deadline = time.time() + max(0.5, float(timeout or 4))
+
+    def _left():
+        # 剩多少给多少；已经过期就给一个很短的窗口，让它快速失败而不是
+        # 直接抛——抛出去的错误信息里没有「这台机器慢」这个事实。
+        return max(0.2, deadline - time.time())
+
+    try:
+        r, sid = _peer_rpc(url, token, {
+            "jsonrpc": "2.0", "id": 1, "method": "initialize",
+            "params": {"protocolVersion": "2024-11-05", "capabilities": {},
+                       "clientInfo": {"name": "mcp-fleet-gateway",
+                                      "version": SERVER_VERSION}}}, None, hops, _left())
+        try:
+            _peer_rpc(url, token,
+                      {"jsonrpc": "2.0", "method": "notifications/initialized"},
+                      sid, hops, _left())
+        except ValueError:
+            pass
+        r, _ = _peer_rpc(url, token, {"jsonrpc": "2.0", "id": 2,
+                                      "method": "tools/list", "params": {}},
+                         sid, hops, _left())
+        with GW_LOCK:
+            GW_SESS[name] = {"url": url, "token": token, "sid": sid}
+        if "error" in r:
+            return None, str(r["error"])
+        return (r.get("result") or {}).get("tools") or [], ""
+    except Exception as e:
+        return None, str(e)
+
+
+def gw_tools(force=False, hops=0):
+    """聚合后的工具清单。返回 (tools, errors)。结果带 TTL 缓存。
+
+    并行拉取是必须的：串行时 5 台里 3 台离线，一次 tools/list 要等三个
+    超时——客户端的握手窗口早就关了。总等待还得再压一道上限：对端可能
+    自己也是网关（A 聚合 B、B 聚合 C），它那一跳同样在等别人。
+    """
+    ttl = float(CFG.get("gateway_cache_sec", 300) or 300)
+    with GW_LOCK:
+        # 用 ts（"拉过没有"）判断命中，**不能**用 tools 非空判断：
+        # 所有对端都离线时 tools 恰好是空的，于是每一次 tools/list 都会
+        # 重新去等一轮超时——最该被缓存的场景反而完全没缓存。
+        fresh = (time.time() - GW_CACHE["ts"]) < float(GW_CACHE.get("ttl") or ttl)
+        if not force and GW_CACHE["ts"] and fresh:
+            return list(GW_CACHE["tools"]), list(GW_CACHE["errors"])
+
+    nodes = _gw_node_list()
+    per = float(CFG.get("gateway_list_timeout", 4) or 4)
+    wait = float(CFG.get("gateway_list_wait", 6) or 6)
+    got, errors = {}, []
+    if nodes:
+        from concurrent.futures import ThreadPoolExecutor, TimeoutError as _FTimeout
+        out_hops = int(hops or 0) + 1
+        ex = ThreadPoolExecutor(max_workers=min(8, len(nodes)))
+        try:
+            futs = [(ex.submit(_gw_fetch, n, u, t, per, out_hops), n)
+                    for n, u, t in nodes]
+            deadline = time.time() + wait
+            for f, n in futs:
+                left = deadline - time.time()
+                if left <= 0:
+                    errors.append("%s：整轮聚合超过 %.0fs，本轮跳过" % (n, wait))
+                    continue
+                try:
+                    tools, why = f.result(timeout=left)
+                except _FTimeout:
+                    errors.append("%s：整轮聚合超过 %.0fs，本轮跳过" % (n, wait))
+                    continue
+                except Exception as e:      # 线程里再兜一层，别让 future 炸穿
+                    tools, why = None, str(e)
+                if tools is None:
+                    errors.append("%s：%s" % (n, why))
+                else:
+                    got[n] = tools
+        finally:
+            # 不等剩下的 future。它们各自有 per 秒的 deadline，超时的那些
+            # 已经记成错误了；再等一遍等于把总等待放大成 per×ceil(n/8)。
+            ex.shutdown(wait=False)
+
+    out, used = [], {}
+    for name in sorted(got):
+        pref = _gw_safe(name)
+        if pref in used:
+            errors.append("%s 的前缀 %s 与 %s 冲突，已跳过"
+                          % (name, pref, used[pref]))
+            continue
+        used[pref] = name
+        for t in _gw_pick(got[name]):
+            base = (t.get("name") or "").strip()
+            if not base:
+                continue
+            desc = t.get("description") or ""
+            out.append({
+                "name": "%s__%s" % (pref, base),
+                # 描述前面挂节点名：AI 在 300 个工具里挑的时候，第一眼要看到
+                # 「这是哪台机器」，而不是去数前缀。
+                "description": "[%s] %s" % (name, desc),
+                "inputSchema": t.get("inputSchema")
+                               or {"type": "object", "properties": {}},
+            })
+    ttl_eff = ttl
+    if errors and len(got) < len(nodes):
+        # 没拿全就别按完整 TTL 缓存：一台设备重启后要等五分钟才重新出现在
+        # 工具列表里，现场看起来就是「网关不认新节点」。
+        ttl_eff = min(ttl, 30)
+    with GW_LOCK:
+        GW_CACHE.update({"ts": time.time(), "tools": out,
+                         "errors": errors, "nodes": len(got), "ttl": ttl_eff})
+    for e in errors:
+        print("[warn] 网关：%s" % e, file=sys.stderr)
+    return out, errors
+
+
+def _gw_result(text, is_err=False):
+    return {"content": [{"type": "text", "text": text}],
+            "isError": bool(is_err)}
+
+
+def _gw_route(full):
+    """`nas__exec` → ("nas", "exec")；前缀对不上任何节点返回 None。"""
+    pref, sep, tool = (full or "").partition("__")
+    if not sep or not pref or not tool:
+        return None
+    for name, url, token in _gw_node_list():
+        if _gw_safe(name) == pref:
+            return (name, url, token, tool)
+    return None
+
+
+def gw_call(full, arguments):
+    """把 `节点__工具` 转发到对应节点。前缀不认识时返回 None（交回本机）。"""
+    hit = _gw_route(full)
+    if not hit:
+        return None
+    name, url, token, tool = hit
+    hops = int(getattr(_REQ, "hops", 0) or 0) + 1
+    limit = int(CFG.get("peer_max_hops", 3) or 3)
+    if hops > limit:
+        return _gw_result("[%s] 转发跳数超过上限 %d，疑似成环，已拒绝"
+                          % (name, limit), True)
+    timeout = float(CFG.get("gateway_call_timeout", 130) or 130)
+
+    with GW_LOCK:
+        sess = dict(GW_SESS.get(name) or {})
+    sid = sess.get("sid") if sess.get("url") == url else None
+
+    # 会话只在**调用发出之前**建立。这一步失败可以放心返回错误：
+    # 命令一个字节都没发出去。
+    if not sid:
+        try:
+            r, sid = _peer_rpc(url, token, {
+                "jsonrpc": "2.0", "id": 1, "method": "initialize",
+                "params": {"protocolVersion": "2024-11-05", "capabilities": {},
+                           "clientInfo": {"name": "mcp-fleet-gateway",
+                                          "version": SERVER_VERSION}}},
+                None, hops, min(timeout, 20))
+            try:
+                _peer_rpc(url, token,
+                          {"jsonrpc": "2.0", "method": "notifications/initialized"},
+                          sid, hops, min(timeout, 10))
+            except ValueError:
+                pass
+            with GW_LOCK:
+                GW_SESS[name] = {"url": url, "token": token, "sid": sid}
+        except Exception as e:
+            return _gw_result("[%s] 连不上：%s" % (name, e), True)
+
+    try:
+        r, sid2 = _peer_rpc(url, token, {
+            "jsonrpc": "2.0", "id": 2, "method": "tools/call",
+            "params": {"name": tool, "arguments": arguments or {}}},
+            sid, hops, timeout)
+        with GW_LOCK:
+            GW_SESS[name] = {"url": url, "token": token, "sid": sid2 or sid}
+    except Exception as e:
+        # **不重试**。请求可能已经到了对端并开始执行，重发就是跑两遍。
+        # 只把会话标记作废，让下一次调用重新握手。
+        with GW_LOCK:
+            GW_SESS.pop(name, None)
+        return _gw_result("[%s] 调用失败：%s" % (name, e), True)
+    if "error" in r:
+        return _gw_result("[%s] 对端错误：%s"
+                          % (name, json.dumps(r["error"], ensure_ascii=False)), True)
+    res = r.get("result")
+    return res if isinstance(res, dict) else _gw_result(
+        "[%s] 对端返回异常：%s" % (name, str(r)[:200]), True)
+
+
+def gw_warm():
+    """启动时后台预热一次缓存：否则第一次 tools/list 要等所有节点往返。"""
+    def _run():
+        try:
+            gw_tools(force=True)
+        except Exception as e:
+            print("[warn] 网关预热失败：%s" % e, file=sys.stderr)
+    threading.Thread(target=_run, daemon=True).start()
+
+
 def handle_rpc(msg):
     if not isinstance(msg, dict) or msg.get("jsonrpc") != "2.0":
         return None
@@ -4948,6 +5288,16 @@ def handle_rpc(msg):
                 instructions = _agent_layer.build_instructions(CFG)
             except Exception as _e:
                 print("[warn] Agent 提示词生成失败，使用内置简版: %s" % _e, file=sys.stderr)
+        if gw_enabled():
+            # 网关必须自己说清楚命名规则，否则 AI 看到 `nas__exec` 会当成
+            # 一个陌生工具去猜参数。
+            _nodes = [n for n, _u, _t in _gw_node_list()]
+            instructions = (
+                "本节点是集群网关：工具名形如 `<节点>__<工具>` 的，会在对应节点上执行；"
+                "不带前缀的是本机（%s）。当前可路由节点：%s。"
+                "例：`nas__exec` = 在 nas 上执行命令，`exec` = 在本机执行。\n\n%s"
+                % (SERVER_NAME, "、".join(_nodes) or "（暂无，先 fleet pair / peer_add）",
+                   instructions or ""))
         return {"jsonrpc": "2.0", "id": mid, "result": {
             "protocolVersion": params.get("protocolVersion") or "2024-11-05",
             "capabilities": caps,
@@ -4959,10 +5309,29 @@ def handle_rpc(msg):
     if method == "ping":
         return {"jsonrpc": "2.0", "id": mid, "result": {}}
     if method == "tools/list":
+        if gw_enabled():
+            hops = int(getattr(_REQ, "hops", 0) or 0)
+            # 成环保护：A 聚合 B、B 又聚合 A 时，tools/list 会互相递归。
+            # 这个方向没有副作用，所以只能靠跳数拦，不能靠「不重试」拦。
+            if hops >= int(CFG.get("peer_max_hops", 3) or 3):
+                return {"jsonrpc": "2.0", "id": mid, "result": {"tools": list(TOOLS)}}
+            extra, _errs = gw_tools(hops=hops)
+            return {"jsonrpc": "2.0", "id": mid,
+                    "result": {"tools": list(TOOLS) + extra}}
         return {"jsonrpc": "2.0", "id": mid, "result": {"tools": TOOLS}}
     if method == "tools/call":
+        name = params.get("name")
+        if gw_enabled() and "__" in (name or ""):
+            got = gw_call(name, params.get("arguments") or {})
+            if got is not None:
+                # 网关这一跳也要留痕：审计里出现 `nas__exec` 才追得到
+                # 「是谁经本机把命令发到 nas 上的」。
+                _audit_call(name, params.get("arguments") or {},
+                            "error" if got.get("isError") else "ok",
+                            detail="gateway")
+                return {"jsonrpc": "2.0", "id": mid, "result": got}
         return {"jsonrpc": "2.0", "id": mid,
-                "result": call_tool(params.get("name"), params.get("arguments"))}
+                "result": call_tool(name, params.get("arguments"))}
     if method == "resources/list":
         return {"jsonrpc": "2.0", "id": mid, "result": {"resources": []}}
     if method == "prompts/list":
@@ -5655,6 +6024,11 @@ def main():
     ap.add_argument("--read-only", action="store_true",
                     help="只读模式：exec/write/edit/systemctl/docker_restart 等"
                          "变更类工具全部禁用（审计观察节点）")
+    ap.add_argument("--gateway", action="store_true",
+                    help="网关模式：本节点的 /mcp 同时代理所有已配对节点，"
+                         "对端工具以 `节点__工具` 出现（不写回配置文件）")
+    ap.add_argument("--no-gateway", action="store_true",
+                    help="临时关掉配置里的 gateway（排查「是不是网关拖慢了握手」）")
     args = ap.parse_args()
 
     # 配置损坏就直接停：带病上岗（无 token 监听）比不启动危险得多。
@@ -5705,6 +6079,12 @@ def main():
     # v5.0.7: --read-only 运行时开启只读模式（不写回配置文件）
     if args.read_only:
         CFG["read_only"] = True
+    # v5.2.10: --gateway / --no-gateway 只影响本次进程，不改配置文件——
+    # 「试一下」不该顺手把集群入口永久打开。
+    if args.gateway:
+        CFG["gateway"] = True
+    if args.no_gateway:
+        CFG["gateway"] = False
     httpd = FleetHTTPServer((args.host, args.port), Handler)
     # P1-1: TLS 支持
     if args.tls_cert and args.tls_key:
@@ -5731,6 +6111,13 @@ def main():
     print("║  fleet.py pair %s@%s" % (SERVER_NAME, _mcp_url) + " " * max(1, 60 - 18 - len(SERVER_NAME) - len(_mcp_url)) + "║")
     print("╚%s╝" % _bar)
     print("  工具数          : %d (%s)" % (len(TOOLS), ", ".join(t["name"] for t in TOOLS[:4]) + " ..."))
+    if gw_enabled():
+        _gn = _gw_node_list()
+        print("  网关模式        : 已开启（聚合 %d 个对端：%s；工具集 %s）"
+              % (len(_gn), "、".join(n for n, _u, _t in _gn) or "无",
+                 CFG.get("gateway_tools") or "core"))
+        print("                    对端工具名形如 nas__exec；本机工具仍是裸名")
+        gw_warm()
     print("  工作目录        : %s" % CFG.get("work_dir"))
     print("  运行身份        : %s" % ("root" if _is_root() else "非 root"))
 

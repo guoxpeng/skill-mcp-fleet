@@ -1,12 +1,12 @@
 ---
 name: mcp-fleet
-version: 5.2.9
+version: 5.2.10
 description: 把手机、NAS、云服务器、软路由、电脑与 Docker 容器组成一张 AI 对等协作网：一条命令安装节点、设备码/邀请链接安全配对，任意 MCP Agent 即可跨设备执行命令、读写与传输文件、查看容器日志、离线留言、按能力委派任务，并自带只读自检与有界自修复。默认安全（Ed25519 身份、请求签名防重放、认证加密信箱、哈希链审计），零第三方依赖、不依赖任何中心服务。当用户需要管理 NAS、远程控制家中电脑、多设备互联、让 AI 操作设备、远程执行命令、软路由排查、云主机纳管、离线留言、设备监控、MCP 组网或多 Agent 协作时使用；即使用户未提 "fleet"，只要涉及「用聊天指挥另一台设备干活」也应主动使用。
 license: MIT
 compatibility: Python 3.6+，纯标准库；Linux / macOS / Windows / Android(Termux) / OpenWrt。可选 openssl（自动生成 TLS 证书）与 tailscale（跨网段加速）。
 ---
 
-# MCP Fleet v5.2.9 · 让所有设备成为一支 AI 团队
+# MCP Fleet v5.2.10 · 让所有设备成为一支 AI 团队
 
 MCP Fleet 把每台设备变成一个**节点**，节点之间对等互联：自动发现、在线直投、离线信箱、
 按能力委派。设备上的 AI Agent 可以直接对话与协作，而不是"人拿遥控器"。
@@ -180,6 +180,24 @@ fleet run nas,pi "df -h" --short
 - **`fleet group` 是「节点分组」**（给批量执行用，存在登记表里），
   和 agent 协作组（`group_form` / `group_list` / `group_disband`）不是一回事。
 
+### 5）一个 endpoint 管全网（v5.2.10 网关模式）
+
+客户端只配本机一个 MCP 地址，对端工具以 `节点__工具` 出现：
+
+```text
+istoreos__exec   → 在 istoreos 上执行
+exec             → 在本机执行（裸名不变，已有配置不受影响）
+```
+
+```bash
+fleet gateway on        # 开（写配置 + 重启本机节点）
+fleet gateway           # 看聚合了谁、多少工具、是否已生效
+fleet gateway tools     # 列聚合后的工具名
+```
+
+默认只暴露 19 个常用工具/节点（`gateway_tools: core`），全量要显式
+`gateway_tools: all`——73×N 会把上下文塞满。**网关的 token 等于整个集群的 token**。
+
 ---
 
 ## 四、安全红线（必须遵守）
@@ -213,6 +231,7 @@ fleet run nas,pi "df -h" --short
 | 自对话 | `fleet_help` `fleet_think` `fleet_plan` `fleet_reflect` `fleet_review` `fleet_handoff` | 规划/反思/验收/交接 |
 | 运维 | `fleet_doctor` `fleet_metrics` `fleet_identity` `fleet_audit_verify` `fleet_token_rotate` | 自检/指标/身份/审计/轮换 |
 | 批量（CLI） | `fleet run` `fleet group` | 多台并行跑同一命令 / 节点分组（**不是 MCP 工具**，用 bash 调） |
+| 网关（CLI） | `fleet gateway` | 本机一个 endpoint 暴露全集群，对端工具名 `节点__工具` |
 
 完整参数：调用 `fleet_help(topic="tools")`，或见 `references/agent-playbook.md`。
 

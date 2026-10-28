@@ -594,7 +594,7 @@ class WiringTest(unittest.TestCase):
     def test_menu_entries_exist(self):
         src = _src("fleet.py")
         for marker in ('elif choice == "26"', 'elif choice == "27"',
-                       "请选择 (0-27)"):
+                       "请选择 (0-28)"):
             self.assertIn(marker, src)
 
     def test_run_help_mentions_group(self):

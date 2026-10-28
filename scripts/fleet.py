@@ -20,6 +20,7 @@ mcp-fleet 统一命令行 —— 节点之间互相操控（不分主副，谁�
   exec <target> <命令...>       在副端执行 shell 命令
   run --all|--group G <命令...> 一批机器上**并行**跑同一条命令（替代 shell 循环）
   group [ls|add|rm|del]         节点分组：批量执行的选点依据
+  gateway [on|off|tools]        网关模式：一个 endpoint 暴露全集群（`节点__工具`）
   shell <target>                交互式 shell（PTY，可跑 vim/top，替代 ssh）
   sessions / attach / kill      连接管理：一张表看全 / 接管挂起的会话 / 统一断开
   recordings / replay           会话录像（asciinema v2 cast）与回放
@@ -55,6 +56,7 @@ target 写法
   python fleet.py run --all --short "uptime"
   python fleet.py group add web nas pi
   python fleet.py run --group web "systemctl restart nginx"
+  python fleet.py gateway on
   python fleet.py install-cmd --name pi --port 3100 --mirror ghfast
   python fleet.py bootstrap --host 192.168.1.9 --user root --name pi
   python fleet.py tunnel cloud --status
@@ -84,7 +86,7 @@ import uuid
 
 # ---------------------------------------------------------------- 基础
 
-VERSION = "5.2.9"
+VERSION = "5.2.10"
 PROTOCOL = "2024-11-05"
 HERE = os.path.dirname(os.path.abspath(__file__))
 
@@ -3405,6 +3407,147 @@ def cmd_group(a):
     verb = "加入" if act == "add" else "移出"
     print(ok("[+] ") + "已把 %s %s组 %s" % ("、".join(members), verb, a.group))
     print(dim("  一起跑命令：fleet run --group %s \"uptime\"" % a.group))
+    return 0
+
+
+def _gw_local_cfg_path(me):
+    return os.path.join(me.get("dir") or "", "mcp_agent_config.json")
+
+
+def _gw_runtime(a, url, meta):
+    """连本机节点拉一次 tools/list。返回 (tools, 错误)。"""
+    try:
+        c = MCPClient(url, a.timeout, token=meta.get("token", ""),
+                      connect_timeout=_connect_timeout(a))
+        c.handshake()
+        tools = c.list_tools()
+        c.close()
+        return tools or [], ""
+    except Exception as e:
+        return [], _human_net_err(e)
+
+
+def _gw_split(tools):
+    """把工具清单拆成 {本机: [...], 前缀: [...]}。"""
+    local, remote = [], {}
+    for t in tools:
+        name = (t or {}).get("name") or ""
+        if "__" in name:
+            pref = name.split("__", 1)[0]
+            remote.setdefault(pref, []).append(name.split("__", 1)[1])
+        else:
+            local.append(name)
+    return local, remote
+
+
+def cmd_gateway(a):
+    """网关模式：一个 MCP endpoint 暴露整个集群。
+
+    没有它，接 5 台设备就要在客户端配 5 个 MCP 条目。有了它，客户端只认本机
+    一个 URL，对端工具叫 `节点__工具`。
+
+    这里要同时说清两件事：**配置文件里开没开**，和**跑着的进程加没加载**。
+    只报前者会骗人——改完配置不重启，工具根本不会出现。
+    """
+    me = local_node()
+    if not me:
+        return die("本机还没装节点——网关就是本机节点本身，先装：\n"
+                   "    sh scripts/install.sh --name %s --port 3100" % _default_node_name())
+    cfg_path = _gw_local_cfg_path(me)
+    try:
+        cfg = load_json_config(cfg_path)
+    except Exception as e:
+        return die("读不到 %s：%s" % (cfg_path, e))
+
+    action = (getattr(a, "action", "") or "").strip().lower()
+
+    # ---- on / off：改配置（+ 默认重启，否则改了等于没改）----
+    if action in ("on", "off"):
+        want = (action == "on")
+        if bool(cfg.get("gateway")) == want:
+            print(dim("  配置里已经是 %s 了。" % ("开" if want else "关")))
+        else:
+            cfg["gateway"] = want
+            try:
+                save_json_config(cfg_path, cfg)
+            except Exception as e:
+                return die("写 %s 失败：%s" % (cfg_path, e))
+            print(ok("[+] ") + "已%s网关（%s）"
+                  % ("开启" if want else "关闭", cfg_path))
+        if getattr(a, "no_restart", False):
+            print(dim("  --no-restart：改动要下次启动才生效（fleet restart）"))
+            return 0
+        print(dim("  重启本机节点让它生效…"))
+        return cmd_restart(_menu_args(["restart"]))
+
+    url, meta = _local_endpoint() or (None, None)
+    tools, why = _gw_runtime(a, url, meta) if url else ([], "没有本机节点")
+    local, remote = _gw_split(tools)
+    cfg_on = bool(cfg.get("gateway"))
+    live_on = bool(remote)
+
+    if action == "tools":
+        if not tools:
+            print(err("[x] ") + "拿不到工具清单：%s" % why)
+            return 1
+        if a.json:
+            print(json.dumps({"local": local, "remote": remote},
+                             ensure_ascii=False, indent=2))
+            return 0
+        print("本机工具（%d）：" % len(local))
+        print("  " + "  ".join(sorted(local)))
+        if not remote:
+            print()
+            print(warn("没有 `节点__工具` —— 网关没开，或还没有已配对的节点。"))
+            print(dim("  开：fleet gateway on    配对：fleet pair <对方>"))
+            return 0 if not cfg_on else 1
+        for pref in sorted(remote):
+            print()
+            print("%s（%d）：" % (pref, len(remote[pref])))
+            print("  " + "  ".join(sorted(remote[pref])))
+        return 0
+
+    # ---- status ----
+    if a.json:
+        print(json.dumps({"config_gateway": cfg_on, "running": live_on,
+                          "url": url, "local_tools": len(local),
+                          "remote": dict((k, len(v)) for k, v in remote.items()),
+                          "error": why}, ensure_ascii=False, indent=2))
+        return 0
+
+    print("网关模式")
+    print("  " + "-" * 56)
+    print("  配置文件        : %s" % ("已开启" if cfg_on else "关闭")
+          + dim("  (%s)" % cfg_path))
+    if not url:
+        print("  运行状态        : %s" % err("本机节点没在跑（fleet start）"))
+        return 1
+    if live_on:
+        print("  运行状态        : %s" % ok("已生效")
+              + dim("  %d 个对端前缀" % len(remote)))
+    elif cfg_on:
+        print("  运行状态        : %s" % warn("配置已开，但进程还没加载")
+              + dim("  → fleet restart"))
+    else:
+        print("  运行状态        : 未开启")
+    print("  本机端点        : %s" % url)
+    print("  本机工具        : %d" % len(local))
+    if remote:
+        print("  聚合节点        :")
+        w = max(len(p) for p in remote)
+        for pref in sorted(remote):
+            print("    %-*s  %3d 个工具" % (w, pref, len(remote[pref])))
+        print("  合计            : %d 本机 + %d 对端 = %d"
+              % (len(local), sum(len(v) for v in remote.values()),
+                 len(local) + sum(len(v) for v in remote.values())))
+        print()
+        print(dim("  客户端只配这一个地址即可（fleet add --name fleet --url %s）" % url))
+        print(dim("  用法：对端工具名 = 节点__工具，如 %s__exec；本机仍是 exec"
+                  % sorted(remote)[0]))
+    else:
+        print()
+        print(dim("  开：fleet gateway on      配对节点：fleet pair <对方地址>"))
+        print(dim("  工具集：core（19 个/节点）｜gateway_tools=all 或 \"exec,read\" 可改"))
     return 0
 
 
@@ -6971,6 +7114,16 @@ def build_parser():
     sp.add_argument("nodes", nargs="*", default=[], help="节点名（可多个）")
     sp.set_defaults(func=cmd_group)
 
+    sp = common(sub.add_parser(
+        "gateway", help="网关模式：一个 endpoint 暴露整个集群（对端工具名 `节点__工具`）"),
+        need_target=False)
+    sp.add_argument("action", nargs="?", default="",
+                    choices=["", "status", "on", "off", "tools"],
+                    help="留空=看状态；on/off=开关（会重启本机节点）；tools=列聚合后的工具名")
+    sp.add_argument("--no-restart", action="store_true",
+                    help="改配置但不重启（下次启动才生效）")
+    sp.set_defaults(func=cmd_gateway)
+
     sp = common(sub.add_parser("call", help="调任意工具"), need_target=False)
     sp.add_argument("target", nargs="?", default="",
                     help="副端名字/地址；省略=本机。也可以只写工具名（fleet call sysinfo）")
@@ -7997,6 +8150,7 @@ def cmd_menu(a):
    [8] 执行命令（exec）          [9] 调用工具（call）
   [20] 交互式 shell（替代 ssh） [21] 端口转发（-L/-R/-D）
   [26] 批量执行（run）          [27] 分组管理（group）
+  [28] 网关模式（gateway）
   [10] 列远端工具清单（tools）
 
   【连接管理】
@@ -8022,7 +8176,7 @@ def cmd_menu(a):
         print("  提示词速用：fleet prompt self_repair  然后原样粘给 AI 客户端。")
         print()
         try:
-            choice = input("  请选择 (0-27): ").strip()
+            choice = input("  请选择 (0-28): ").strip()
         except (EOFError, KeyboardInterrupt):
             print("\n  再见！")
             return 0
@@ -8377,6 +8531,26 @@ def cmd_menu(a):
                 argv = (["group", "add" if op == "1" else "rm", gname]
                         + _split_names(names))
                 cmd_group(_menu_args(argv))
+            input("\n  按回车继续...")
+
+        # ---- 28: gateway（网关模式） ----
+        elif choice == "28":
+            _banner()
+            print("\n  网关模式（一个 endpoint 管全网）")
+            print("  " + "-" * 40)
+            cmd_gateway(_menu_args(["gateway"]))
+            print()
+            print("  1) 开启（会重启本机节点）   2) 关闭   3) 看聚合后的工具名")
+            try:
+                op = input("  选择（回车返回）: ").strip()
+            except (EOFError, KeyboardInterrupt):
+                continue
+            if op == "1":
+                cmd_gateway(_menu_args(["gateway", "on"]))
+            elif op == "2":
+                cmd_gateway(_menu_args(["gateway", "off"]))
+            elif op == "3":
+                cmd_gateway(_menu_args(["gateway", "tools"]))
             input("\n  按回车继续...")
 
         else:

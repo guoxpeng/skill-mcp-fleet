@@ -1,7 +1,7 @@
-# 真机测试结果 · MCP Fleet v5.2.9
+# 真机测试结果 · MCP Fleet v5.2.10
 
 > 本文件记录可复现的真实设备验证。最近一次：2026-10-28（iStoreOS 真机）。
-> 自动化用例：**1126 passed + 1 skipped**（`python3 -m pytest tests/ -q`）。
+> 自动化用例：**1160 passed + 1 skipped**（`python3 -m pytest tests/ -q`）。
 > 下列结果来自实际安装/升级/运行，不是单元测试推断。
 
 ## 1. 覆盖矩阵
@@ -146,6 +146,45 @@ run istoreos --quiet "exit 7" → 只打汇总，退出码 1（--quiet 写在命
 | `curl ... http://127.0.0.1:9/`（关闭的端口） | `curl rc=97`（收到 SOCKS 失败码，不干等） |
 | 直接发 `GET / HTTP/1.0`（不是 SOCKS） | 立刻断开，日志「不是 SOCKS5（首字节 71）」 |
 | 本机节点对照（`-D 11080 node`） | 200 / 86ms |
+
+### 5.3 网关模式（v5.2.10，一个 endpoint 管全网）
+
+本机节点开 `gateway: true`，把 iStoreOS 聚合进来：
+
+```text
+$ fleet gateway
+网关模式
+  配置文件        : 已开启  (.../mcp_agent_config.json)
+  运行状态        : 已生效  1 个对端前缀
+  本机端点        : http://127.0.0.1:3100/mcp
+  本机工具        : 73
+  聚合节点        :
+    istoreos   19 个工具
+  合计            : 73 本机 + 19 对端 = 92
+
+$ fleet call node --tool istoreos__exec --arg command="uname -s; echo via-gateway"
+[exit 0]
+Linux
+via-gateway
+
+$ fleet call node --tool exec --arg command="uname -s"      # 裸名 = 本机
+[exit 0]
+Darwin
+```
+
+审计链留痕（`fleet_audit_verify` 仍 `ok:true`）：
+
+```json
+{"event":{"args":{"command":"uname -s; echo via-gateway"},
+          "detail":"gateway","status":"ok","tool":"istoreos__exec"},"idx":2052,...}
+```
+
+**一个 URL，92 个工具，跨 Tailscale 打到真设备。** 本机工具仍是裸名，已有客户端
+配置不受影响。
+
+延迟上限（同一台机器，iStoreOS 拔网后）：`tools/list` 第 1 次 **4.10s**（受
+`gateway_list_timeout=4` 约束，不再是无上限），第 2/3/4 次 **0.00s**（命中缓存），
+缓存 TTL 自动缩到 **30s** 后重试。修之前这里每次都要重新等一轮超时。
 
 ## 6. 修复过的真实缺陷（真机发现，已合并进 5.1.1 / 5.2.7）
 
