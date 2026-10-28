@@ -10,6 +10,73 @@
 
 ---
 
+## [5.2.7] — 2026-10-28 · 第一次上真软路由：三个只有真机才暴露的坑
+
+拿到 iStoreOS（24.10.7 / Celeron J4125 / 998MB 内存 / Tailscale）的登录权限后，
+把它从 5.2.0 原地升到 5.2.7，逐条敲命令。**前三条命令就翻车了。**
+
+三个 bug 是同一个根因的三种表现，读代码看不出来，因为桌面 macOS/Linux 的
+`/etc/profile` 不打横幅——只有软路由会。
+
+### 1. 每条 exec 输出都被开机横幅污染
+```
+$ fleet exec istoreos "uname -s"
+  ▀     ▄▄▄▄    ▄        ▄▄▄▄   ▄▄▄▄      ← 9 行 ASCII 艺术
+  ...
+iStoreOS 24.10.7, 2026070313
+-------------------------------------------------------
+Linux
+```
+根因：`_wrap` 默认 `-lc`（login shell），OpenWrt 的 `/etc/profile` 会 `cat` 横幅。
+后果不是「多几行」——是 `| jq`、`$(...)`、`grep` 全部拿到脏数据。
+
+修复：`login_shell` 默认改 **False**；交互式 `shell_open` 仍用 `-l`（那里横幅是
+**应该**看到的）。老安装的配置里这个键被安装器写死成 `true`，所以加**一次性迁移**
+（写 `_login_shell_migrated` 标记，用户之后手动改回 true 不会被反复打回）。
+
+### 2. `fleet cp` 在设备上完全不可用
+```
+[x] 搬运失败：远端 stat 输出异常：'\x1b[0;1;34;94m▀\x1b[0m     \x1b[0;34m▄▄▄▄\x1b[0m ...'
+```
+cp 靠解析远端 `stat` 判断文件，横幅把那行挤掉了。同一个根因，第 1 条修好即消失。
+
+### 3. `net_check listen` 返回 683KB
+设备上没有 `ss`，退回的 busybox `netstat -tlnp` **不认 `-l`**，把所有 socket
+（含 ESTABLISHED）全倒出来：实测 **6943 行 / 683212 字节**，客户端只能截断，
+等于没给信息。修复：优先 `ss`；否则 netstat 自己 `grep -i listen`；两头封 200 行；
+空输出明确说「没有监听端口」而不是返回空串。
+
+### 4. 顺带：`exec-async` 的提示在副端上是错的
+`fleet exec-async istoreos ...` 打出的 `fleet exec-poll <jid>` 会去问**本机**
+（提示里没有 target），得到「未知 job_id」；照提示补上 target 之后，argparse 又
+把顺序读反（`target` 排在 `job_id` 前面），报「找不到副端 b5db0c8c4625」。
+修复：CLI 层按形状补 target（副端不知道主端用什么名字），`_pick_job_args`
+按 **job_id 是纯十六进制**识别，两种顺序都认。
+
+### 真机验证记录
+完整数据见 [`references/test-results.md`](references/test-results.md) 第 5 节。
+
+```text
+ping      → node v5.2.7（升级前 5.2.0）
+exec      → [exit 0] / Linux          （横幅已消失）
+cp 推/拉   → 17 字节 5.1s / 5.7s，内容一致
+forward   → -L → LuCI HTTP 200 三次全通（2.3s / 2.3s / 7.3s）
+sessions  → 1 条连接，label/owner/字节/录制齐全
+recordings→ /root/fleet/recordings/sh-368b0153.cast 3.6KB，replay 可回放
+audit     → ok:true（升级前 ok:false / bad_index 0，5.2.4 那个 bug 在真机复现并消失）
+```
+
+设备工具链实测：`bash base64 dd python3 tar gzip curl wget nc netstat` 全有，
+**`ss` 没有**——所以上面第 3 条不是理论风险。
+
+### 测试
+- 新增 `tests/test_device_527.py`（21 条）：默认非登录 shell（含反向验证）、
+  `shell_open` 仍登录、迁移只做一次且不丢令牌、无该键时不该改写文件、
+  listen 命令必须自己 grep + 封顶、job 提示补 target、job_id 按形状识别（两种顺序）。
+- 全量 **1039 passed, 1 skipped**（5.2.6 是 1018，本版净增 21 条）。
+
+---
+
 ## [5.2.6] — 2026-10-28 · 连接管理：看得见、接得回、断得掉、查得到
 
 5.2.5 把「拿它当 ssh 用」的常用命令串了一遍，剩下的最后一块是**连接本身**。

@@ -104,16 +104,19 @@ for _stream in (sys.stdout, sys.stderr):
 DEFAULT_CONFIG = {
     "name": "node",             # 副端标识（显示在状态页与 serverInfo）
     "tool_prefix": "",          # 工具名前缀，如 "nas_"；留空则用裸名（exec/read/...）
-    "version": "5.2.6",
+    "version": "5.2.7",
     "sudo_password": "",        # 留空且非 root 时会尝试免密 sudo
     "work_dir": "/",            # 默认工作目录
     "command_timeout": 120,     # 秒
     "max_output_bytes": 200000, # 单次输出上限，防止刷爆上下文
     "allowed_roots": ["/"],     # 文件读写允许的路径前缀（安全边界）
     "enable_docker": True,      # 无 Docker 的设备可关掉
-    "login_shell": True,        # True=bash -lc（会 source /etc/profile）；
-                                # 容器里 profile 打了欢迎横幅（PAI-DSW 等）时设 False，
-                                # 改成 bash -c，输出干净且 PATH 通常够用
+    "login_shell": False,       # False=shell -c；True=shell -lc（会 source /etc/profile）
+                                # **默认必须是 False**（v5.2.7）：iStoreOS / OpenWrt 的
+                                # /etc/profile 会打印开机横幅，于是每一条 exec 的输出
+                                # 都被 9 行 ASCII 艺术污染，`| jq` / `$(...)` / cp 的
+                                # stat 解析全部失败（真机实测）。需要 profile 里的 PATH
+                                # 时才打开；交互式 shell 走 shell_open 的 -l，不受影响。
     # ---- 访问控制（v3.0）--------------------------------------------------
     # 非空则所有请求必须带 Authorization: Bearer <token>（或 X-Fleet-Token）。
     # 副端以 root 运行、exec 等于 root shell，走公网隧道时**必须**设置。
@@ -225,6 +228,22 @@ def load_config():
         except Exception as e:
             _CONFIG_LOAD_ERROR = str(e)
             print("[warn] 读配置失败，用默认值: %s" % e, file=sys.stderr)
+    # v5.2.7 迁移：`login_shell` 的默认值从 True 改成 False。
+    # 这个键是**安装器写进配置**的，不是用户手填的；而它在 iStoreOS / OpenWrt 上
+    # 会把 /etc/profile 的开机横幅塞进每一条 exec 输出（真机实测：`fleet exec X
+    # "uname -s"` 返回 9 行 ASCII 艺术 + Linux，`fleet cp` 连 stat 都解析不出来）。
+    # 只迁移一次：落盘一个标记，用户之后手动改回 true 不会被反复打回。
+    if cfg.get("login_shell") is True and not cfg.get("_login_shell_migrated"):
+        cfg["login_shell"] = False
+        cfg["_login_shell_migrated"] = True
+        try:
+            if os.path.exists(CONFIG_PATH):
+                save_config(cfg)
+                print("[info] 已关闭 login_shell：登录 shell 会把 /etc/profile 的"
+                      "横幅混进每条命令输出；要恢复请手动改 true 并删 _login_shell_migrated",
+                      file=sys.stderr)
+        except Exception:
+            pass
     return cfg
 
 
@@ -616,7 +635,12 @@ def _wrap(cmd, sudo=False):
     仍然流向命令本身，所以带 stdin 的命令不受影响。
     """
     sh = _shell_bin()
-    flag = "-lc" if CFG.get("login_shell", True) else "-c"
+    # **默认不登录**（v5.2.7）。`-lc` 会 source /etc/profile，而 iStoreOS / OpenWrt
+    # 的 /etc/profile 会打印开机横幅：真机上 `fleet exec istoreos "uname -s"`
+    # 返回的是 9 行 ASCII 艺术 + `Linux`，脚本里 `| jq` / `grep` 全废。
+    # 交互式 shell 仍然走 `shell_open` 的 `-l`（那里横幅是**应该**看到的）。
+    # 需要 profile 里的 PATH 时把 login_shell 打开即可。
+    flag = "-lc" if CFG.get("login_shell", False) else "-c"
     if not sudo or _is_root():
         return sh + " " + flag + " " + shlex.quote(cmd)
     if CFG.get("sudo_password"):
@@ -2272,9 +2296,18 @@ def t_net_check(a):
         except Exception as e:
             return "[exit 1] DNS resolve failed: %r" % (e,), True
     elif action == "listen":
-        # 列出本机监听端口
-        cmd = "ss -tlnp 2>/dev/null || netstat -tlnp 2>/dev/null"
+        # 列出本机监听端口。
+        #
+        # 真机坑（iStoreOS 24.10.7 / busybox）：`ss` 根本不存在，而 busybox 的
+        # `netstat -tlnp` **不认 -l**，会把所有 socket（含 ESTABLISHED）全倒出来
+        # ——实测 6943 行 / 683KB，客户端只能截断，等于没有信息。
+        # 所以：优先 ss；否则 netstat 再自己 grep LISTEN；两头都封 200 行。
+        cmd = ("if command -v ss >/dev/null 2>&1; then ss -tlnp 2>/dev/null; "
+               "else netstat -tlnp 2>/dev/null || netstat -an 2>/dev/null; fi "
+               "| grep -i -E 'listen|^proto|^Active' | head -200")
         code, out, err = run_local(cmd)
+        if not out.strip():
+            return ("[exit 0] 没有监听端口（或本机既无 ss 也无 netstat）"), False
         return fmt_result(code, out, err), code != 0
     return "[exit 1] Unknown action: %s" % action, True
 

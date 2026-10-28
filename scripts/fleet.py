@@ -76,7 +76,7 @@ import uuid
 
 # ---------------------------------------------------------------- 基础
 
-VERSION = "5.2.6"
+VERSION = "5.2.7"
 PROTOCOL = "2024-11-05"
 HERE = os.path.dirname(os.path.abspath(__file__))
 
@@ -2797,6 +2797,27 @@ def _mcp_client(a, toks=None, target=None):
     return c
 
 
+def _job_hint(text, target):
+    """把副端返回的提示补成**能直接复制**的 CLI 命令。
+
+    副端只知道自己的 SERVER_NAME，不知道主端用的是什么名字（可能是别名、
+    也可能是 IP），所以 target 只能由这一层补。不补的话
+    `fleet exec-async istoreos ...` 打出的 `fleet exec-poll <jid>` 会去问本机，
+    得到「未知 job_id」——提示和事实互相矛盾。
+    """
+    target = (target or "").strip()
+    if not target:
+        return text
+    m = re.search(r"job_id=([0-9a-f]+)", text)
+    if not m:
+        return text
+    jid = m.group(1)
+    for verb in ("exec-poll", "exec-result", "exec-kill"):
+        text = text.replace("fleet %s %s" % (verb, jid),
+                            "fleet %s %s %s" % (verb, jid, target))
+    return text
+
+
 def cmd_exec_async(a):
     toks = list(a.command)
     c = _mcp_client(a, toks)
@@ -2812,22 +2833,34 @@ def cmd_exec_async(a):
         text, iserr = c.call("exec_async", args, timeout=max(a.timeout, 30))
     except MCPError as e:
         return die("调用失败：%s" % e)
+    # 提示里的命令必须能**直接复制执行**（见 _job_hint 的说明）
+    text = _job_hint(text, getattr(a, "target", ""))
     sys.stdout.write(text if text.endswith("\n") else text + "\n")
     return 1 if iserr else 0
+
+
+#: job_id 是 `uuid4().hex[:12]`，纯小写十六进制；副端名字/地址不会长这样。
+_JOB_ID_RE = re.compile(r"^[0-9a-f]{8,32}$")
 
 
 def _pick_job_args(a):
     """exec-poll / exec-result / exec-kill 的位置参数兜底，返回 (target, job_id)。
 
     `fleet exec-poll <job_id>` 是最自然的用法（exec-async 的提示也这么写），
-    但 target 是必需位置参数：job_id 被当成 target，真正的 job_id 缺失，
-    于是回一句 argparse 的 usage——提示和用法互相矛盾，用户只能猜。
-    只有一个位置参数时，它就是 job_id，节点默认本机。
+    但 argparse 里 target 排在前面：job_id 被当成 target，真正的 job_id 缺失，
+    于是回一句 usage——提示和用法互相矛盾，用户只能猜。
+
+    两条兜底：
+      1. 只有一个位置参数 → 它就是 job_id，节点默认本机；
+      2. 两个都给了但顺序反了（`exec-result <jid> istoreos`）→ 按**形状**换回来。
+         job_id 是纯十六进制，节点名几乎不可能长这样，判据足够稳。
     """
     target = (getattr(a, "target", "") or "").strip()
     jid = (getattr(a, "job_id", "") or "").strip()
     if target and not jid:
         return "", target
+    if target and jid and _JOB_ID_RE.match(target) and not _JOB_ID_RE.match(jid):
+        return jid, target          # 用户按 `<jid> <节点>` 写的，argparse 读反了
     return target, jid
 
 
