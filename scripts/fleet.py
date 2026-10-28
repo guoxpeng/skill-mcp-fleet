@@ -71,6 +71,7 @@ import shlex
 import shutil
 import signal
 import socket
+import struct
 import subprocess
 import sys
 import tempfile
@@ -83,7 +84,7 @@ import uuid
 
 # ---------------------------------------------------------------- 基础
 
-VERSION = "5.2.8"
+VERSION = "5.2.9"
 PROTOCOL = "2024-11-05"
 HERE = os.path.dirname(os.path.abspath(__file__))
 
@@ -1938,6 +1939,123 @@ def cmd_replay(a):
 # ---------------------------------------------------------------------------
 # 端口转发（v5.4）：ssh -L / -R 的等价物
 # ---------------------------------------------------------------------------
+def _parse_socks_bind(spec, default_bind):
+    """`-D 1080` / `-D 127.0.0.1:1080` → {bind, port}。
+
+    -D 没有「目标」，目标由 SOCKS 客户端在握手时给——这正是它和 -L 的区别：
+    一个固定出口 vs 一个通用出口。
+    """
+    raw = (spec or "").strip()
+    if not raw:
+        raise ValueError("SOCKS 监听规格为空")
+    parts = raw.split(":")
+    if len(parts) == 1:
+        bind, port = default_bind, parts[0]
+    elif len(parts) == 2:
+        bind, port = parts
+    else:
+        raise ValueError("看不懂的 -D 规格：%s\n"
+                         "     写法：-D <端口> 或 -D <绑定地址>:<端口>" % raw)
+    try:
+        p = int(port)
+    except ValueError:
+        raise ValueError("-D 的端口不是数字：%r" % port)
+    if not (0 < p < 65536):
+        raise ValueError("-D 的端口超出范围：%d" % p)
+    return {"bind": bind, "port": p}
+
+
+#: SOCKS5 应答码 → 人话。只用来给日志和 reply 用，不需要全。
+_SOCKS5_MSG = {0: "成功", 1: "一般性失败", 2: "规则不允许", 3: "网络不可达",
+               4: "主机不可达", 5: "连接被拒", 6: "TTL 过期",
+               7: "命令不支持", 8: "地址类型不支持"}
+
+
+def _recv_n(conn, n):
+    """读满 n 字节。短读/异常时返回**已经读到的部分**，由调用方判长度。"""
+    buf = b""
+    while len(buf) < n:
+        try:
+            chunk = conn.recv(n - len(buf))
+        except Exception:
+            return buf
+        if not chunk:
+            return buf
+        buf += chunk
+    return buf
+
+
+def _socks5_reply(conn, code):
+    """回一个 SOCKS5 应答（BND.ADDR 固定 0.0.0.0:0，客户端一般不看）。"""
+    try:
+        conn.sendall(b"\x05" + bytes(bytearray([code & 0xFF]))
+                     + b"\x00\x01" + b"\x00\x00\x00\x00" + b"\x00\x00")
+    except Exception:
+        pass
+
+
+def _socks5_greet(conn, timeout=30):
+    """SOCKS5 握手（无认证）+ CONNECT。返回 ((host, port), "") 或 (None, 原因)。
+
+    **只做 CONNECT**：`ssh -D` 的语义就是一个「能 CONNECT 的 SOCKS5」，
+    UDP ASSOCIATE 需要额外一条 UDP 通道，而且没有浏览器会为普通网页用它。
+    域名**原样**交给副端去解析——这才是「借用那台设备的网络环境」：DNS 在哪边
+    解析，决定了你看到的是哪边的内网。
+    """
+    conn.settimeout(timeout)
+    head = _recv_n(conn, 2)
+    if len(head) < 2:
+        return None, "连接太短"
+    if bytearray(head)[0] != 5:
+        return None, "不是 SOCKS5（首字节 %d）" % bytearray(head)[0]
+    methods = _recv_n(conn, bytearray(head)[1])
+    if 0 not in bytearray(methods):
+        _socks5_reply(conn, 0xFF)
+        return None, "客户端不支持「无认证」方式"
+    try:
+        conn.sendall(b"\x05\x00")          # 选「无认证」
+    except Exception as e:
+        return None, "回握手失败：%r" % (e,)
+    req = _recv_n(conn, 4)
+    if len(req) < 4 or bytearray(req)[0] != 5:
+        return None, "请求头格式错误"
+    cmd, atyp = bytearray(req)[1], bytearray(req)[3]
+    if cmd != 1:                            # 1=CONNECT, 2=BIND, 3=UDP
+        _socks5_reply(conn, 7)
+        return None, "只支持 CONNECT（cmd=%d）" % cmd
+    if atyp == 1:
+        raw = _recv_n(conn, 4)
+        # 长度必须**先校验**：`inet_ntoa` 拿到短包会抛 OSError，
+        # 而这里抛出去就是「线程带着 traceback 死掉、连接没人关」。
+        if len(raw) < 4:
+            return None, "IPv4 地址不完整"
+        host = socket.inet_ntoa(raw)
+    elif atyp == 3:
+        n = _recv_n(conn, 1)
+        if not n:
+            return None, "域名长度缺失"
+        ln = bytearray(n)[0]
+        raw = _recv_n(conn, ln)
+        if len(raw) < ln:
+            return None, "域名不完整"
+        host = raw.decode("utf-8", "replace")
+    elif atyp == 4:
+        raw = _recv_n(conn, 16)
+        if len(raw) < 16:
+            return None, "IPv6 地址不完整"
+        host = socket.inet_ntop(socket.AF_INET6, raw)
+    else:
+        _socks5_reply(conn, 8)
+        return None, "地址类型不支持（atyp=%d）" % atyp
+    p = _recv_n(conn, 2)
+    if len(p) < 2:
+        return None, "端口缺失"
+    port = struct.unpack("!H", p)[0]
+    if not host or not port:
+        return None, "目标地址为空（%r:%r）" % (host, port)
+    return (host, port), ""
+
+
 def _parse_fwd(spec, default_bind, is_local):
     """解析转发规格。
 
@@ -2057,11 +2175,14 @@ def _pump_sock_to_remote(client, tid, sock, gstop, lst, stats):
 
 
 def cmd_forward(a):
-    """v5.4: 端口转发 —— 没有它，「替代 ssh」还是半句话。
+    """端口转发 —— 没有它，「替代 ssh」还是半句话。
 
-    ssh 除了给终端，还给 -L / -R：远端内网里只有那台机器能碰的数据库、面板、
+    ssh 除了给终端，还给 -L / -R / -D：远端内网里只有那台机器能碰的数据库、面板、
     私有 API，全靠它接出来。fleet 之前的工具都是「一次请求一次响应」，
     拿不到一条能持续双向流动的连接，所以这块一直是缺的。
+
+    -L / -R 在命令行上把目标定死；-D 是本地开一个 SOCKS5，目标由客户端每次
+    连接时给（v5.2.9）。三者底层是同一条通道，区别只在「谁决定去哪」。
 
     实现上仍然是请求/响应，只是把「持续」拆成了「按需拉增量」：
     副端持有 socket 并缓冲最近 512KB，主端长轮询（wait=0.2s）把新增字节拉回来。
@@ -2091,19 +2212,22 @@ def cmd_forward(a):
         return 0 if not is_err else 1
 
     default_bind = getattr(a, "bind", "") or "127.0.0.1"
-    locals_, remotes = [], []
+    locals_, remotes, dynamics = [], [], []
     try:
         for spec in (getattr(a, "local", None) or []):
             locals_.append(_parse_fwd(spec, default_bind, True))
         for spec in (getattr(a, "remote", None) or []):
             remotes.append(_parse_fwd(spec, "127.0.0.1", False))
+        for spec in (getattr(a, "dynamic", None) or []):
+            dynamics.append(_parse_socks_bind(spec, default_bind))
     except ValueError as e:
         return die(str(e))
-    if not locals_ and not remotes:
-        return die("至少要给一个 -L 或 -R。例：\n"
+    if not locals_ and not remotes and not dynamics:
+        return die("至少要给一个 -L / -R / -D。例：\n"
                    "     fleet forward -L 8080:127.0.0.1:80 %s\n"
-                   "     fleet forward -R 9000:127.0.0.1:3000 %s"
-                   % (a.target, a.target))
+                   "     fleet forward -R 9000:127.0.0.1:3000 %s\n"
+                   "     fleet forward -D 1080 %s        # 本地 SOCKS5，从 %s 出网"
+                   % (a.target, a.target, a.target, a.target))
 
     stop = threading.Event()
     listeners = []        # 本地监听 socket（-L）
@@ -2255,6 +2379,92 @@ def cmd_forward(a):
         threading.Thread(target=accept_loop, daemon=True).start()
         return ls
 
+    # ---- -D：本地 SOCKS5，目标由客户端在握手时给 ----
+    def serve_dynamic(f):
+        """ssh -D 的等价物：一个本地 SOCKS5 端口，出口在副端那边。
+
+        和 -L 的唯一区别是「目标谁定」：-L 在命令行上定死，-D 让客户端每次连的
+        时候说。所以底层用的是同一套 tunnel_open/read/write——不用新协议，
+        也不用在副端开任何端口（这正是 ssh -D 比 ssh -L 更适合「临时借用
+        某台机器的网络」的原因）。
+        """
+        ls = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        ls.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            ls.bind((f["bind"], f["port"]))
+            ls.listen(32)
+        except Exception as e:
+            ls.close()
+            print(err("[x] ") + "绑定 %s:%d 失败：%s" % (f["bind"], f["port"], e))
+            return None
+        real = ls.getsockname()[1]
+        print(ok("[D] ") + "%s:%d  SOCKS5（经 %s 出网；浏览器/curl 指向它即可）"
+              % (f["bind"], real, a.target))
+
+        def handle(conn, peer):
+            label = "%s:%d" % (peer[0], peer[1])
+            if not _take_slot(conn, label):
+                return
+            try:
+                got, why = _socks5_greet(conn)
+                if not got:
+                    print(dim("  - %s 握手未完成：%s" % (label, why)))
+                    try:
+                        conn.close()
+                    except Exception:
+                        pass
+                    return
+                host, hport = got
+                rc, wc = _mk_clients()
+                with lock:
+                    stats["conn"] += 1
+                try:
+                    text, is_err = rc.call("tunnel_open",
+                                           {"host": host, "port": hport},
+                                           timeout=40)
+                except MCPError as e:
+                    text, is_err = str(e), True
+                tid = ""
+                if not is_err:
+                    try:
+                        tid = json.loads(text)["tunnel_id"]
+                    except Exception:
+                        is_err, text = True, "副端返回异常：%s" % str(text)[:120]
+                if is_err:
+                    # 给客户端一个明确的 SOCKS 失败码，别让它傻等
+                    _socks5_reply(conn, 5 if "拒" in str(text) else 4)
+                    print(err("[x] ") + "%s → %s:%d 失败：%s"
+                          % (label, host, hport, str(text)[:120]))
+                    try:
+                        conn.close()
+                    except Exception:
+                        pass
+                    _drop_clients(rc, wc)
+                    return
+                _socks5_reply(conn, 0)
+                # 握手时把 socket 设成了 30s 超时；泵起来必须恢复阻塞，
+                # 否则一条安静的连接（SSE / 长轮询）30 秒后会被自己掐断。
+                try:
+                    conn.settimeout(None)
+                except Exception:
+                    pass
+                print(dim("  + %s → %s:%d ↔ %s" % (label, host, hport, tid)))
+                _pipe(tid, conn, rc, wc, label)
+            finally:
+                slots.release()
+
+        def accept_loop():
+            while not stop.is_set():
+                try:
+                    conn, peer = ls.accept()
+                except Exception:
+                    break
+                threading.Thread(target=handle, args=(conn, peer),
+                                 daemon=True).start()
+
+        threading.Thread(target=accept_loop, daemon=True).start()
+        return ls
+
     # ---- -R：副端监听，新连接接回本地 ----
     def serve_remote(f):
         ctl = MCPClient(url, timeout=30, token=token, insecure=insecure)
@@ -2369,6 +2579,10 @@ def cmd_forward(a):
 
     for f in locals_:
         ls = serve_local(f)
+        if ls:
+            listeners.append(ls)
+    for f in dynamics:
+        ls = serve_dynamic(f)
         if ls:
             listeners.append(ls)
     for f in remotes:
@@ -6694,11 +6908,13 @@ def build_parser():
                     help="用内置播放器（默认优先用系统的 asciinema）")
     sp.set_defaults(func=cmd_replay)
     sp = common(sub.add_parser(
-        "forward", help="v5.4: 端口转发（等价 ssh -L / -R）"))
+        "forward", help="端口转发（等价 ssh -L / -R / -D）"))
     sp.add_argument("-L", "--local", action="append", metavar="[绑定:]端口:主机:端口",
                     help="本地监听并转发到副端可达的地址，可重复")
     sp.add_argument("-R", "--remote", action="append", metavar="[绑定:]端口:主机:端口",
                     help="副端监听并转发回本地可达的地址，可重复")
+    sp.add_argument("-D", "--dynamic", action="append", metavar="[绑定:]端口",
+                    help="本地开 SOCKS5，从副端出网（等价 ssh -D），可重复")
     sp.add_argument("--bind", default="127.0.0.1",
                     help="-L 的默认绑定地址（默认只绑回环，要用 0.0.0.0 显式给）")
     sp.add_argument("--list", action="store_true", help="列出副端当前的隧道")
@@ -7779,7 +7995,7 @@ def cmd_menu(a):
 
   【远程操控】
    [8] 执行命令（exec）          [9] 调用工具（call）
-  [20] 交互式 shell（替代 ssh） [21] 端口转发（-L / -R）
+  [20] 交互式 shell（替代 ssh） [21] 端口转发（-L/-R/-D）
   [26] 批量执行（run）          [27] 分组管理（group）
   [10] 列远端工具清单（tools）
 
@@ -8018,26 +8234,35 @@ def cmd_menu(a):
         # ---- 21: forward ----
         elif choice == "21":
             _banner()
-            print("\n  端口转发（等价 ssh -L / -R）")
+            print("\n  端口转发（等价 ssh -L / -R / -D）")
             print("  " + "-" * 40)
-            print("  格式：[绑定地址:]端口:目标主机:目标端口")
+            print("  -L/-R 格式：[绑定地址:]端口:目标主机:目标端口")
             print("  例：8080:127.0.0.1:80   或   127.0.0.1:8080:db.internal:3306")
+            print("  -D 格式：[绑定地址:]端口（本地 SOCKS5，目标由客户端给）")
             print()
             name = _pick_node("要经哪台设备转发: ")
             if not name:
                 continue
             try:
-                spec = input("  转发规格: ").strip()
+                direction = input("  方向 [L=本地监听/R=副端监听/D=本地 SOCKS5，默认 L]: "
+                                  ).strip().upper()
             except (EOFError, KeyboardInterrupt):
-                continue
-            if not spec:
                 continue
             try:
-                direction = input("  方向 [L=本地监听/R=副端监听，默认 L]: ").strip().upper()
+                if direction == "D":
+                    spec = input("  SOCKS5 监听端口（如 1080）: ").strip()
+                    if not spec:
+                        continue
+                    argv = ["forward", "-D", spec, name]
+                else:
+                    spec = input("  转发规格: ").strip()
+                    if not spec:
+                        continue
+                    argv = ["forward", name]
+                    argv += (["--remote", spec] if direction == "R"
+                             else ["--local", spec])
             except (EOFError, KeyboardInterrupt):
                 continue
-            argv = ["forward", name]
-            argv += (["--remote", spec] if direction == "R" else ["--local", spec])
             cmd_forward(_menu_args(argv))
 
         # ---- 22: sessions ----

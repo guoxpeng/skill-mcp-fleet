@@ -26,7 +26,7 @@ import zipfile
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
-DEFAULT_VERSION = "5.2.8"
+DEFAULT_VERSION = "5.2.9"
 MAX_FILES = 30
 MAX_BYTES = 40 * 1024 * 1024
 SKILL_NAME = "mcp-fleet"

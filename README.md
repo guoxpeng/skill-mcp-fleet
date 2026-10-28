@@ -1,4 +1,4 @@
-# MCP Fleet v5.2.8 · 让所有设备成为一支 AI 团队
+# MCP Fleet v5.2.9 · 让所有设备成为一支 AI 团队
 
 > **2026 华为开发者大赛 · 小红书 Skill 创新赛** ｜ 通用赛道 · 开发工具
 > 作者：guoxpeng ｜ 开源仓库：https://github.com/guoxpeng/skill-mcp-fleet ｜ 许可：MIT
@@ -204,7 +204,7 @@ fleet add --name pi --ip 192.168.1.9 --group web   # 登记时就归组
 重新 `add` 同一台（换地址、换令牌）不会把它踢出原来的组；`groups` 写成
 `"web,db"` 这种走形格式也认。
 
-### 6.8 端口转发（`ssh -L / -R` 的等价物）
+### 6.8 端口转发（`ssh -L / -R / -D` 的等价物）
 
 5.3 给了终端，但 ssh 还有一半用处是端口转发：远端内网里只有那台机器能碰的数据库、
 面板、私有 API，全靠它接出来。
@@ -212,15 +212,31 @@ fleet add --name pi --ip 192.168.1.9 --group web   # 登记时就归组
 ```bash
 fleet forward -L 8080:db.internal:3306 nas   # 本地 8080 → 副端视角的 db:3306
 fleet forward -R 9000:127.0.0.1:3000 nas     # 副端 9000 → 本地 3000
+fleet forward -D 1080 nas                    # 本地 SOCKS5，从 nas 出网（v5.2.9）
 fleet forward --list nas                      # 看副端当前隧道
 ```
 
+`-D` 是 ssh 的最后一项传输能力，也是「AI 借用设备网络环境」最直接的形式：
+本地起一个 SOCKS5，目标由客户端每次连接时给，**域名原样交给副端解析**——
+DNS 在哪边解析，决定了你看到的是哪边的内网。
+
+```bash
+fleet forward -D 1080 istoreos &
+curl --socks5-hostname 127.0.0.1:1080 http://127.0.0.1:80/   # 设备本机的 LuCI
+```
+
 - 副端新增 7 个工具（`tunnel_open/listen/accept/read/write/close/list`），总数 62 → **69**；
-- 一条命令可叠加多个 `-L` / `-R`；`-L` 默认只绑回环，要暴露到局域网需显式 `--bind 0.0.0.0`；
+- `-L` / `-R` / `-D` 底层是同一条通道，区别只在「谁决定去哪」：`-L` 命令行写死，
+  `-D` 客户端每次说。所以 `-D` 不需要副端开任何端口，也不用新协议；
+- 一条命令可叠加多个 `-L` / `-R` / `-D`；默认只绑回环，要暴露到局域网需显式 `--bind 0.0.0.0`；
+- 只做 SOCKS5 的 CONNECT（TCP）——`ssh -D` 的语义也是这个，UDP ASSOCIATE 不实现；
+  三种地址类型（IPv4 / 域名 / IPv6）都认，失败时回明确的 SOCKS 码（4/5/7/8）
+  而不是让客户端干等；
 - 实现要点是**不丢字节**：缓冲区满时读线程挂起等主端取（背压），而不是像终端那样
   丢弃滚屏历史——TCP 丢一个字节，下载的文件就是坏的；
 - 验证方式：1MB / 5MB 随机二进制 + SHA256 比对，上行/下行/`-L`/`-R` 四个方向全覆盖。
-  本机回环实测 `-L` 5MB ≈ 0.5s、`-R` 5MB ≈ 3s。
+  本机回环实测 `-L` 5MB ≈ 0.5s、`-R` 5MB ≈ 3s；`-D` 经 iStoreOS 取 LuCI 首页
+  664 字节 / 4.2s（Tailscale 链路）。
 - 顺带补上「长时间在线」的证据：`fleet health` 现在显示副端自报的**进程在线时长**
   和主端**已观测多久**，并把 `first_seen / last_ok / up_count` 记在
   `~/.mcp-fleet/seen.json`（掉线不清零）——只看当次 UP 看不出稳定性。
@@ -255,12 +271,12 @@ bash scripts/demo.sh                        # 本机双节点 30 秒演示
 
 ```bash
 python3 scripts/build_package.py
-# → dist/mcp-fleet-v5.2.8.zip + SHA256SUMS + MANIFEST.json
+# → dist/mcp-fleet-v5.2.9.zip + SHA256SUMS + MANIFEST.json
 ```
 
 - 提交包文件数 **≤ 30**、大小 **≤ 40 MB**，由脚本自动裁剪并以清单/SHA256 固化。
 - 纯标准库、零第三方运行时依赖、MIT 许可、可离线部署。
-- 版本：代码 `SERVER_VERSION=5.2.8` ＝ git tag `v5.2.8` ＝ GitHub Release。
+- 版本：代码 `SERVER_VERSION=5.2.9` ＝ git tag `v5.2.9` ＝ GitHub Release。
   完整演进见 `CHANGELOG.md`。
 - **版本号一律三段式 `X.Y.Z`**：默认只动补丁位（修 bug、稳定性、性能），
   新增能力才动次版本位，破坏性变更才动主版本位。构建脚本会做三段式校验与
