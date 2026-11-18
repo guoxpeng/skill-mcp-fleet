@@ -26,11 +26,13 @@ log() { echo "[$(date '+%F %T')] $*" >> "$LOG"; }
 
 ts_ok() {
   # 返回 0=在线。tailscale status 非 0 或报 Logged out / NoState 都算掉线。
-  local out
-  out="$("$TS" status 2>&1 | head -5)"
-  local rc=$?
+  # 注意：不能写 `out="$(... | head -5)"; rc=$?`——$? 拿到的是 head 的退出码（恒 0），
+  # status 失败会被误判在线。先不接管道拿 rc，再对输出做 head+grep。
+  local out rc
+  out="$("$TS" status 2>&1)"
+  rc=$?
   [ $rc -ne 0 ] && return 1
-  echo "$out" | grep -qiE "logged out|NoState|stopped" && return 1
+  echo "$out" | head -5 | grep -qiE "logged out|NoState|stopped" && return 1
   return 0
 }
 

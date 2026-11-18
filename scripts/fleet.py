@@ -4681,7 +4681,7 @@ def cmd_pair(a):
         req.add_header("Content-Type", "application/json")
         if token:
             req.add_header("Authorization", "Bearer " + token)
-        with _ur.urlopen(req, timeout=a.timeout) as resp:
+        with _opener_for(base).open(req, timeout=a.timeout) as resp:
             pair_resp = json.loads(resp.read().decode("utf-8"))
         if pair_resp.get("ok"):
             peer_ident = {"public_key": pair_resp.get("my_public_key", ""),
@@ -4796,7 +4796,7 @@ def cmd_invite(a):
         req.add_header("Content-Type", "application/json")
         if token:
             req.add_header("Authorization", "Bearer " + token)
-        resp = _ur.urlopen(req, timeout=a.timeout)
+        resp = _opener_for(url).open(req, timeout=a.timeout)
         result = json.loads(resp.read().decode())
     except Exception as e:
         return die("生成邀请失败：%s" % e)
@@ -4895,7 +4895,7 @@ def cmd_accept(a):
         req.add_header("Content-Type", "application/json")
         if token:
             req.add_header("Authorization", "Bearer " + token)
-        resp = _ur.urlopen(req, timeout=a.timeout)
+        resp = _opener_for(verify_url).open(req, timeout=a.timeout)
         result = json.loads(resp.read().decode())
     except Exception as e:
         return die("确权失败：%s" % e)
